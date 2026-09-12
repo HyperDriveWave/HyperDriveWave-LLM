@@ -1042,6 +1042,13 @@ bash Scripts/deploy.sh
 bash Scripts/deploy.sh --dry-run
 ```
 
+**`--dry-run` 一个文件都不写。** 这个退出点必须排在**任何写操作之前**——
+早先的版本把它放在"装 systemd 单元 + `daemon-reload`"之后，结果是从一个临时
+目录跑 `--dry-run` 时，把真实的 `~/.config/systemd/user/` 下两个单元改写成了
+指向那个临时目录。当前进程还在跑旧的，看起来一切正常，但**下次重启就会去跑
+一个已经不存在的路径**。现在 `--dry-run` 在阶段 1 结束就退出，连决策快照
+`plan.env` 都不写。
+
 常用开关：
 
 | 开关 | 用途 |
@@ -1049,8 +1056,36 @@ bash Scripts/deploy.sh --dry-run
 | `--network online\|mirror\|offline` | 网络模式。不指定则交互式询问；非交互默认 `online` |
 | `--proxy <url>` | `mirror` 模式下的 HTTP 代理 |
 | `--bind <ip>` | 手动指定 WebUI 绑定地址，默认自动探测默认路由出口 IP |
+| `--port <键>=<端口>[,...]` | 直接指定端口，跳过交互（见 §10.11） |
 | `--skip-models` | 模型已备好，跳过检查与下载 |
 | `--with-frp` | 一并安装 frpc 单元（只安装不启用，启停仍由控制中心控制） |
+| `--takeover` | 显式声明接管本机上已有的另一份安装（见下） |
+
+**systemd 单元是机器级的，不是项目级的。** 它们装在
+`~/.config/systemd/user/`，路径固定，**不随项目目录走**。所以同一台机器上
+从 A 目录跑一次 `deploy.sh`，会把正在运行的 B 目录安装顶掉：单元被改指到 A，
+当前进程仍在跑 B（无感），但下次重启就切过去了——如果 A 后来被删掉，
+服务就再也起不来。
+
+为此 `deploy.sh` 在装单元前会**对比单元里现有的 `WorkingDirectory=`**：
+
+- 指向的就是本次目录 → 直接继续，不打扰
+- 指向别处 → 打印两边路径并要确认；**非交互环境直接报错退出**，
+  不会因为 `confirm()` 在非 tty 下默认通过而静默接管。
+  确认接管要显式加 `--takeover`。
+- 拒绝确认 → 退出，并给出停掉旧安装的命令
+
+在临时目录里试跑部署脚本时，务必用 `--dry-run`，或者把 `XDG_CONFIG_HOME`
+指到临时目录（单元会写到那里，碰不到真实安装）：
+
+```bash
+XDG_CONFIG_HOME=/tmp/hdw-test bash Scripts/deploy.sh    # 隔离，不碰真实单元
+```
+
+`XDG_CONFIG_HOME` 是 `user_unit_dir()` 的取值来源，改了它就等于换了整个
+单元目录——**这是在不影响本机运行项目的前提下测试部署脚本的正确做法**。
+注意隔离的只是单元文件；`docker compose` 仍会绑同样的宿主端口，
+所以真要跑完整流程还是得在另一台机器上进行。
 
 **目标机前置条件**：Docker Engine + Compose v2、systemd 用户管理器可用
 （llama 和资源协调器都是用户级服务）、若用 GPU 则需 NVIDIA 驱动 +
@@ -1352,6 +1387,18 @@ bash Scripts/build_llama.sh --cpu        # 强制 CPU 版
 
 **注意 llama.cpp 没有可用的国内镜像**（`gitee.com/mirrors/llama.cpp` 不存在）。
 连不上 github 的机器请改用离线包——`pack_hdw.sh` 打出来的包里带着源码和产物。
+
+**在这台机器上已经跑着一份 HyperDriveWave 的情况下克隆部署**（比如为了
+对比新旧版本），`deploy.sh` 会检测到 systemd 单元正指向另一个目录并要求
+确认。想放两份互不干扰地跑，**光改项目目录不够**——单元装在
+`~/.config/systemd/user/`，两边会互相顶掉。可行做法是给第二份单独一个
+`XDG_CONFIG_HOME`：
+
+```bash
+XDG_CONFIG_HOME=$HOME/.config-hdw2 bash Scripts/deploy.sh
+```
+
+同时还得把宿主端口错开（见 §10.11），否则两边抢同一组端口。
 
 ### 10.11 端口配置
 
@@ -1889,6 +1936,14 @@ bash Scripts/deploy_verify.sh --deep   # 额外做重启演练
       的 `local.base_url` 也一致。三处分叉的表现是
       `/health` 全绿、模型页正常，一提问就 connection refused。
       `start.sh` 会在检测到不一致时直接报错拦下。
+- [ ] **systemd 单元指向的是当前项目目录**（不是上一次部署留下的旧路径）：
+      ```bash
+      grep -h '^WorkingDirectory=' ~/.config/systemd/user/hyperdrivewave-*.service
+      ```
+      单元是**机器级**的，不随项目目录走。同一台机器上从另一个目录跑过
+      `deploy.sh` 的话，这里会指向那个目录——**服务当前仍在跑旧的（无感），
+      重启后才发作**。`deploy.sh` 装单元前会拦下这种情况，但从别的机器
+      拷过来的单元不会重新生成，所以值得手工看一眼。
 
 ### 17.2 部署后：自动化测不到的，手工确认
 
@@ -1951,6 +2006,22 @@ bash Scripts/deploy_verify.sh --deep   # 额外做重启演练
       不要用 `Configs/.env.*` 这种会把模板一起吞掉的通配。
       同理，凭据识别也别用裸子串——`KEY|TOKEN` 会误伤
       `KEYCLOAK_URL` 和 `HDW_LLM_MAX_TOKENS`，要带词边界（`_KEY$`）。
+
+      **`--dry-run` 不能省。** 在 `/tmp` 这种临时目录里跑部署脚本时，
+      它会去写**真实的** `~/.config/systemd/user/`——单元目录是机器级的，
+      跟项目在哪儿无关。实际踩过：临时目录里跑了一次，把两个在跑的服务的
+      单元改写成了指向那个临时目录，当前进程还在跑（毫无异常），
+      但只要重启就再也起不来。
+      现在 `--dry-run` 在任何写操作之前就退出，所以上面这条命令是安全的；
+      **但去掉 `--dry-run` 就不安全了**。要在临时目录里试完整流程，
+      至少把单元目录也隔离掉：
+
+      ```bash
+      XDG_CONFIG_HOME=/tmp/clonetest/.config bash /tmp/clonetest/Scripts/deploy.sh
+      ```
+
+      端口也仍然是真的——临时副本会和本机在跑的项目抢同一组宿主端口，
+      所以本机已有一套在跑时，完整流程请换机做。
 - [ ] **`Configs/.env.example` 覆盖了 `.env` 的全部键**：
       `bash Scripts/gen_env_example.sh --check`。模板过时会让新机器缺配置，
       且症状分散、很难定位到「模板少了几个键」这个根因。

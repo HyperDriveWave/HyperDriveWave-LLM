@@ -8,7 +8,10 @@
 #   bash Scripts/deploy.sh --bind 10.0.0.5        # 指定 WebUI 绑定的网卡地址
 #   bash Scripts/deploy.sh --skip-models          # 模型已备好，跳过检查与下载
 #   bash Scripts/deploy.sh --prefer gitee         # 第三方依赖优先走 gitee（国内网络建议）
-#   bash Scripts/deploy.sh --setup-mirrors       # 先配好 Docker/pip/npm/apt 国内镜像源
+#   bash Scripts/deploy.sh --setup-mirrors        # 先配好 Docker/pip/npm/apt 国内镜像源
+#   bash Scripts/deploy.sh --port webui=3000,qa=8080   # 指定端口，跳过交互（见 --ports）
+#   bash Scripts/deploy.sh --dry-run              # 只报告会改什么，一个文件都不写
+#   bash Scripts/deploy.sh --takeover             # 接管本机上指向别处的已有安装
 #
 # 设计原则：
 #   1. **路径一律相对**。代码本身已经自定位（脚本用 BASH_SOURCE 推根目录、
@@ -49,9 +52,12 @@ SETUP_MIRRORS=0
 PORT_OVERRIDE=""
 SHOW_PORTS=0
 ONLINE_ONLY=0
+TAKEOVER=0
 
 usage() {
-  sed -n "2,21p" "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+  # 取开头连续的注释块。**不用硬编码行号**——早先写的是 `sed -n "2,21p"`，
+  # 往头部加一行说明，它就会截到 `set -euo pipefail` 那一行上去。
+  awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print; next } exit }' "${BASH_SOURCE[0]}"
   exit 0
 }
 
@@ -68,6 +74,7 @@ while [ $# -gt 0 ]; do
     --setup-mirrors) SETUP_MIRRORS=1; shift ;;
     --port)       PORT_OVERRIDE="${2:-}"; shift 2 ;;
     --ports)      SHOW_PORTS=1; shift ;;
+    --takeover)   TAKEOVER=1; shift ;;
     -h|--help)    usage ;;
     *) die "未知参数：$1（--help 看用法）" ;;
   esac
@@ -234,8 +241,10 @@ elif [ "$NET_MODE" = "mirror" ]; then
 fi
 
 # 决策快照。后续阶段只读它，不重复探测。
-mkdir -p "$(deploy_state_dir)"
+# dry-run 下不写——它的契约是"一个文件都不改"。
 PLAN_FILE="$(deploy_state_dir)/plan.env"
+if [ "$DRY_RUN" != "1" ]; then
+mkdir -p "$(deploy_state_dir)"
 {
   echo "# 部署决策快照，由 deploy.sh 生成。改了要重跑 deploy.sh。"
   echo "HDW_DEPLOY_NET=$NET_MODE"
@@ -248,6 +257,7 @@ PLAN_FILE="$(deploy_state_dir)/plan.env"
   echo "HDW_DEPLOY_START_TS=$(date +%s)"
 } > "$PLAN_FILE"
 dim "  决策快照：$PLAN_FILE"
+fi
 
 # ═══ 阶段 1：目录 ═════════════════════════════════════════════
 
@@ -262,6 +272,48 @@ for d in ingest model-config frp; do
   mkdir -p "$RUNTIME_ROOT/$d"
 done
 info "已补建 ingest / model-config / frp（prepare_dirs.sh 漏掉了这三个）"
+
+# ── dry-run 到此为止 ──
+#
+# **必须在任何写操作之前退出**。最初这个退出点放在「装 systemd 单元 +
+# daemon-reload」之后，结果是从一个临时目录跑 --dry-run 时，把用户真实的
+# ~/.config/systemd/user/ 下两个单元改写成了指向那个临时目录——
+# 当前进程还在跑旧的，但**下次重启就会去跑已经不存在的路径**。
+# dry-run 的契约是"只看不改"，那就必须一次写操作都不做。
+if [ "$DRY_RUN" = "1" ]; then
+  log ""
+  step "dry-run 报告（以下都**没有实际执行**）"
+  log "  项目根    ：$HDW_ROOT"
+  log "  GPU       ：$GPU_SUMMARY"
+  log "  网络模式  ：$NET_MODE"
+  log "  推理后端  ：${BACKEND_REL:-（无，需要构建）}"
+  log "  WebUI 绑定：$BIND_IP"
+  log ""
+  log "  端口现状："
+  ports_table
+  _c="$(ports_conflicts)"
+  if [ -n "$_c" ]; then
+    log ""
+    log "  端口冲突："
+    printf '%s\n' "$_c" | while IFS=$'\t' read -r _k _p _d; do
+      _s="$(port_find_free "$((_p + 1000))")"
+      printf '    %s %s（建议改用 %s）\n' "$_p" "$_d" "${_s:-无可用替代}"
+    done
+  fi
+  log ""
+  log "  接下来会做（去掉 --dry-run 才执行）："
+  log "    · 渲染 Configs/.env 与 HDW_Runtime/model-config/config.json"
+  log "    · 安装 systemd 用户单元并 daemon-reload"
+  [ "$NEED_LLAMA_BUILD" = "1" ] && log "    · 拉 llama.cpp 源码并编译（CUDA 约 10 分钟）"
+  log "    · 下载缺失的模型与第三方依赖"
+  log "    · 构建镜像、调 start.sh 启动、跑验收"
+  log ""
+  log "  **本次没有写入任何文件，也没有动 systemd。**"
+  log ""
+  log "  想看 .env 具体会改成什么：先直接跑一次（会自动备份成 .env.bak-<时间戳>），"
+  log "  再 diff 那个备份。"
+  exit 0
+fi
 
 # ═══ 阶段 1.5：端口 ═══════════════════════════════════════════
 # 放在配置渲染之前——它要写 .env。
@@ -621,6 +673,37 @@ esac
 
 UNIT_CHANGED=0
 
+# ── 接管检查 ──
+# 单元装在 ~/.config/systemd/user/，是**机器级**的：不检查的话，从 A 目录跑一次
+# deploy.sh 就会把已在跑的 B 目录安装顶掉——当前进程还在跑旧的，
+# 但下次重启会去跑新路径。踩过这个坑（从临时目录跑 --dry-run 时把真实安装改了）。
+for _u in hyperdrivewave-llama.service hyperdrivewave-resource-coordinator.service; do
+  _cur="$UNIT_DIR/$_u"
+  [ -f "$_cur" ] || continue
+  _old_root="$(sed -n 's/^WorkingDirectory=//p' "$_cur" 2>/dev/null | head -1)"
+  # %h 形式要和当前 SD_ROOT 一致才算"同一个安装"
+  if [ -n "$_old_root" ] && [ "$_old_root" != "$SD_ROOT" ]; then
+    warn "已有安装指向别的目录："
+    log "    $_u"
+    log "      现有：$_old_root"
+    log "      本次：$SD_ROOT"
+    log "  继续会把它改指到本次的目录。正在运行的服务当前仍用旧路径，"
+    log "  但下次重启就会切过来。"
+    # 这是**破坏性**操作，非交互环境不能靠 confirm 的默认值自动通过——
+    # 否则在 CI 或脚本里跑一次就会静默接管另一份安装。
+    if [ ! -t 0 ] && [ "$TAKEOVER" != "1" ]; then
+      die "检测到已有安装指向别处，且当前是非交互环境。
+     确认要接管的话加 --takeover 显式声明：
+       bash Scripts/deploy.sh --takeover
+     或者换一台机器部署。"
+    fi
+    if ! confirm "  确认接管？"; then
+      die "已取消。要部署到别处请换一台机器，或先手工停掉旧安装：
+       systemctl --user disable --now hyperdrivewave-llama.service hyperdrivewave-resource-coordinator.service"
+    fi
+  fi
+done
+
 install_unit "hyperdrivewave-llama.service" "[Unit]
 Description=HyperDriveWave llama.cpp local inference
 After=default.target
@@ -681,23 +764,6 @@ fi
 
 systemctl --user daemon-reload
 
-# ── dry-run 到此为止 ──
-# 后面的建镜像 / 启动会真的重启在跑的服务，不适合"只想看看会改什么"的场景。
-if [ "$DRY_RUN" = "1" ]; then
-  log ""
-  info "--dry-run：已完成前置检查、探测与配置渲染，未构建镜像、未启动服务。"
-  log ""
-  _units="hyperdrivewave-llama.service hyperdrivewave-resource-coordinator.service"
-  [ "$WITH_FRP" = "1" ] && _units="$_units hyperdrivewave-frpc.service"
-  log "  决策快照   ：$PLAN_FILE"
-  log "  推理后端   ：$BACKEND_REL（device=$LLAMA_DEVICE）"
-  log "  系统单元   ：$UNIT_DIR/"
-  for _u in $_units; do log "               $_u"; done
-  log ""
-  log "  去掉 --dry-run 重跑即真正部署。"
-  log ""
-  exit 0
-fi
 
 # ═══ 阶段 3：第三方依赖 ═══════════════════════════════════════
 # 排在模型之前：镜像构建依赖源码（hdw-mineru 的 build.context 就是 MinerU 仓库），
