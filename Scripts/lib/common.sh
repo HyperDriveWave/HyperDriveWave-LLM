@@ -190,3 +190,34 @@ http_ok() {
   local url="$1" timeout="${2:-5}"
   curl -fsS --max-time "$timeout" -o /dev/null "$url" 2>/dev/null
 }
+
+# ── 交互 ──────────────────────────────────────────────────────
+# 被 setup_mirrors.sh 和 deploy.sh 共用，所以放在这里而不是各自的脚本里。
+#
+# 非交互环境（没有 tty）**必须**自动采用默认值并说出来，
+# 不能静默跳过——否则 CI 里跑会出现"没报错但什么都没配"。
+
+# 返回 0 = 采用默认/确认；返回 1 = 用户要自己填
+confirm() {
+  local prompt="$1"
+  [ "${HDW_ASSUME_YES:-0}" = "1" ] && return 0
+  if [ ! -t 0 ]; then
+    warn "非交互环境，自动采用默认值"
+    return 0
+  fi
+  printf '%s [Y/n] ' "$prompt" >&2
+  local ans
+  read -r ans
+  case "${ans:-y}" in
+    y|Y|yes|YES|"") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 读一个值。空输入 → 默认值
+ask_value() {
+  local name="$1" def="$2" ans
+  printf '  %s [%s]: ' "$name" "$def" >&2
+  read -r ans
+  printf '%s' "${ans:-$def}"
+}

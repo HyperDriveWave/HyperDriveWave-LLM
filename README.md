@@ -87,10 +87,12 @@ HyperDriveWave/
 │   ├── fetch_models.sh                    # 从魔搭补齐模型
 │   ├── fetch_vendors.sh                   # 按 vendor.lock 克隆第三方源码
 │   ├── setup_mirrors.sh                   # 配 Docker/pip/npm/apt 镜像源
+│   ├── build_llama.sh                     # 从源码编译 llama.cpp
 │   ├── pack_hdw.sh                        # 源机打包
 │   ├── lib/                               # 上述脚本共用的库
-│   │   ├── common.sh                      #   幂等写文件 / 日志
-│   │   ├── detect.sh                      #   GPU / 网络探测
+│   │   ├── common.sh                      #   幂等写文件 / 日志 / 交互
+│   │   ├── detect.sh                      #   GPU / 网络 / 端口探测
+│   │   ├── ports.sh                       #   端口清单（唯一事实源）
 │   │   └── models.sh                      #   模型清单（唯一事实源）
 │   ├── init.sh
 │   ├── prepare_dirs.sh
@@ -204,8 +206,11 @@ HyperDriveWave/
 - `fetch_models.sh`：按清单从魔搭下载模型，字节级校验。
 - `fetch_vendors.sh`：按 `vendor/vendor.lock` 克隆第三方源码回原路径。
 - `setup_mirrors.sh`：配置 Docker/pip/npm/apt 国内镜像源。
+- `build_llama.sh`：从源码编译 llama.cpp（CUDA / Vulkan / CPU 三选一，按显卡自动定）。
+  **从 GitHub 克隆后必须跑**，否则没有 llama-server 二进制。
 - `pack_hdw.sh`：源机打包（253 G → 25 G），排除用不到的模型与构建产物。
-- `lib/`：上述脚本共用的库。`common.sh`（幂等写文件/日志）、`detect.sh`（GPU/网络探测）、
+- `lib/`：上述脚本共用的库。`common.sh`（幂等写文件/日志/交互）、
+  `detect.sh`（GPU/网络/端口探测）、`ports.sh`（端口清单的**唯一事实源**）、
   `models.sh`（模型清单的**唯一事实源**）。
 
 **运维**：
@@ -1314,6 +1319,122 @@ PY
   长得不像 `.env`，很容易漏。`.gitignore` 里对每种命名都要有对应规则。
 - 配置参考文件里的 token：`frpc_*.toml` / `frps_*.toml` 常常带着真实 token。
 
+### 10.10 从 GitHub 克隆后首次部署
+
+`llama.cpp` 的源码和编译产物**都不进版本库**（源码树 1.4 G、CUDA 产物 974 M），
+所以克隆下来的项目里**没有任何 llama-server 二进制**。这是正常的，
+`deploy.sh` 会识别出来并在阶段 3.5 现场编译，不会直接报错退出。
+
+完整流程：
+
+```bash
+git clone https://github.com/HyperDriveWave/HyperDriveWave-LLM.git
+cd HyperDriveWave-LLM
+
+bash Scripts/setup_mirrors.sh --yes   # 国内网络建议先配镜像源
+bash Scripts/deploy.sh                # 走完全部流程
+```
+
+`deploy.sh` 会依次做完：探测 GPU 与网络 → 端口确认 → 推理方式 →
+渲染配置 → **拉第三方源码** → **编译 llama.cpp** → 下模型 → 建镜像 → 启动 → 验收。
+
+**编译这一段要等**：CUDA 单架构约 10 分钟，Vulkan 约 5 分钟，CPU 约 3 分钟。
+工具链（cmake / g++ / CUDA toolkit）缺失时会用 apt 自动安装（需要 sudo 密码）。
+CUDA toolkit 在 Ubuntu 的 **multiverse** 源里，不需要加 NVIDIA 官方源。
+
+单独重编或用参数控制：
+
+```bash
+bash Scripts/build_llama.sh --check      # 只报状态
+bash Scripts/build_llama.sh --rebuild    # 强制重编
+bash Scripts/build_llama.sh --cpu        # 强制 CPU 版
+```
+
+**注意 llama.cpp 没有可用的国内镜像**（`gitee.com/mirrors/llama.cpp` 不存在）。
+连不上 github 的机器请改用离线包——`pack_hdw.sh` 打出来的包里带着源码和产物。
+
+### 10.11 端口配置
+
+部署时端口可以改，默认值不变。换服务器时 3000/8080/5432 这类端口很容易撞上已有服务。
+
+```bash
+bash Scripts/deploy.sh --ports                        # 只看端口表与冲突
+bash Scripts/deploy.sh --port qa=18080,webui=13000    # 直接指定
+bash Scripts/deploy.sh                                # 交互式：列出现状，问 Y/n，选 n 逐项改
+```
+
+冲突会被自动识别并**建议一个空闲端口**（往上找 200 个），确认后自动改。
+
+可改的端口：
+
+| 服务 | 默认 | 绑定 |
+| --- | --- | --- |
+| WebUI HTTP / HTTPS | 3000 / 8443 | 局域网 |
+| QA API | 8080 | **所有网卡**（唯一一个） |
+| 宿主 llama.cpp | 1919 | 仅本机 |
+| 本机 RAG / MinerU | 8001 / 8002 | 仅本机 |
+| Neo4j HTTP / Bolt | 7475 / 7688 | 仅本机 |
+| PostgreSQL / Redis | 5432 / 6379 | 仅本机 |
+| 入库 API | 8090 | 仅本机 |
+| MCP | 8766 | 仅本机（**不可改**，见下） |
+
+**容器之间的通信全部走容器内端口**（`hdw-rag:8001`、`hdw-qa-api:8080` 等），
+与宿主映射无关——所以改宿主端口不会影响内部调用，只影响你从外面怎么连。
+
+**两处会连带同步**（脚本自动做，不用手工）：
+
+- 改 **llama 端口** → 同步 `.env` 的 `HDW_LOCAL_LLM_BASE_URL` / `HDW_LLM_BASE_URL`
+  和 `HDW_Runtime/model-config/config.json` 的 `local.base_url`。
+  最后一处**不同步等于没改**：qa-api 读的是 config.json，`.env` 只是 fallback。
+  漏了它的表现极具迷惑性——`/health` 全绿、模型管理页正常，一提问就 connection refused。
+- 改 **WebUI 端口或绑定地址** → 同步 `frpc_hdw_public.toml` 的 `localPort`/`localIP`，
+  并提示需要重启 frpc。不同步的话隧道照常"建立成功"但转发到旧端口，
+  只有 frpc 日志里有 connection refused，控制中心显示一切正常。
+
+**MCP 的 8766 改不了**：容器内监听端口由 `MCP/Dockerfile` 的 `--port 8766` 决定，
+命令行参数压过环境变量，只改宿主映射会让 nginx 的 `/api/mcp/` 转发和 qa-api 调用断链。
+要真支持得同时改 Dockerfile + nginx.conf + compose 三处，收益不值这个复杂度。
+
+### 10.12 无 GPU 部署（走在线 API）
+
+没有 NVIDIA 显卡时，纯 CPU 跑 27B 模型约 **1 token/s**——问一个问题要等好几分钟，
+实际不可用。`deploy.sh` 会检测到并引导切到在线 API。
+
+```text
+── 步骤：推理方式（未检测到 GPU）──
+
+  没有可用的 NVIDIA 显卡。这影响两件事：
+    · 本地推理：只能走 CPU，27B 模型约 1 token/s，实际不可用
+    · 知识入库的 GPU 加速：不可用（入库会慢很多，不影响已有知识库的问答）
+
+  建议改用在线 API：问答立刻可用。代价是每次提问都走外网，
+  且提问内容和检索到的文档片段会发给模型提供方。
+
+切换到在线 API？[Y/n]
+  base_url [https://api.deepseek.com]:
+  model [deepseek-v4-flash]:
+  api_key（必填，否则提问会返回 503）:
+```
+
+确认后脚本会写 `.env`（`HDW_ONLINE_LLM_*`、`HDW_LLM_MODE=online`、
+`HDW_SKIP_LOCAL_LLM=true`），并且**还会改 `HDW_Security/auth/auth.csv`**
+里每个用户的 `default_inference_mode`。
+
+最后这一处不改的话前面全白做：每次问答的默认模式取自 auth.csv 里该用户的那一列，
+**不是** `.env` 的 `HDW_LLM_MODE`（`main.py:2222 → _user_default_inference_mode`）。
+本项目 98 个用户该列都是 `offline`，不翻的话他们提问仍走离线 → 没本地模型 → 直接失败。
+
+**停用本地推理后的边界**：
+
+- 不会启动 llama 服务
+- 前端**仍能看到「离线」选项**，但选中会失败——这是刻意的：完全藏掉这个选项
+  会让人以为系统坏了
+- `deploy_verify.sh` 会跳过 llama 检查，改为验证在线 API 是否配好
+  （它不该因为"本地推理按配置就没在跑"而报一堆失败）
+
+**以后加了显卡**：重跑 `bash Scripts/deploy.sh` 即可切回本地推理
+（把 `HDW_SKIP_LOCAL_LLM` 设回 `false`，并把 auth.csv 的默认模式改回 `offline` 或按需）。
+
 ## 11. 日常运维命令
 
 查看状态：
@@ -1760,6 +1881,14 @@ bash Scripts/deploy_verify.sh --deep   # 额外做重启演练
 - [ ] **第三方依赖就位**（`fetch_vendors.sh --check-only`）。缺 MinerU 会导致
       `hdw-mineru` 镜像构建失败，缺 aora-bot 会导致 WebUI 情绪球加载不出来。
 - [ ] **WebUI 可访问**，且返回的确实是页面（不是 nginx 指错目录后的 200）。
+- [ ] **端口没有冲突**：`bash Scripts/deploy.sh --ports`。改过端口的话，
+      确认 `frpc_hdw_public.toml` 的 `localPort` 跟着变了（改了 WebUI 端口却没同步，
+      外网访问会静默断掉）。
+- [ ] **llama 端口改动后配置自洽**：`HDW_LOCAL_LLM_BASE_URL` 里的端口
+      与 `HDW_LLAMA_PORT` 一致，且 `HDW_Runtime/model-config/config.json`
+      的 `local.base_url` 也一致。三处分叉的表现是
+      `/health` 全绿、模型页正常，一提问就 connection refused。
+      `start.sh` 会在检测到不一致时直接报错拦下。
 
 ### 17.2 部署后：自动化测不到的，手工确认
 

@@ -21,6 +21,15 @@
 #   4. bash Scripts/deploy_verify.sh                 确认没坏
 
 # ── 默认部署需要 ───────────────────────────────────────────────
+# llama.cpp：本地推理引擎的源码。**版本库里没有它的源码，也没有编译好的二进制**
+# （源码树 1.4G、CUDA 产物 974M），所以从 GitHub 克隆的项目必须先跑
+# Scripts/build_llama.sh 现场编译，否则部署会死在「找不到 llama-server」。
+#
+# 注意：llama.cpp 官方源在 github.com，**没有可用的 gitee 镜像**
+# （gitee.com/mirrors/llama.cpp 和 ggml-org/llama.cpp 都试过，不存在）。
+# 连不上 github 的机器请改用离线包——pack_hdw.sh 打出来的包里带着源码和产物。
+HDW_Inference/llama/llama.cpp-upstream	f3f1a8f2760f28325a5ec20c05b171e5b7c83a29	yes	master	https://github.com/ggml-org/llama.cpp
+
 # MinerU：knowledge profile，hdw-mineru 镜像的构建上下文（Dockerfile 里 COPY . .）
 HDW_Knowledge/MinerU	2fbeef09960c7ed0643a15a576ba21e104036375	yes	master	https://github.com/opendatalab/MinerU.git,https://gitee.com/pplus_open_source/MinerU.git
 # aora-bot：web profile，hdw-webui 把 emotion-ball/js 挂到 nginx 下当情绪球用

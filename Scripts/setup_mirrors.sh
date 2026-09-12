@@ -25,14 +25,13 @@ export HDW_ROOT
 
 . "$SCRIPT_DIR/lib/common.sh"
 
-ASSUME_YES=0
 CHECK_ONLY=0
 ONLY_LIST="docker,pip,npm,apt"
 OPT_DOCKER=""; OPT_PIP=""; OPT_NPM=""; OPT_APT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --yes|-y)  ASSUME_YES=1; shift ;;
+    --yes|-y)  HDW_ASSUME_YES=1; shift ;;
     --check)   CHECK_ONLY=1; shift ;;
     --only)    ONLY_LIST="${2:-}"; shift 2 ;;
     --docker)  OPT_DOCKER="${2:-}"; shift 2 ;;
@@ -62,26 +61,7 @@ backup_sys() {
   sudo cp -a "$f" "$bak" && dim "    已备份 $f → $(basename "$bak")"
 }
 
-confirm() {
-  # $1=提示 结果是 0=用默认值 1=要自己填
-  local prompt="$1"
-  [ "$ASSUME_YES" = "1" ] && return 0
-  [ -t 0 ] || { warn "非交互环境，自动采用默认值"; return 0; }
-  printf '%s [Y/n] ' "$prompt" >&2
-  local ans; read -r ans
-  case "${ans:-y}" in
-    y|Y|yes|YES|"") return 0 ;;
-    *) return 1 ;;
-  esac
-}
 
-ask_value() {
-  # $1=项目名 $2=当前默认值 → 输出用户输入（空则用默认）
-  local name="$1" def="$2" ans
-  printf '  %s [%s]: ' "$name" "$def" >&2
-  read -r ans
-  printf '%s' "${ans:-$def}"
-}
 
 # ═══ 检测 ═════════════════════════════════════════════════════
 

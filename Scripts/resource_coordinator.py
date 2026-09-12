@@ -30,13 +30,20 @@ SOCKET_PATH = Path(
 )
 LLAMA_UNIT = os.getenv("HDW_LLAMA_SYSTEMD_UNIT", "hyperdrivewave-llama.service")
 FRPC_UNIT = os.getenv("HDW_FRP_SYSTEMD_UNIT", "hyperdrivewave-frpc.service")
+
+# 端口由 HDW_LLAMA_PORT 推导，不写死 1919。
+# 原来这里是 `os.getenv("HDW_LLAMA_HEALTH_URL", "http://127.0.0.1:1919/health")`——
+# 出口是有的，但**全项目没有任何地方设置过它**（.env/.env.example/两个 systemd
+# 单元里都没有），所以事实上等于写死。改了 HDW_LLAMA_PORT 之后，
+# 协调器的 /switch-llm、GPU 抢占、健康探测会全部指向旧端口。
+LLAMA_PORT = os.getenv("HDW_LLAMA_PORT", "1919")
 LLAMA_HEALTH_URL = os.getenv(
     "HDW_LLAMA_HEALTH_URL",
-    "http://127.0.0.1:1919/health",
+    f"http://127.0.0.1:{LLAMA_PORT}/health",
 )
 LLAMA_PROPS_URL = os.getenv(
     "HDW_LLAMA_PROPS_URL",
-    "http://127.0.0.1:1919/props",
+    f"http://127.0.0.1:{LLAMA_PORT}/props",
 )
 MODEL_CONFIG_PATH = Path(
     os.getenv(

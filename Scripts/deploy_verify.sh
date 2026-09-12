@@ -61,6 +61,9 @@ QA_PORT="${HDW_QA_API_PORT:-8080}"
 QA_URL="http://127.0.0.1:$QA_PORT"
 MINERU_PORT="${HDW_MINERU_PORT:-8002}"
 MINERU_URL="http://127.0.0.1:$MINERU_PORT"
+# Neo4j HTTP。原来在检查里写死 7475，改了端口就会出现
+# 「只有 Neo4j 这一项红、其余全绿」，被当成"Neo4j 坏了"往错方向排查。
+NEO4J_HTTP_PORT="${HDW_NEO4J_HTTP_PORT:-7475}"
 
 json_get() { python3 -c "
 import json,sys
@@ -175,7 +178,7 @@ for i in 1 2 3 4 5; do
   NEO_RESP="$(curl -fsS --max-time 5 -u "$NEO_CRED" \
       -H 'Content-Type: application/json' \
       -d '{"statements":[{"statement":"RETURN 1"}]}' \
-      http://127.0.0.1:7475/db/neo4j/tx/commit 2>/dev/null)"
+      "http://127.0.0.1:${NEO4J_HTTP_PORT}/db/neo4j/tx/commit" 2>/dev/null)"
   if grep -q '"errors":\[\]' <<< "$NEO_RESP"; then
     NEO_OK=1; break
   fi
@@ -186,6 +189,21 @@ done
 # ═══ 3. llama.cpp（重点：不能只看 /health）════════════════════
 section "llama.cpp 本地推理"
 
+# 无 GPU 的部署会显式停用本地推理（deploy.sh 写 HDW_SKIP_LOCAL_LLM=true）。
+# 这时候报一堆"llama 不通"是误导——它是**按配置就该没在跑**。
+# 改为检查"在线 API 是否配好"，那才是这类部署真正该验的东西。
+if [ "${HDW_SKIP_LOCAL_LLM:-false}" = "true" ]; then
+  info "本地推理已停用（HDW_SKIP_LOCAL_LLM=true），跳过 llama 检查"
+  if [ -n "${HDW_ONLINE_LLM_API_KEY:-}" ]; then
+    pass "在线 API 已配置：${HDW_ONLINE_LLM_BASE_URL:-<未设>} / ${HDW_ONLINE_LLM_MODEL:-<未设>}"
+    _llama_skipped=1
+  else
+    fail "停用了本地推理，但 HDW_ONLINE_LLM_API_KEY 没配 —— 提问会返回 503"
+    _llama_skipped=1
+  fi
+fi
+
+if [ "${_llama_skipped:-0}" != "1" ]; then
 if ! http_ok "$LLAMA_URL/health" 10; then
   fail "llama /health 不通（$LLAMA_URL）"
 else
@@ -267,6 +285,7 @@ else
     pass "MTP 未启用（配置里也没要求）"
   fi
 fi
+fi   # ← 结束「本地推理是否停用」的分支
 
 # ═══ 4. 本机 RAG ══════════════════════════════════════════════
 section "本机 RAG 服务"

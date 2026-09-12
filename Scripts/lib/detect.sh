@@ -97,10 +97,18 @@ select_llama_backend_dir() {
     done
   done
 
-  # Vulkan 兜底：不需要 NVIDIA 卡，但它是旧版 llama.cpp，
-  # 既不支持 --spec-type（MTP 失效），也可能不认新模型架构，
-  # 所以选它必须让调用方给出明确警告，而不是静默降级。
-  for root in llama.cpp-upstream/build build; do
+  # 无 CUDA 可用时的兜底，按优先级：
+  #   build-vulkan / build  —— Vulkan，不需要 NVIDIA 卡，但旧版 llama.cpp
+  #                            不支持 --spec-type（MTP 失效），也可能不认新模型架构
+  #   build-cpu             —— 纯 CPU，最慢但一定能跑
+  # 选非 CUDA 后端必须让调用方给出明确警告，而不是静默降级。
+  for root in llama.cpp-upstream/build-vulkan llama.cpp-upstream/build \
+              build-vulkan build; do
+    if [ -x "$llama_dir/$root/bin/llama-server" ]; then
+      echo "$root"; return 0
+    fi
+  done
+  for root in llama.cpp-upstream/build-cpu build-cpu; do
     if [ -x "$llama_dir/$root/bin/llama-server" ]; then
       echo "$root"; return 0
     fi
@@ -201,17 +209,67 @@ bundle_cuda_runtime() {
 # 会让部署跑到一半才在 compose up 炸掉。
 port_busy() {
   local port="$1" addrs
+  # ss 缺失时必须当成"查不出来"，而不是"不忙"。踩过的坑：
+  # 没有这个兜底时 `ss` 报 command not found（退出码 127），
+  # `if port_busy` 把它当假 → 判定端口空闲 → **挑到一个被占的端口且不自知**。
+  # 自动选端口依赖这个函数，所以宁可保守报"忙"。
+  if ! have_cmd ss; then
+    return 0
+  fi
   addrs="$(ss -ltnH 2>/dev/null | awk '{print $4}')"
+  [ -n "$addrs" ] || return 0      # ss 输出为空同样可疑，保守处理
   grep -qE "[:.]${port}$" <<< "$addrs"
 }
 
-# 端口是不是被**本项目自己的**容器占着。
+# 端口是不是被**本项目自己的**东西占着。
 # 部署脚本要能重复执行：重跑时 3000/8080/8001 必然被上次起的容器占着，
-# 那是正常状态，不该报"端口被占用"的警告——真正的冲突是别的进程占的。
+# 那是正常状态，不该报"端口被占用"——真正的冲突是别的进程占的。
+#
+# 两类都要认，缺一不可：
+#   1. compose 容器（名字前缀 hyperdrivewave-）
+#   2. **宿主进程**：llama-server 和 frpc。它们不在 docker ps 里，
+#      不认的话 1919 永远被判成"外来冲突"，而它其实是本项目自己的。
 port_held_by_hdw() {
   local port="$1" ports
   ports="$(docker ps --filter 'name=hyperdrivewave-' --format '{{.Ports}}' 2>/dev/null)"
-  grep -qE "[:.]${port}->" <<< "$ports"
+  grep -qE "[:.]${port}->" <<< "$ports" && return 0
+  port_held_by_host_service "$port"
+}
+
+# 宿主上的本项目进程（用户级 systemd 服务）是否在监听该端口。
+# 用 systemd 的单元名判断，比翻 /proc/net 稳，也不依赖 ss 的输出格式。
+port_held_by_host_service() {
+  local port="$1"
+  have_cmd systemctl || return 1
+  # llama 的端口是可配的，从 .env 读，不写死 1919
+  local llama_port="1919"
+  if [ -f "${HDW_ROOT:-}/Configs/.env" ]; then
+    local v
+    v="$(sed -n 's/^HDW_LLAMA_PORT=//p' "$HDW_ROOT/Configs/.env" 2>/dev/null | tail -1)"
+    [ -n "$v" ] && llama_port="$v"
+  fi
+  if [ "$port" = "$llama_port" ]; then
+    systemctl --user is-active --quiet hyperdrivewave-llama.service 2>/dev/null && return 0
+    # 服务没起但端口被占，说明是别的进程抢了这个端口，不算"我们的"
+    return 1
+  fi
+  return 1
+}
+
+# 找一个空闲端口。从 preferred 开始往上试，最多试 span 个。
+# 输出找到的端口号；找不到输出空。
+port_find_free() {
+  local preferred="$1" span="${2:-200}" i p
+  for (( i = 0; i < span; i++ )); do
+    p=$(( preferred + i ))
+    [ "$p" -gt 65535 ] && break
+    if ! port_busy "$p"; then
+      echo "$p"
+      return 0
+    fi
+  done
+  echo ""
+  return 1
 }
 
 disk_free_gb() {

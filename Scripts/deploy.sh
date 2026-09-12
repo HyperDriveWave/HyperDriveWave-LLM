@@ -30,6 +30,8 @@ export HDW_ROOT
 . "$SCRIPT_DIR/lib/detect.sh"
 # shellcheck source=lib/models.sh
 . "$SCRIPT_DIR/lib/models.sh"
+# shellcheck source=lib/ports.sh
+. "$SCRIPT_DIR/lib/ports.sh"
 
 ENV_FILE="$HDW_ROOT/Configs/.env"
 ENV_EXAMPLE="$HDW_ROOT/Configs/.env.example"
@@ -44,6 +46,9 @@ WITH_FRP=0
 DRY_RUN=0
 PREFER_HOST=""
 SETUP_MIRRORS=0
+PORT_OVERRIDE=""
+SHOW_PORTS=0
+ONLINE_ONLY=0
 
 usage() {
   sed -n "2,21p" "${BASH_SOURCE[0]}" | sed 's/^# \?//'
@@ -61,6 +66,8 @@ while [ $# -gt 0 ]; do
     --dry-run)    DRY_RUN=1; shift ;;
     --prefer)     PREFER_HOST="${2:-}"; shift 2 ;;
     --setup-mirrors) SETUP_MIRRORS=1; shift ;;
+    --port)       PORT_OVERRIDE="${2:-}"; shift 2 ;;
+    --ports)      SHOW_PORTS=1; shift ;;
     -h|--help)    usage ;;
     *) die "未知参数：$1（--help 看用法）" ;;
   esac
@@ -87,13 +94,11 @@ fi
 
 [ -f "$COMPOSE_FILE" ] || die "找不到 $COMPOSE_FILE，项目结构不完整"
 
-# 端口占用：早点发现比 compose up 失败后再回滚便宜。
-# 被本项目自己的容器占着是正常状态（重跑部署时必然如此），只报别人的冲突。
-for p in "${HDW_WEBUI_PORT:-3000}" "${HDW_QA_API_PORT:-8080}" "${HDW_RAG_PORT:-8001}" "${HDW_MINERU_PORT:-8002}"; do
-  if port_busy "$p" && ! port_held_by_hdw "$p"; then
-    warn "端口 $p 被本项目的进程之外的东西占用，compose 启动时可能失败"
-  fi
-done
+# 端口检查已挪到「阶段 1.5：端口」——那里会读 .env、能改、能自动建议替代端口。
+# 原来这里的写法有两个问题：
+#   1. 读的是**shell 进程的环境**（`${HDW_WEBUI_PORT:-3000}`），而 deploy.sh
+#      根本没 source .env。所以用户在 .env 里改了端口，这里仍在查旧端口。
+#   2. 只列了 4 个端口，TLS/Neo4j/MCP/Postgres/Redis 和宿主的 llama 都没查。
 
 FREE_GB="$(disk_free_gb "$HDW_ROOT")"
 info "项目根：$HDW_ROOT"
@@ -108,20 +113,32 @@ if [ "$HDW_GPU_COUNT" -gt 0 ]; then
 fi
 info "GPU：$GPU_SUMMARY"
 
-# 后端选择：看架构能不能在目标卡上跑，而不是看目录存不存在
+# 后端选择：看架构能不能在目标卡上跑，而不是看目录存不存在。
+#
+# **找不到后端不是致命错误**：从 GitHub 克隆下来的项目本来就没有编译好的
+# llama-server（源码和产物都不进版本库），这时应该现场编译而不是直接退出。
+# 构建放在阶段 3.5（拉完第三方源码之后）。
 LLAMA_DIR="$HDW_ROOT/HDW_Inference/llama"
 BACKEND_REL="$(select_llama_backend_dir "$LLAMA_DIR" "$HDW_GPU_CAP" "$HDW_GPU_COUNT")"
-[ -n "$BACKEND_REL" ] || die "找不到可用的 llama-server 二进制（$LLAMA_DIR 下没有任何构建产物）"
+NEED_LLAMA_BUILD=0
 
-LLAMA_DEVICE="cpu"
-case "$BACKEND_REL" in
-  *build-cuda*) LLAMA_DEVICE="CUDA0" ;;
-  *build*)      LLAMA_DEVICE="Vulkan0" ;;
-esac
-
-info "推理后端：$BACKEND_REL（device=$LLAMA_DEVICE）"
+if [ -z "$BACKEND_REL" ]; then
+  NEED_LLAMA_BUILD=1
+  LLAMA_DEVICE="cpu"
+  warn "没有找到可用的 llama-server 二进制"
+  log "  这是从版本库克隆后的**正常状态**——源码和编译产物都不进库。"
+  log "  部署到阶段 3.5 时会自动拉源码并编译（CUDA 约 10 分钟，CPU 约 3 分钟）。"
+else
+  LLAMA_DEVICE="cpu"
+  case "$BACKEND_REL" in
+    *build-cuda*) LLAMA_DEVICE="CUDA0" ;;
+    *build*)      LLAMA_DEVICE="Vulkan0" ;;
+  esac
+  info "推理后端：$BACKEND_REL（device=$LLAMA_DEVICE）"
+fi
 
 # 后端选错是"跑起来才炸"的典型：CUDA kernel 不匹配时 /health 照样通过。
+if [ -n "$BACKEND_REL" ]; then
 case "$BACKEND_REL" in
   *build-cuda-multi*)
     : # 多架构，目标卡在任何支持的架构上都没问题
@@ -129,24 +146,23 @@ case "$BACKEND_REL" in
   *build-cuda*)
     BACKEND_ARCHES="$(llama_backend_arches "$LLAMA_DIR/$BACKEND_REL")"
     if [ "$HDW_GPU_COUNT" -gt 0 ] && ! arch_covers_cap "$BACKEND_ARCHES" "$HDW_GPU_CAP"; then
-      die "内部错误：选中的后端不覆盖本机架构（arch=$BACKEND_ARCHES cap=$HDW_GPU_CAP）"
+      # 编译产物不覆盖本机架构 —— 这正是"从别处拷来的二进制在新卡上跑不了"的情形。
+      # 不直接死，改为让阶段 3.5 重编。
+      warn "现有 CUDA 产物只含 sm_${BACKEND_ARCHES:-未知}，不覆盖本机 ${HDW_GPU_CAP}。
+     将在部署时重新编译。"
+      NEED_LLAMA_BUILD=1
+      BACKEND_REL=""
     fi
-    warn "当前 CUDA 后端只编译了 sm_${BACKEND_ARCHES:-未知}，换到别的显卡型号会失败。
-     要支持多型号，在本机跑一次：
-       cd $LLAMA_DIR/llama.cpp-upstream && cmake -B build-cuda-multi -S . \\
-         -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_NATIVE=OFF \\
-         -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \\
-         -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF \\
-         -DCMAKE_CUDA_ARCHITECTURES='80;89;90;120' && \\
-       cmake --build build-cuda-multi -j \"\$(nproc)\" --target llama-server"
     ;;
   *)
-    warn "回退到 Vulkan 后端（$BACKEND_REL）。它不需要 NVIDIA 卡，但代价明确：
-     - MTP 失效（旧版 llama.cpp 不支持 --spec-type），解码吞吐大约降 2-3 倍
-     - 旧版可能不认当前模型架构，启动会直接失败——所以下面的推理冒烟测试必须通过
-     要拿到 CUDA + MTP，请看上面重编多架构二进制的命令。"
+    warn "回退到非 CUDA 后端（$BACKEND_REL）。它不需要 NVIDIA 卡，但代价明确：
+     - MTP 失效，解码吞吐明显下降
+     - 旧版 llama.cpp 可能不认当前模型架构，启动会直接失败——
+       所以最后的推理冒烟测试必须通过
+     要拿到 CUDA + MTP，装好显卡和 CUDA toolkit 后重跑 deploy.sh 即可。"
     ;;
 esac
+fi
 
 # CUDA 二进制链接 /usr/local/cuda/.../libcudart.so.13，目标机只有驱动没有 toolkit 时会起不来
 if [ "$LLAMA_DEVICE" = "CUDA0" ] && ! cuda_runtime_present; then
@@ -247,6 +263,224 @@ for d in ingest model-config frp; do
 done
 info "已补建 ingest / model-config / frp（prepare_dirs.sh 漏掉了这三个）"
 
+# ═══ 阶段 1.5：端口 ═══════════════════════════════════════════
+# 放在配置渲染之前——它要写 .env。
+
+step "端口"
+
+# 提前把 .env 建出来（阶段 2 也要用），否则端口读不到已有配置
+if [ ! -f "$ENV_FILE" ]; then
+  [ -f "$ENV_EXAMPLE" ] || die "既没有 $ENV_FILE 也没有 $ENV_EXAMPLE"
+  cp "$ENV_EXAMPLE" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  info "已从 .env.example 生成 Configs/.env"
+fi
+export HDW_ENV_FILE="$ENV_FILE"
+export HDW_ROOT
+
+if [ "$SHOW_PORTS" = "1" ]; then
+  ports_table
+  log ""
+  c="$(ports_conflicts)"
+  if [ -z "$c" ]; then
+    info "没有检测到外部端口冲突"
+  else
+    log "检测到以下端口被外部占用："
+    printf '%s\n' "$c" | while IFS=$'\t' read -r k p d; do
+      printf '  %-6s %s  %s\n' "$p" "$d" "$(port_change_note "$k")"
+    done
+  fi
+  log ""
+  log "改端口：bash Scripts/deploy.sh --port webui=13000,qa=18080"
+  exit 0
+fi
+
+# ── ① 命令行显式指定优先 ──
+if [ -n "$PORT_OVERRIDE" ]; then
+  info "按 --port 指定端口"
+  IFS=',' read -r -a _pairs <<< "$PORT_OVERRIDE"
+  for _pair in "${_pairs[@]}"; do
+    _k="${_pair%%=*}"; _v="${_pair#*=}"
+    [ "$_k" != "$_v" ] || die "端口写法应为 键=值，收到：$_pair"
+    _key="$(port_key_of "$_k")" || die "未知端口键：$_k（用 --ports 看全部可选项）"
+    if [ "$(port_changeable "$_key")" != "yes" ]; then
+      die "$_key 不可更改：$(port_change_note "$_key")"
+    fi
+    port_apply "$_key" "$_v" || die "设置 $_key 失败"
+  done
+fi
+
+# ── ② 冲突检测 + 自动建议 ──
+CONFLICTS="$(ports_conflicts)"
+if [ -n "$CONFLICTS" ]; then
+  log ""
+  warn "检测到端口冲突（占用者不是本项目）："
+  while IFS=$'\t' read -r _k _p _d; do
+    _sug="$(port_find_free "$((_p + 1000))")"
+    printf '  %s %-6s %s\n' "⚠" "$_p" "$_d"
+    if [ -n "$_sug" ]; then
+      printf '      建议改用 %s\n' "$_sug"
+      if confirm "      把 $_k 改成 $_sug ？"; then
+        port_apply "$_k" "$_sug"
+      else
+        ALT="$(ask_value "      或手工指定 $_k 的端口" "$_p")"
+        [ "$ALT" != "$_p" ] && port_apply "$_k" "$ALT"
+      fi
+    else
+      warn "      往上试了 200 个端口都被占，请手工处理"
+    fi
+  done <<< "$CONFLICTS"
+fi
+
+# ── ③ 交互式逐项确认 ──
+if [ "$DRY_RUN" != "1" ] && [ -t 0 ] && [ -z "$PORT_OVERRIDE" ]; then
+  log ""
+  log "当前端口："
+  ports_table
+  log ""
+  if ! confirm "用以上端口？（选 n 则逐项修改）"; then
+    log ""
+    log "逐项填写（直接回车 = 保持当前值，填 - = 跳过）"
+    while IFS=$'\t' read -r _k _var _def _desc _scope _ch; do
+      [ -n "$_k" ] || continue
+      if [ "$_ch" != "yes" ]; then
+        dim "  $_desc（$_k）：不可更改 —— $(port_change_note "$_k")"
+        continue
+      fi
+      _cur="$(port_get "$_k")"
+      _new="$(ask_value "$_desc" "$_cur")"
+      [ "$_new" = "-" ] && continue
+      [ "$_new" = "$_cur" ] && continue
+      if port_busy "$_new" && ! port_held_by_hdw "$_new"; then
+        warn "    端口 $_new 已被占用"
+        if ! confirm "    仍要用它？"; then continue; fi
+      fi
+      port_apply "$_k" "$_new"
+    done < <(ports_manifest)
+  fi
+fi
+
+# 记录进决策快照，方便排查"当时用的什么端口"
+{
+  echo "HDW_DEPLOY_PORT_WEBUI=$(port_get webui)"
+  echo "HDW_DEPLOY_PORT_QA=$(port_get qa)"
+  echo "HDW_DEPLOY_PORT_LLAMA=$(port_get llama)"
+} >> "$PLAN_FILE"
+
+# ═══ 阶段 1.6：推理后端（无 GPU 时引导切在线 API）══════════════
+#
+# 纯 CPU 跑 27B 模型约 1 token/s——回答一个问题要等几分钟，实际不可用。
+# 与其装一个跑不动的系统让用户自己发现，不如在这里把在线 API 配好。
+# 默认值取自 .env，用户可以直接回车沿用。
+
+if [ "$HDW_GPU_COUNT" -eq 0 ]; then
+  step "推理方式（未检测到 GPU）"
+
+  log ""
+  log "  没有可用的 NVIDIA 显卡（nvidia-smi 不存在或没有设备）。这影响两件事："
+  log ""
+  log "    · 本地推理：llama.cpp 只能走 CPU，27B 模型约 1 token/s，"
+  log "      问一个问题要等好几分钟，实际不可用。"
+  log "    · 知识入库的 GPU 加速：入库时本要临时抢占显卡跑嵌入与重排，"
+  log "      无卡时这条路径不可用（入库会慢很多，但不影响已有知识库的问答）。"
+  log ""
+  log "  建议改用在线 API：问答立刻可用。代价是每次提问都走外网，"
+  log "  且提问内容和检索到的文档片段会发给模型提供方。"
+  log ""
+
+  _cur_base="$(env_get "$ENV_FILE" HDW_ONLINE_LLM_BASE_URL || echo '')"
+  _cur_model="$(env_get "$ENV_FILE" HDW_ONLINE_LLM_MODEL || echo '')"
+  _cur_key="$(env_get "$ENV_FILE" HDW_ONLINE_LLM_API_KEY || echo '')"
+  _cur_base="${_cur_base:-https://api.deepseek.com}"
+  _cur_model="${_cur_model:-deepseek-v4-flash}"
+
+  if [ -n "$_cur_key" ]; then
+    info "当前已配置在线 API（key 已填，不显示）"
+  else
+    info "在线 API 还没配 key"
+  fi
+
+  if confirm "切换到在线 API？"; then
+    log ""
+    log "填写在线模型配置（回车保持当前值；key 直接粘贴，不会回显到日志）"
+    _new_base="$(ask_value "base_url" "$_cur_base")"
+    _new_model="$(ask_value "model" "$_cur_model")"
+    if [ -n "$_cur_key" ]; then
+      printf '  api_key [已配置，回车保持不变]: ' >&2
+      read -r _new_key
+      _new_key="${_new_key:-$_cur_key}"
+    else
+      printf '  api_key（必填，否则提问会返回 503）: ' >&2
+      read -r _new_key
+    fi
+
+    env_set "$ENV_FILE" HDW_ONLINE_LLM_BASE_URL "$_new_base"
+    env_set "$ENV_FILE" HDW_ONLINE_LLM_MODEL "$_new_model"
+    [ -n "$_new_key" ] && env_set "$ENV_FILE" HDW_ONLINE_LLM_API_KEY "$_new_key"
+    # 默认推理模式设成 online。注意这只影响部分入口，
+    # 每次问答真正取的是 auth.csv 里该用户的 default_inference_mode（见下）。
+    env_set "$ENV_FILE" HDW_LLM_MODE "online"
+    # 明确不启动本地 llama。不设这个的话 start.sh 仍会按 base_url 去拉 llama，
+    # 然后在 CPU 上花几分钟加载 12G 模型，最后大概率 OOM 或超时。
+    env_set "$ENV_FILE" HDW_SKIP_LOCAL_LLM "true"
+
+    ok "在线 API 已配置：$_new_base / $_new_model"
+    [ -n "$_new_key" ] || warn "没填 api_key，提问会返回 503（online LLM API key is not configured）"
+
+    # ── auth.csv 的默认推理模式 ──
+    # **这一处不改，前面全白做**：每次问答的默认模式取的是
+    # auth_store 里该用户的 default_inference_mode 字段
+    # （app/main.py:2222 → _user_default_inference_mode），
+    # 而不是 .env 的 HDW_LLM_MODE。本项目 98 个用户该字段都是 offline，
+    # 所以不翻的话，用户提问仍然走离线 → 没本地模型 → 直接失败。
+    _auth_csv="$HDW_ROOT/HDW_Security/auth/auth.csv"
+    if [ -f "$_auth_csv" ]; then
+      _offline_n="$(python3 -c "
+import csv,sys
+with open(sys.argv[1], encoding='utf-8-sig', newline='') as fh:
+    print(sum(1 for r in csv.DictReader(fh) if (r.get('default_inference_mode') or '').strip().lower() != 'online'))
+" "$_auth_csv" 2>/dev/null || echo 0)"
+      if [ "${_offline_n:-0}" -gt 0 ]; then
+        log ""
+        log "  还有 $_offline_n 个用户的默认推理模式是「离线」。"
+        log "  不改成「在线」的话，他们提问仍会走离线、直接失败——"
+        log "  因为默认模式取自 auth.csv，不是 .env。"
+        if confirm "  把这 $_offline_n 个用户的默认模式改为 online？"; then
+          backup_once "$_auth_csv"
+          python3 - "$_auth_csv" <<'PY'
+import csv, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8-sig", newline="") as fh:
+    rows = list(csv.DictReader(fh))
+    fields = list(rows[0].keys())
+for r in rows:
+    r["default_inference_mode"] = "online"
+with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+    w = csv.DictWriter(fh, fieldnames=fields)
+    w.writeheader()
+    w.writerows(rows)
+PY
+          ok "  已把 $_offline_n 个用户改为 online（原文件已备份）"
+        else
+          warn "  保持 offline。这些用户需要在 WebUI 里手工切到「在线」才能提问。"
+        fi
+      fi
+    fi
+
+    log ""
+    warn "本地推理（离线模式）已停用："
+    log "    · 不会启动 llama 服务（HDW_SKIP_LOCAL_LLM=true）"
+    log "    · WebUI 里仍能看到「离线」选项，但选中会失败——没有本地模型在跑"
+    log "    · 部署结束后的推理冒烟测试会跳过（没有本地后端可测）"
+    log ""
+    log "  以后加了显卡，重跑 bash Scripts/deploy.sh 即可切回本地推理。"
+    ONLINE_ONLY=1
+  else
+    warn "保持本地推理。请知悉：纯 CPU 下 27B 模型约 1 token/s，"
+    warn "一次问答可能要等好几分钟，且知识入库的 GPU 加速不可用。"
+  fi
+fi
+
 # ═══ 阶段 2：配置渲染 ═════════════════════════════════════════
 
 step "渲染机器相关配置"
@@ -307,16 +541,23 @@ info ".env 已更新（HDW_WEBUI_BIND=$BIND_IP，绝对路径覆盖已清除）"
 # 隐藏硬依赖：llama/start.sh、resource_coordinator、qa-api 三方都读它，
 # 但仓库里没有任何地方生成它。
 CONFIG_JSON="$RUNTIME_ROOT/model-config/config.json"
+# base_url 从 .env 取，不写死。写死的话新机器首次部署就会写出带旧端口的配置，
+# 而 qa-api 读的正是它（.env 只是 fallback）——改了端口却在这里被拽回 1919。
+# 注意必须在 source .env 之后取，所以这里现读现算。
+_LOCAL_LLM_BASE_URL="$(sed -n 's/^HDW_LOCAL_LLM_BASE_URL=//p' "$ENV_FILE" 2>/dev/null | tail -1)"
+_LOCAL_LLM_BASE_URL="${_LOCAL_LLM_BASE_URL:-http://host.docker.internal:1919/v1}"
+
 if [ ! -f "$CONFIG_JSON" ]; then
-  python3 - "$CONFIG_JSON" <<'PY'
+  python3 - "$CONFIG_JSON" "$_LOCAL_LLM_BASE_URL" <<'PY'
 import json, sys
 from pathlib import Path
 target = Path(sys.argv[1])
+local_base_url = sys.argv[2]
 target.parent.mkdir(parents=True, exist_ok=True)
 cfg = {
     "version": 2,
     "local": {
-        "base_url": "http://host.docker.internal:1919/v1",
+        "base_url": local_base_url,
         "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
         "engine": "llama.cpp",
         "context_window": 262144,
@@ -460,6 +701,39 @@ bash "$SCRIPT_DIR/fetch_vendors.sh" --network "$NET_MODE" ${PREFER_HOST:+--prefe
      缺 aora-bot 会导致 WebUI 的情绪球加载不出来。"
 }
 
+# ═══ 阶段 3.5：构建 llama.cpp ═════════════════════════════════
+# 排在拉源码之后、建镜像之前。从 GitHub 克隆的项目里没有编译好的
+# llama-server，必须在这里补上，否则后面 start.sh 会起不来本地推理。
+
+if [ "$NEED_LLAMA_BUILD" = "1" ]; then
+  step "构建 llama.cpp"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "--dry-run：跳过实际编译（这一步要 3-40 分钟）"
+  elif [ "$NET_MODE" = "offline" ]; then
+    warn "离线模式下无法拉取 llama.cpp 源码（它不在离线包里时会失败）。
+     如果用的是 pack_hdw.sh 打出来的包，源码和编译产物应该都在，
+     不该走到这里——请检查包是否完整。"
+  else
+    bash "$SCRIPT_DIR/build_llama.sh" || die "llama.cpp 构建失败。
+     没有本地推理后端的话，本地问答与知识入库都无法工作。
+     可以只部署在线模式：重跑并选择「切换到在线 API」。"
+  fi
+
+  # 重新选一次后端——刚编出来的产物现在应该在
+  BACKEND_REL="$(select_llama_backend_dir "$LLAMA_DIR" "$HDW_GPU_CAP" "$HDW_GPU_COUNT")"
+  if [ -n "$BACKEND_REL" ]; then
+    case "$BACKEND_REL" in
+      *build-cuda*) LLAMA_DEVICE="CUDA0" ;;
+      *build*)      LLAMA_DEVICE="Vulkan0" ;;
+    esac
+    ok "推理后端：$BACKEND_REL（device=$LLAMA_DEVICE）"
+    NEED_LLAMA_BUILD=0
+  elif [ "$DRY_RUN" != "1" ]; then
+    warn "构建后仍找不到可用的 llama-server。本地推理将不可用。"
+  fi
+fi
+
 # ═══ 阶段 4：模型 ═════════════════════════════════════════════
 
 if [ "$SKIP_MODELS" = "1" ]; then
@@ -529,8 +803,16 @@ if ! linger_enabled; then
 fi
 
 log "不可用的能力（如有）："
-if [ "$HDW_GPU_COUNT" -eq 0 ]; then
-  log "  · 无 NVIDIA 卡：本地推理走 CPU，速度很低；知识入库的 GPU 加速路径（/prepare）不可用"
+if [ "${HDW_SKIP_LOCAL_LLM:-false}" = "true" ]; then
+  # 无 GPU 且选了在线 API。这里必须说清楚，否则用户会在 WebUI 里
+  # 点「离线」然后一直失败，还不知道为什么。
+  log "  · 本地推理（离线模式）：已停用 —— 未启动 llama 服务"
+  log "      前端仍能看到「离线」选项，但选中会失败。要恢复需要一张 NVIDIA 卡，"
+  log "      然后重跑 bash Scripts/deploy.sh。"
+  log "  · 知识入库的 GPU 加速：不可用（入库会慢很多，不影响已有知识库的问答）"
+elif [ "$HDW_GPU_COUNT" -eq 0 ]; then
+  log "  · 无 NVIDIA 卡：本地推理走 CPU，约 1 token/s，一次问答要等几分钟"
+  log "  · 知识入库的 GPU 加速路径（/prepare）不可用"
 fi
 case "$BACKEND_REL" in
   *build-cuda*) : ;;
