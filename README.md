@@ -1932,6 +1932,29 @@ bash Scripts/deploy_verify.sh --deep   # 额外做重启演练
       用 `git ls-tree -r -z`（NUL 分隔、不转义）。
       **验证时不要拿同一套解析去比两边**——两边都错的话反而显示"一致"。
 - [ ] **模型/构建产物/第三方源码没有进库**，见 `.gitignore` 三、六两节。
+- [ ] **模拟一次真实克隆**（漏过这类问题，代价很大）：
+
+      ```bash
+      rm -rf /tmp/clonetest && mkdir -p /tmp/clonetest
+      git archive HEAD | tar -x -C /tmp/clonetest
+      ls /tmp/clonetest/Configs/.env.example        # 必须存在
+      bash /tmp/clonetest/Scripts/deploy.sh --dry-run
+      ```
+
+      **为什么必须做**：`.gitignore` 的排除规则过宽会静默吞掉本该进库的文件。
+      实际发生过——`Configs/.env.*` 这条规则把 `.env.example` 一起排除了，
+      而它是新机器唯一的配置模板，结果别人克隆后第一步就死：
+      「既没有 Configs/.env 也没有 Configs/.env.example」。
+      本地一切正常，因为本地**早就有 .env 了**，根本走不到那个分支。
+
+      **教训**：排除规则要写到具体命名形式（`Configs/.env.before*`），
+      不要用 `Configs/.env.*` 这种会把模板一起吞掉的通配。
+      同理，凭据识别也别用裸子串——`KEY|TOKEN` 会误伤
+      `KEYCLOAK_URL` 和 `HDW_LLM_MAX_TOKENS`，要带词边界（`_KEY$`）。
+- [ ] **`Configs/.env.example` 覆盖了 `.env` 的全部键**：
+      `bash Scripts/gen_env_example.sh --check`。模板过时会让新机器缺配置，
+      且症状分散、很难定位到「模板少了几个键」这个根因。
+      `.env` 有改动就重跑 `bash Scripts/gen_env_example.sh` 重新生成。
 
 项目的最短可靠路径是：
 

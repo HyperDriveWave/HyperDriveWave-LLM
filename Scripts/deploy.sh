@@ -270,7 +270,15 @@ step "端口"
 
 # 提前把 .env 建出来（阶段 2 也要用），否则端口读不到已有配置
 if [ ! -f "$ENV_FILE" ]; then
-  [ -f "$ENV_EXAMPLE" ] || die "既没有 $ENV_FILE 也没有 $ENV_EXAMPLE"
+  if [ ! -f "$ENV_EXAMPLE" ]; then
+    die "既没有 $ENV_FILE 也没有 $ENV_EXAMPLE。
+     正常情况下 .env.example 是随版本库一起来的，不该两个都缺。
+     最可能的原因是**克隆不完整**——检查一下：
+       git ls-files Configs/ | grep env
+     如果只有 .env 而没有 .env.example，那是 .gitignore 的排除规则写得太宽
+     （比如用了 \`Configs/.env.*\` 这种会把 .env.example 一起吞掉的模式），
+     要去版本库里把 Configs/.env.example 补回来。"
+  fi
   cp "$ENV_EXAMPLE" "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   info "已从 .env.example 生成 Configs/.env"

@@ -22,9 +22,22 @@ Configs/*.bak-*
 # .env.before-remote-rag-20260909），但内容就是一份完整的凭据快照——
 # 实测里面躺着真实的 HDW_ONLINE_LLM_API_KEY 和 HDW_AUTH_SECRET。
 # 建议直接删掉，留着既没用又是风险。
-Configs/.env.*
+# **不要写成 `Configs/.env.*`** —— 那会把 `.env.example` 一起吞掉，
+# 而它是新机器唯一的模板，缺了它 deploy.sh 第一步就死。
+# 这是踩过的坑：克隆到另一台机器后报
+#   「既没有 Configs/.env 也没有 Configs/.env.example」
+# 排除规则要精确到具体的备份命名形式。
+Configs/.env.before*
+Configs/.env.[0-9]*
+Configs/.env.bak*
+Configs/.env.bak-*
+Configs/.env.save*
+Configs/.env.old*
+Configs/.env.local*
 Configs/*.env.before*
 Configs/*.env.[0-9]*
+# 显式保住模板文件（否定规则要放在排除规则之后才生效）
+!Configs/.env.example
 
 # FRP 配置里带真实 auth token 的那几个。它们指向的是**别的** FRP 服务器
 # （第三方 FRP 服务器和 SmartGasTurbine 自己的 frps），和本项目部署无关。
