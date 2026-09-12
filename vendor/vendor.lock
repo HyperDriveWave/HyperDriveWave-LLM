@@ -25,10 +25,20 @@
 # （源码树 1.4G、CUDA 产物 974M），所以从 GitHub 克隆的项目必须先跑
 # Scripts/build_llama.sh 现场编译，否则部署会死在「找不到 llama-server」。
 #
-# 注意：llama.cpp 官方源在 github.com，**没有可用的 gitee 镜像**
-# （gitee.com/mirrors/llama.cpp 和 ggml-org/llama.cpp 都试过，不存在）。
-# 连不上 github 的机器请改用离线包——pack_hdw.sh 打出来的包里带着源码和产物。
-HDW_Inference/llama/llama.cpp-upstream	f3f1a8f2760f28325a5ec20c05b171e5b7c83a29	yes	master	https://github.com/ggml-org/llama.cpp
+# 镜像兜底：github 在国内不一定连得上（实测会**无限挂起**），所以带了 gitee 镜像。
+# **注意 URL 后面的 #<commit>** —— 镜像没有我们锁定的那个 commit（它是定时同步的，
+# 天然落后几天），不带 # 的话每一级回退都会失败。这里锁的镜像版本是
+# 2026-08-28，比上游锁定的 2026-09-08 落后 11 天。
+#
+# 已验证该镜像**保留了 MTP 投机解码**（common/arg.cpp 的 spec_type_draft_mtp、
+# opts.download_mtp、--spec-type 与本机那份逐处一致），这是本项目最依赖的特性。
+# 但版本毕竟不同，走到镜像兜底后 fetch_vendors.sh 会警告并要求重跑验收。
+#
+# 其他确认不存在的镜像（别再试了）：gitee.com/mirrors/llama.cpp（点号，不存在）、
+# gitee.com/ggml-org/llama.cpp（不存在）、gitee.com/lure_ai/llama.cpp（存在但停在
+# 2026-04-20，落后 5 个月，太旧）。连 github 和 gitee 都不通的机器请改用离线包——
+# pack_hdw.sh 打出来的包里带着源码和产物。
+HDW_Inference/llama/llama.cpp-upstream	f3f1a8f2760f28325a5ec20c05b171e5b7c83a29	yes	master	https://github.com/ggml-org/llama.cpp,https://gitee.com/mirrors/llama-cpp#b387ddfd84b4b1f79a6e09910748195e3320e89e
 
 # MinerU：knowledge profile，hdw-mineru 镜像的构建上下文（Dockerfile 里 COPY . .）
 HDW_Knowledge/MinerU	2fbeef09960c7ed0643a15a576ba21e104036375	yes	master	https://github.com/opendatalab/MinerU.git,https://gitee.com/pplus_open_source/MinerU.git

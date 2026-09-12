@@ -206,8 +206,13 @@ if [ ! -d "$SRC_DIR" ]; then
   log ""
   log "    bash Scripts/fetch_vendors.sh --with llama.cpp-upstream"
   log ""
-  log "  注意：llama.cpp 官方源在 github.com，没有 gitee 镜像。"
-  log "  如果这台机器连不上 github，改用离线包（pack_hdw.sh 打出来的包里带着源码）。"
+  log "  连不上 github 时加 --prefer gitee 走镜像（实测 9 秒，快得多）："
+  log ""
+  log "    bash Scripts/fetch_vendors.sh --with llama.cpp-upstream --prefer gitee"
+  log ""
+  log "  注意：镜像是定时同步的，**没有**我们锁定的那个 commit，所以它会给一份"
+  log "  稍旧的源码（脚本会明确警告）。介意的话改用离线包——"
+  log "  pack_hdw.sh 打出来的包里带着源码和编译好的产物，版本与源机完全一致。"
   exit 1
 fi
 [ -d "$SRC_DIR/.git" ] || warn "源码目录不是 git 仓库——可能是从离线包解出来的，继续"

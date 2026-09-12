@@ -1218,21 +1218,26 @@ MinerU 和 FreeToken 的 Dockerfile 另外支持 `--build-arg APT_MIRROR=<url>` 
 
 ### 10.8 第三方依赖（vendor）
 
-项目用到 10 个第三方仓库，但**它们不进版本库**——仓库里只留一份锁文件，
+项目用到 12 个第三方仓库，但**它们不进版本库**——仓库里只留一份锁文件，
 部署时按需克隆回原路径（项目结构完全不变）。
 
 ```bash
-bash Scripts/fetch_vendors.sh                 # 只拉默认需要的（MinerU、aora-bot）
-bash Scripts/fetch_vendors.sh --all           # 全部（含 6 个预留仓库，约 2.7G）
+bash Scripts/fetch_vendors.sh                 # 只拉默认需要的 4 个（见下）
+bash Scripts/fetch_vendors.sh --all           # 全部 12 个（含 8 个预留仓库）
 bash Scripts/fetch_vendors.sh --with dify,n8n # 默认的 **加上** 这两个
 bash Scripts/fetch_vendors.sh --only MinerU   # 只要这一个
 bash Scripts/fetch_vendors.sh --check-only    # 只报状态，不克隆
 bash Scripts/fetch_vendors.sh --prefer gitee  # 优先走 gitee（国内网络强烈建议）
 ```
 
-**为什么这么做**：这 10 个目录合计 3.45 GiB，其中 **2.66 GiB 是 `.git`**——
-真正的源码只有 606 MiB，而构建产物一个都没有（`node_modules` 全项目为零）。
-把 git 历史搬进项目仓库纯属浪费。实测默认的那 3 个克隆下来只要 **62 MB**。
+默认拉的 4 个是：`llama.cpp-upstream`（推理引擎源码，**必须**，见 §10.10）、
+`MinerU`（`hdw-mineru` 镜像的构建上下文）、`aora-bot`（WebUI 情绪球）、
+`python-sdk`（`hdw-mcp` 镜像构建依赖）。其余 8 个当前零引用，要用时显式 `--with`。
+
+**为什么这么做**：这 12 个目录全部拉齐是 **4.8 GiB，其中 2.7 GiB 是 `.git`**。
+把 git 历史搬进项目仓库纯属浪费，而且 12 个仓库里有 8 个现在根本没被引用。
+注意大头的分布很悬殊——单独一个 `llama.cpp-upstream` 就占 1.4 GB（源码树本身
+就大），其余 11 个合计才 3.5 GiB。默认那 4 个里不含 llama.cpp 时只要 62 MB。
 
 **版本锁在 [`vendor/vendor.lock`](vendor/vendor.lock)**，制表符分隔，每行是
 `路径 / commit / 是否默认拉 / 分支 / URL`。用的是 commit SHA 而非分支名——
@@ -1241,6 +1246,25 @@ bash Scripts/fetch_vendors.sh --prefer gitee  # 优先走 gitee（国内网络�
 **URL 一栏是「规范上游在前、镜像兜底在后」**，按顺序尝试。这不是摆设：
 本机实测 `github.com` 的按 commit 拉取会**无限挂起**（GitHub 对未广告的 SHA
 要做一次完整可达性遍历，大仓库上能卡几分钟），靠回退到 `gitee.com` 才装上。
+
+**镜像 URL 可以带自己的 commit，写法是 `URL#commit`**：
+
+```text
+https://github.com/ggml-org/llama.cpp,https://gitee.com/mirrors/llama-cpp#b387ddfd84b4...
+```
+
+这不是可选的花样，而是**镜像兜底能成立的前提**：镜像是别人的定时同步，
+**永远不会有**我们锁定的那个 commit。原先"多个 URL 试同一个 commit"的模型对
+镜像不成立，把镜像 URL 直接追加进去只会每一级都失败——看起来配了兜底，实际
+一点用没有。
+
+不带 `#` 的 URL 用行首那个锁定 commit（所以老写法完全兼容）。分隔符选 `#`
+而不是 `@`，因为 SSH 写法 `git@host:path` 里本来就有 `@`。
+
+走到镜像兜底时脚本会**明确警告**，列出「锁定版本 → 实际拿到的版本」并
+要求重跑验收；已有目录落在镜像 commit 上时判为 `就绪·镜像版本`（**不重克隆**，
+否则每次跑都会重拉一遍）。`--check-only` 会把每个 URL 各自会检出的 commit
+都列出来。
 
 国内网络建议直接加 `--prefer gitee` 把 gitee 提到前面，省掉那次白等：
 
@@ -1261,6 +1285,9 @@ bash Scripts/fetch_vendors.sh --prefer gitee  # 优先走 gitee（国内网络�
 | 3 | 全量 `git clone` + checkout | 最慢，但一定成功 |
 
 第 1 级依赖服务端支持取任意 SHA（`uploadpack.allowReachableSHA1InWant`）。
+**GitHub 和 Gitee 都支持**（Gitee 是 2026-09-12 实测的：对
+`gitee.com/mirrors/llama-cpp` 浅取任意 SHA，9 秒成功）——所以镜像兜底通常
+就停在最快的那一级，不会退化成全量克隆。
 每级都有超时（默认 45s / 150s / 1800s，可用 `HDW_VENDOR_T*_TIMEOUT` 调），
 某个 host 三级全挂后**本次运行内不再尝试它**。
 
@@ -1385,8 +1412,27 @@ bash Scripts/build_llama.sh --rebuild    # 强制重编
 bash Scripts/build_llama.sh --cpu        # 强制 CPU 版
 ```
 
-**注意 llama.cpp 没有可用的国内镜像**（`gitee.com/mirrors/llama.cpp` 不存在）。
-连不上 github 的机器请改用离线包——`pack_hdw.sh` 打出来的包里带着源码和产物。
+**连不上 github 时走 gitee 镜像**（`vendor.lock` 里已配好兜底）：
+
+```bash
+bash Scripts/fetch_vendors.sh --with llama.cpp-upstream --prefer gitee
+```
+
+实测 9 秒完成（github 那边会挂起 45 秒才超时）。**但要注意兜底给的是另一份代码**：
+
+镜像是定时同步的，**不会**有我们锁定的那个 commit，所以脚本会用镜像自己的版本
+（写在 `vendor.lock` 的 `#<commit>` 里），并明确警告版本不同。这一点已针对
+llama.cpp 专门核对过——镜像是 2026-08-28，锁定的是 2026-09-08，落后 11 天，
+**MTP 投机解码的代码逐处一致**（`spec_type_draft_mtp` / `opts.download_mtp` /
+`--spec-type` 取值集合相同）。但版本差异不会被自动测出来，**务必重跑验收**：
+
+```bash
+bash Scripts/deploy_verify.sh
+```
+
+要拿到与源机完全一致的版本，用离线包——`pack_hdw.sh` 打出来的包里带着源码和
+编译好的产物。另外 `gitee.com/lure_ai/llama.cpp` 虽然存在但停在 2026-04-20
+（落后 5 个月），太旧，不要用。
 
 **在这台机器上已经跑着一份 HyperDriveWave 的情况下克隆部署**（比如为了
 对比新旧版本），`deploy.sh` 会检测到 systemd 单元正指向另一个目录并要求

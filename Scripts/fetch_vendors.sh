@@ -5,8 +5,8 @@
 # 本脚本负责补齐，并把项目自有的 overlay 文件（vendor/overlays/）拷回原位。
 #
 # 用法：
-#   bash Scripts/fetch_vendors.sh                 # 只拉默认需要的（MinerU / aora-bot）
-#   bash Scripts/fetch_vendors.sh --all           # 拉全部（含 6 个预留仓库，约 2.7G）
+#   bash Scripts/fetch_vendors.sh                 # 只拉默认需要的 4 个
+#   bash Scripts/fetch_vendors.sh --all           # 拉全部 12 个（含 8 个预留仓库）
 #   bash Scripts/fetch_vendors.sh --with dify,n8n # 默认的 **加上** 这两个
 #   bash Scripts/fetch_vendors.sh --only MinerU   # 只要这一个
 #   bash Scripts/fetch_vendors.sh --check-only    # 只报状态，不克隆
@@ -16,6 +16,12 @@
 # 但国内网络下按 SHA 拉 github 会**无限挂起**，虽有超时和拉黑兜底，首次仍要
 # 白等 45 秒。--prefer gitee 把 gitee 的 URL 提到前面，实测冷克隆 54s → 2.5s。
 # 只影响本次运行，不改锁文件。
+#
+# 关于镜像 URL 的写法：镜像（如 gitee 的定时同步）**不会有**我们锁定的那个
+# commit，所以 URL 后面可以直接带上它自己存在的 commit，用 # 分隔：
+#   https://github.com/上游/repo#<锁定的commit>,https://gitee.com/镜像/repo#<镜像的commit>
+# 不带 # 的 URL 用行首那个锁定 commit。走到镜像兜底会**明确警告版本不同**，
+# 并要求重跑验收——因为拿到的确实是另一份代码。
 #
 # 退出码：0 = 需要的都已就绪；1 = 有缺失（离线模式下的正常结果）
 
@@ -47,7 +53,10 @@ while [ $# -gt 0 ]; do
     --check-only) CHECK_ONLY=1; shift ;;
     --network)    NET_MODE="${2:-}"; shift 2 ;;
     --prefer)     PREFER_HOST="${2:-}"; shift 2 ;;
-    -h|--help)    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)    # 取开头连续的注释块。**不用硬编码行号**——原先写的是
+                  # `sed -n '2,20p'`，往头部加几行说明就会截断（deploy.sh 里有同样的坑）。
+                  awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print; next } exit }' "${BASH_SOURCE[0]}"
+                  exit 0 ;;
     *) die "未知参数：$1" ;;
   esac
 done
@@ -70,6 +79,43 @@ order_urls() {
     esac
   done
   printf '%s' "${first}${first:+,}${rest}"
+}
+
+# ── 每个 URL 可以带自己的 commit（URL#commit）────────────────────
+# **按最后一个 # 切分**。不能用 @ 当分隔符——SSH 写法 `git@host:path` 里本来
+# 就有 @，切出来会把 host 当成 commit。而仓库 URL 里出现 # 的情况不存在。
+# 不带 #commit 的 URL 用行首那个 commit（规范上游的锚定版本）。
+#
+# 为什么非要有这个：gitee 镜像**永远不会有**我们锁定的那个 commit——
+# 它是别人的定时同步，天然落后几天。所以原先"多个 URL 试同一个 commit"
+# 这个模型对镜像根本不成立，把镜像 URL 加进去只会每次都失败。
+# 带上镜像自己的 commit，兜底才谈得上成立。
+#
+# 代价是**版本与锁定的不同**，所以走到兜底必须大声警告并重跑验收。
+url_clean() { printf '%s' "${1%%#*}"; }
+
+url_commit() {   # $1=url（可能带 #commit）  $2=行首 commit
+  case "$1" in
+    *'#'*) printf '%s' "${1##*#}" ;;
+    *)     printf '%s' "$2" ;;
+  esac
+}
+
+# 这一行所有可接受的 commit：行首那个 + 每个 URL 自带的，去重、逗号分隔。
+# 已有仓库落在其中任何一个上都算"就绪"——否则用镜像拉过的机器每次跑都判
+# WRONG_HEAD，然后反复重克隆，永远修不好。
+acceptable_commits() {   # $1=行首 commit  $2=urls
+  # **out 必须单独一行赋值**：`local a="$1" b="$a"` 里 $a 是在赋值前展开的，
+  # 取到的是外层同名变量（未定义），锚定 commit 会被静默吞掉。
+  local row="$1" urls="$2" u c
+  local out="$row"
+  for u in ${urls//,/ }; do
+    [ -n "$u" ] || continue
+    c="$(url_commit "$u" "$row")"
+    [ "$c" = "$row" ] && continue
+    case ",$out," in *",$c,"*) ;; *) out="$out,$c" ;; esac
+  done
+  printf '%s' "$out"
 }
 
 case "$NET_MODE" in
@@ -155,8 +201,13 @@ should_fetch() {
 }
 
 # ── 状态判定 ──────────────────────────────────────────────────
+# $1=path  $2=锚定 commit  $3..=其它可接受的 commit（镜像自带的那些）
+#
+# 输出 OK / OK_FALLBACK / NOGIT / MISSING / WRONG_HEAD
+# OK_FALLBACK 表示落在某个镜像的 commit 上：**算就绪**（不然会反复重克隆），
+# 但要明确标出来，因为那是与锁定版本不同的另一份代码。
 vendor_status() {
-  local path="$1" want="$2"
+  local path="$1" want="$2"; shift 2
   local dir="$HDW_ROOT/$path"
   if [ ! -d "$dir/.git" ]; then
     # 目录存在但没有 .git —— 可能是从旧备份直接拷过来的
@@ -169,16 +220,18 @@ vendor_status() {
   fi
   local head
   head="$(git -C "$dir" rev-parse HEAD 2>/dev/null)"
-  if [ "$head" = "$want" ]; then
-    echo "OK"
-  else
-    echo "WRONG_HEAD"
-  fi
+  if [ "$head" = "$want" ]; then echo "OK"; return; fi
+  local c
+  for c in "$@"; do
+    [ -n "$c" ] && [ "$head" = "$c" ] && { echo "OK_FALLBACK"; return; }
+  done
+  echo "WRONG_HEAD"
 }
 
 # ── 三级克隆 ──────────────────────────────────────────────────
 # 第 1 级依赖服务端支持取任意 SHA（uploadpack.allowReachableSHA1InWant）。
-# GitHub 支持；Gitee 未验证——这正是要有回退的原因。
+# GitHub 支持；**Gitee 实测也支持**（2026-09-12 对 gitee.com/mirrors/llama-cpp
+# 浅取任意 SHA，9 秒成功）——所以镜像兜底走的是最快的那一级，不会退化到全量克隆。
 
 try_shallow_sha() {
   local url="$1" sha="$2" dest="$3"
@@ -256,15 +309,19 @@ step "检查第三方依赖"
 
 NEED=(); OK=(); SKIP=()
 declare -a FETCH_JOBS=()
+# 走了镜像兜底的条目（拿到的是与锁定版本不同的代码）
+declare -a FALLBACK_USED=()
 
 while IFS=$'\t' read -r path commit is_default branch urls; do
   [ -n "${path:-}" ] || continue
   [ -n "${commit:-}" ] || { warn "锁文件条目缺 commit：$path"; continue; }
 
-  st="$(vendor_status "$path" "$commit")"
+  # 允许的 commit = 锚定的 + 各镜像自带的。要把它们逐个展开成位置参数。
+  read -r -a _accept <<< "$(acceptable_commits "$commit" "$urls" | tr ',' ' ')"
+  st="$(vendor_status "$path" "${_accept[@]}")"
 
   if ! should_fetch "$path" "$is_default"; then
-    if [ "$st" = "OK" ]; then
+    if [ "$st" = "OK" ] || [ "$st" = "OK_FALLBACK" ]; then
       dim "  [就绪] $path"
     else
       SKIP+=("$path|$st|$is_default")
@@ -276,6 +333,12 @@ while IFS=$'\t' read -r path commit is_default branch urls; do
     OK)
       OK+=("$path")
       dim "  [就绪] $path"
+      ;;
+    OK_FALLBACK)
+      # 算就绪，不重克隆（重克隆也只会再拿回同一个镜像 commit）。但必须标出来。
+      OK+=("$path")
+      warn "  [就绪·镜像版本] $path"
+      warn "      在 $(git -C "$HDW_ROOT/$path" rev-parse HEAD 2>/dev/null | cut -c1-12)，不是锁定的 ${commit:0:12}"
       ;;
     MISSING|NOGIT|WRONG_HEAD)
       NEED+=("$path|$commit|$branch|$urls|$st")
@@ -297,7 +360,19 @@ if [ "$CHECK_ONLY" = "1" ]; then
   log "仅检查模式：不克隆。缺失清单："
   for item in "${NEED[@]}"; do
     IFS='|' read -r p c b u _ <<< "$item"
-    printf '  %-32s ← %s @ %s\n' "$p" "$(printf '%s' "$u" | cut -d, -f1)" "${c:0:12}"
+    printf '  %-32s ← 锁定 %s\n' "$p" "${c:0:12}"
+    # 把每个候选 URL 和它**实际会检出**的 commit 都列出来——镜像那个往往
+    # 不是锁定的 commit，这正是最容易看漏的一点。
+    for _u in ${u//,/ }; do
+      [ -n "$_u" ] || continue
+      _uc="$(url_commit "$_u" "$c")"
+      if [ "$_uc" = "$c" ]; then
+        printf '      %s\n' "$(url_clean "$_u")"
+      else
+        printf '      %s\n         └ %s（镜像版本，与锁定不同）\n' \
+          "$(url_clean "$_u")" "${_uc:0:12}"
+      fi
+    done
   done
   log ""
   log "有网的机器上执行：bash Scripts/fetch_vendors.sh --all"
@@ -318,7 +393,9 @@ step "克隆缺失的依赖（${#NEED[@]} 个）"
 for item in "${NEED[@]}"; do
   IFS='|' read -r path commit branch urls st <<< "$item"
   dest="$HDW_ROOT/$path"
-  url_primary="$(printf '%s' "$urls" | cut -d, -f1)"
+  url_primary_raw="$(printf '%s' "$urls" | cut -d, -f1)"
+  url_primary="$(url_clean "$url_primary_raw")"
+  primary_commit="$(url_commit "$url_primary_raw" "$commit")"
 
   log ""
   info "▶ $path"
@@ -326,7 +403,7 @@ for item in "${NEED[@]}"; do
 
   # 已有目录但 commit 不对 → 先试增量，不重新克隆
   if [ "$st" = "WRONG_HEAD" ] || [ "$st" = "NOGIT" ] && [ -d "$dest/.git" ]; then
-    if fix_existing "$path" "$commit" "$url_primary"; then
+    if fix_existing "$path" "$primary_commit" "$url_primary"; then
       ok "  增量修正成功"
       continue
     fi
@@ -358,17 +435,27 @@ for item in "${NEED[@]}"; do
         continue
       fi
 
-      info "  [$tier/3] $tier_name（$host，超时 ${tier_timeout}s）"
+      # 每个 URL 用**它自己**的 commit（不带 #commit 的用行首那个）
+      u_url="$(url_clean "$url")"
+      u_commit="$(url_commit "$url" "$commit")"
+
+      if [ "$u_commit" != "$commit" ]; then
+        info "  [$tier/3] $tier_name（$host，超时 ${tier_timeout}s）"
+        dim "        镜像版本 ${u_commit:0:12}（锁定的是 ${commit:0:12}）"
+      else
+        info "  [$tier/3] $tier_name（$host，超时 ${tier_timeout}s）"
+      fi
       host_tried[$host]=1
 
       case "$tier" in
-        1) try_shallow_sha    "$url" "$commit" "$dest" && { done_ok=1; } ;;
-        2) try_partial_clone  "$url" "$commit" "$branch" "$dest" && { done_ok=1; } ;;
-        3) try_full_clone     "$url" "$commit" "$branch" "$dest" && { done_ok=1; } ;;
+        1) try_shallow_sha    "$u_url" "$u_commit" "$dest" && { done_ok=1; } ;;
+        2) try_partial_clone  "$u_url" "$u_commit" "$branch" "$dest" && { done_ok=1; } ;;
+        3) try_full_clone     "$u_url" "$u_commit" "$branch" "$dest" && { done_ok=1; } ;;
       esac
 
       if [ "$done_ok" = "1" ]; then
         ok "  成功（$tier_name @ $host）"
+        effective_commit="$u_commit"
         break 2
       fi
     done
@@ -379,14 +466,24 @@ for item in "${NEED[@]}"; do
     for h in "${!host_tried[@]}"; do BAD_HOST[$h]=1; done
     fail "$path 克隆失败（所有 URL 的三级都试过了）"
     warn "    若这台机器需要走代理，设置 HTTPS_PROXY 后重跑；
-     或把可用的镜像 URL 追加到 vendor/vendor.lock 对应行的末尾。"
+     或把可用的镜像 URL 追加到 vendor/vendor.lock 对应行的末尾。
+     注意：镜像通常**没有**我们锁定的那个 commit，这时要写成
+       <镜像URL>#<该镜像上存在的 commit>
+     否则它每一级都会失败。"
     continue
   fi
 
-  # 校验：必须真的在目标 commit 上
+  # 校验：必须真的在**本次实际使用**的 commit 上
+  effective_commit="${effective_commit:-$commit}"
   got="$(git -C "$dest" rev-parse HEAD 2>/dev/null)"
-  if [ "$got" != "$commit" ]; then
-    fail "$path 检出的 commit 不对：期望 ${commit:0:12}，实际 ${got:0:12}"
+  if [ "$got" != "$effective_commit" ]; then
+    fail "$path 检出的 commit 不对：期望 ${effective_commit:0:12}，实际 ${got:0:12}"
+  fi
+
+  # 走到镜像兜底 = 拿到的是**另一份代码**，不是锁定的那个版本
+  if [ "$effective_commit" != "$commit" ]; then
+    FALLBACK_USED+=("$path|$commit|$effective_commit")
+    warn "  ⚠ $path 用的是镜像版本 ${effective_commit:0:12}，与锁定的 ${commit:0:12} **不是同一份代码**"
   fi
 done
 
@@ -396,6 +493,24 @@ log ""
 if [ "$FAIL_COUNT" -gt 0 ]; then
   warn "$FAIL_COUNT 个依赖未就绪"
   exit 1
+fi
+
+# 用了镜像兜底就得说清楚——这是**另一份代码**，不能当成本次部署没变化。
+# 尤其 llama.cpp：镜像是定时同步的，可能落后若干天，缺的正是刚加的特性。
+if [ "${#FALLBACK_USED[@]}" -gt 0 ]; then
+  log ""
+  warn "以下 ${#FALLBACK_USED[@]} 个依赖用的是**镜像版本**，与锁文件不同："
+  for _f in "${FALLBACK_USED[@]}"; do
+    IFS='|' read -r _p _want _got <<< "$_f"
+    printf '    %-46s %s → %s\n' "$_p" "${_want:0:12}" "${_got:0:12}"
+  done
+  log ""
+  log "  原因是这台机器取不到锁定的那个 commit（通常因为连不上 github，"
+  log "  而国内镜像没有同步到那一个）。能连上 github 时重跑本脚本即可换回锁定版本："
+  log "    bash Scripts/fetch_vendors.sh --all"
+  log ""
+  warn "  **请务必重跑验收**：bash Scripts/deploy_verify.sh"
+  warn "  版本差异不会被自动测出来，但可能表现成推理异常或某个新参数不生效。"
 fi
 
 ok "第三方依赖已就绪"
