@@ -47,7 +47,10 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
 
 当前明确的限制：
 
-1. Dify、n8n、LangGraph、Langfuse、Keycloak 和 Open WebUI 的源码或运行目录已经放入项目，但没有全部纳入当前主 Compose，因此不能假设它们已经启动。
+1. Dify、n8n、LangGraph、Langfuse、Keycloak 和 Open WebUI **当前未被任何代码引用**，
+   也没有纳入主 Compose，不能假设它们已经启动。它们的版本记在 `vendor/vendor.lock`
+   里但标为「不默认拉取」，要用时 `bash Scripts/fetch_vendors.sh --with dify,n8n`。
+   默认部署真正需要的只有 `MinerU`（`knowledge` profile）和 `aora-bot`（`web` profile 的情绪球）。
 2. QA API 当前会调用 RAG 和 Neo4j，但不会对每个问题自动调用 MCP。MCP 页面用于查看工具和服务状态；实时 SIS/RTSP 工具自动路由需要后续增加意图判断、权限、超时和审计。
 3. 普通入库和全量重建仍是两种语义。全量重建会重新解析源目录内全部文档，这是为了让源文件、解析结果、Chunk、Neo4j 和 Zvec 一致。
 4. 当前没有“取消正在运行的 ingest 任务”接口。停止任务需要先确认任务状态，再停止 ingest API、清理 MinerU 工作进程，并检查数据是否需要恢复。
@@ -56,7 +59,17 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
 
 ## 3. 项目结构
 
-以下是项目级结构，第三方仓库内部文件不在这里展开：
+以下是项目级结构。**带 `[vendor]` 标记的目录不在版本库里**——它们由
+`Scripts/fetch_vendors.sh` 按 `vendor/vendor.lock` 里的固定 commit 克隆回来，
+项目结构保持不变。同理，模型权重和构建产物也不进库（见 §10.8）：
+
+```text
+[vendor]  = 第三方仓库，clone 得到
+[fetch]   = 模型权重，Scripts/fetch_models.sh 下载
+[build]   = 构建产物，目标机重新编译
+```
+
+第三方仓库内部文件不在这里展开：
 
 ```text
 HyperDriveWave/
@@ -68,33 +81,47 @@ HyperDriveWave/
 │   ├── nginx/
 │   └── profiles/
 ├── Scripts/
+│   ├── deploy.sh                          # 一键部署主入口
+│   ├── deploy_remote_rag.sh               # 远端 RAG 节点单独部署
+│   ├── deploy_verify.sh                   # 验收（不信任 /health）
+│   ├── fetch_models.sh                    # 从魔搭补齐模型
+│   ├── fetch_vendors.sh                   # 按 vendor.lock 克隆第三方源码
+│   ├── setup_mirrors.sh                   # 配 Docker/pip/npm/apt 镜像源
+│   ├── pack_hdw.sh                        # 源机打包
+│   ├── lib/                               # 上述脚本共用的库
+│   │   ├── common.sh                      #   幂等写文件 / 日志
+│   │   ├── detect.sh                      #   GPU / 网络探测
+│   │   └── models.sh                      #   模型清单（唯一事实源）
 │   ├── init.sh
 │   ├── prepare_dirs.sh
-│   ├── start.sh
+│   ├── start.sh                           # 唯一的启动入口
 │   ├── stop.sh
 │   ├── restart.sh
 │   ├── status.sh
 │   ├── logs.sh
-│   ├── healthcheck.sh
+│   ├── healthcheck.sh                     # 日常巡检（有已知误报，见 §4.2）
 │   ├── backup.sh
 │   ├── restore.sh
 │   ├── ingest_knowledge.sh
+│   ├── sync_remote_rag.sh
 │   ├── resource_coordinator.py
 │   └── hyperdrivewave-resource-coordinator.service
+├── vendor/                                # 第三方依赖的「配方」，不含正文
+│   ├── vendor.lock                        #   路径 / commit / URL
+│   └── overlays/                          #   项目自有的覆盖文件，克隆后拷回原位
 ├── HDW_Engines/
 │   ├── LLM_Models/
-│   │   ├── Qwen3.8/
-│   │   └── Qwen3.8-27B-FP8/
+│   │   └── Qwen3.8-27B-GSQ/               # 当前在用（含 MTP 层）
 │   ├── RAG_Models/
 │   │   ├── bge-m3/
 │   │   └── bge-reranker-v2-m3/
 │   └── MODELS.md
 ├── HDW_Inference/
-│   ├── llama/
-│   ├── FreeToken/
+│   ├── llama/                    [build] llama.cpp 多架构构建产物
+│   ├── FreeToken/                [vendor]
 │   └── RAG_Service/
 ├── HDW_Knowledge/
-│   └── MinerU/
+│   └── MinerU/                   [vendor]
 ├── HDW_KnowledgeGraph/
 │   ├── cypher/
 │   ├── entity_aliases.json
@@ -148,7 +175,9 @@ HyperDriveWave/
 └── 架构.md
 ```
 
-`.venv/` 是本机开发环境，不是生产服务；第三方仓库的 `.git/`、示例、测试和文档属于被复用项目的内部内容。
+`.venv/` 是本机开发环境（给 `fetch_models.sh` 用），不是生产服务，也不进版本库。
+带 `[vendor]` 标记的目录同理——它们在完整的工作副本里是完整的 git 仓库，
+但在版本库里只留 `vendor/vendor.lock` 里那一行「路径 + commit + URL」。
 
 ## 4. 文件夹职责
 
@@ -165,21 +194,40 @@ HyperDriveWave/
 
 ### 4.2 `Scripts`
 
-统一运维入口：
+**部署**（新机器从零到可用）：
+
+- `deploy.sh`：一键全栈部署主入口。探测 GPU 与网络 → 建目录 → 渲染机器相关配置
+  → 补第三方依赖与模型 → 建镜像 → 调 `start.sh` → 验收。支持 `--dry-run` 先看会改什么。
+- `deploy_remote_rag.sh`：远端 GPU 机只部署 RAG 节点（不需要主站那套）。
+- `deploy_verify.sh`：部署验收。**不信任 `/health`**，真跑一次推理和嵌入，
+  详见 §10.6。
+- `fetch_models.sh`：按清单从魔搭下载模型，字节级校验。
+- `fetch_vendors.sh`：按 `vendor/vendor.lock` 克隆第三方源码回原路径。
+- `setup_mirrors.sh`：配置 Docker/pip/npm/apt 国内镜像源。
+- `pack_hdw.sh`：源机打包（253 G → 25 G），排除用不到的模型与构建产物。
+- `lib/`：上述脚本共用的库。`common.sh`（幂等写文件/日志）、`detect.sh`（GPU/网络探测）、
+  `models.sh`（模型清单的**唯一事实源**）。
+
+**运维**：
 
 - `init.sh`：检查 Docker、Compose 和模型目录。
 - `prepare_dirs.sh`：创建 `HDW_Runtime` 持久化目录。
-- `start.sh`：按 Compose profile 启动服务。
+- `start.sh`：按 Compose profile 启动服务。**项目唯一的启动入口**，`deploy.sh` 也调它。
 - `stop.sh`：停止当前 Compose 项目，不删除数据卷目录。
 - `restart.sh`：停止后重新启动全套服务。
 - `status.sh`：查看 Compose 容器状态。
 - `logs.sh`：查看全部服务或指定服务日志。
-- `healthcheck.sh`：检查 QA API、RAG、MinerU、Neo4j、WebUI 和 LLM。
-- `backup.sh`：备份配置、运行数据、关系库初始化内容和评测数据。
-- `restore.sh`：解压指定备份。
+- `healthcheck.sh`：日常巡检。**已知缺陷**：查的是 `${HDW_LLM_PORT:-8000}`
+  （旧 FreeToken 端口），不是真实 llama 的 `1919`，会误报 llm unavailable。
+  要严格验收请用 `deploy_verify.sh`。
+- `backup.sh` / `restore.sh`：打包与还原配置、运行数据、关系库初始化和评测数据。
 - `ingest_knowledge.sh`：命令行执行解析、切分、图谱导入和 Zvec 重建。
+- `sync_remote_rag.sh`：推送 `chunks.jsonl` 到远端节点并触发重建。
+  远端地址必须显式配置（不再有写死的默认值）。
 - `resource_coordinator.py`：通过 Unix socket 串行协调 llama 与本机 GPU RAG/MinerU 的占用。
 - `hyperdrivewave-resource-coordinator.service`：以用户级 systemd 服务常驻资源协调器。
+
+**注意**：`push_github.py` 之类的本机工具不进版本库，见 `.gitignore`。
 
 ### 4.3 `HDW_Engines`
 
@@ -869,23 +917,33 @@ NEO4J_AUTH=neo4j/<strong-password>
 HDW_INTERNAL_API_KEY=<strong-key>
 ```
 
-`HDW_WEBUI_BIND=0.0.0.0` 代表监听所有网卡。更严格的做法是改成服务器实际的 `172.*` 网卡地址，避免监听 RTSP 摄像头所在的 `192.*` 网段。
+`HDW_WEBUI_BIND=0.0.0.0` 代表监听所有网卡。更严格的做法是填**服务器实际对外提供
+WebUI 的那张网卡的地址**，避免顺带监听到 RTSP 摄像头所在的网段。
+`deploy.sh` 会自动探测默认路由出口地址填入，也可以 `--bind <ip>` 覆盖。
 
 ### 10.2 检查
 
 ```bash
 bash Scripts/init.sh
 bash Scripts/prepare_dirs.sh
-docker compose --env-file Configs/.env -f Configs/docker-compose.yml config
+
+# 校验 compose 配置。**必须带上 profile**：所有 service 都声明了 profile，
+# 不带 profile 时输出的是 `services: {}`，命令返回 0 但什么都没校验。
+# 这是个会骗人的假阳性，别照抄网上那种不带 profile 的写法。
+docker compose --env-file Configs/.env -f Configs/docker-compose.yml \
+  --profile base --profile knowledge --profile web config
 ```
 
 `init.sh` 会检查实际 Compose 使用的：
 
 ```text
-HDW_Engines/LLM_Models/Qwen3.8-27B-FP8
+HDW_Engines/LLM_Models/Qwen3.8-27B-GSQ/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
 HDW_Engines/RAG_Models/bge-m3
 HDW_Engines/RAG_Models/bge-reranker-v2-m3
 ```
+
+模型缺失不用手工拷：`bash Scripts/fetch_models.sh` 会从魔搭按字节数校验下载。
+第三方源码同理，见 §10.8。
 
 ### 10.3 一键启动
 
@@ -1193,6 +1251,69 @@ bash Scripts/deploy_verify.sh
 **许可证**：`vendor/` 下都是别人的代码，各自遵循上游许可证。
 `aora-bot/emotion-ball`（WebUI 首页那个情绪球）的许可证在商业部署前需重新核对。
 
+### 10.9 推送到版本库前的凭据扫描
+
+**为什么不能只靠正则**：本项目实际发生过一次漏检——第一次扫描报"无密钥"，
+但 `README_FRP.md` 里就躺着一个**明文面板账号密码**。它是散文格式
+（`` `admin` / `口令` ``），不是 `password=xxx` 这类赋值，正则扫不到。
+
+**可靠的做法是反过来做**：从真实的 `Configs/.env` 里提取凭据**值**，
+拿这些值去反查每一个待提交文件。
+
+```bash
+cd <项目根>
+python3 - <<'PY'
+import pathlib, subprocess, re
+
+# 1) 从真实 .env 提取凭据类键的值
+env = pathlib.Path("Configs/.env")
+creds = {}
+for line in env.read_text(encoding="utf-8", errors="replace").splitlines():
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    k, v = line.split("=", 1)
+    k, v = k.strip(), v.strip().strip('"').strip("'")
+    if len(v) < 8:                       # 短值会产生大量巧合命中
+        continue
+    if v.lower() in ("change_me", "local-dev-key") or "change_me" in v or v.startswith("your_"):
+        continue                           # 占位符不是凭据
+    if not re.search(r"(KEY|TOKEN|SECRET|PASSWORD|AUTH)", k, re.I):
+        continue
+    creds[k] = v
+
+# 2) 反查每一个**已提交**的文件（用 git show 读，才是真正会上传的内容）
+names = subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout.split()
+hits = []
+for n in names:
+    try:
+        text = pathlib.Path(n).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        continue
+    for k, v in creds.items():
+        if v in text:
+            hits.append((n, k))
+
+print(f"  {len(names)} 个文件，{len(creds)} 个凭据值，命中 {len(hits)}")
+for n, k in hits:
+    print(f"    ❌ {n}  含 {k}")
+# 注意：**脚本本身不要打印凭据值**，连前几位也不要
+PY
+```
+
+**判定标准**：
+
+- 长值（30+ 字符）一旦命中就是真泄漏——随机巧合不可能让 35 字符的串匹配上。
+- 短值（如 3 位数的用户名）在二进制文件里必然出现若干次，是巧合，不是泄漏。
+  可以用 `data.count(值)` 看出现次数来区分。
+
+**另外要人工过一遍的**：
+
+- 文档正文里有没有写成散文的凭据（上面那次漏检就是这类）。
+- 文件名不典型的凭据文件——`.env.before-*`、`*.env.20260909` 这类备份
+  长得不像 `.env`，很容易漏。`.gitignore` 里对每种命名都要有对应规则。
+- 配置参考文件里的 token：`frpc_*.toml` / `frps_*.toml` 常常带着真实 token。
+
 ## 11. 日常运维命令
 
 查看状态：
@@ -1488,11 +1609,17 @@ python3 -m py_compile \
   HDW_Orchestrator/industrial-ingest-api/app.py \
   HDW_DataFoundation/ETL_Pipelines/parse_documents.py
 
-docker compose --env-file Configs/.env \
-  -f Configs/docker-compose.yml config
+# compose 校验要带 profile，否则输出 services: {}，返回 0 但什么都没查
+docker compose --env-file Configs/.env -f Configs/docker-compose.yml \
+  --profile base --profile knowledge --profile web config
 
-bash Scripts/healthcheck.sh
+bash Scripts/deploy_verify.sh --quick   # 比 healthcheck.sh 严格得多，见 §10.6
 ```
+
+**升级到 `deploy_verify.sh` 的原因**：`healthcheck.sh` 是日常巡检，
+它查的是 `${HDW_LLM_PORT:-8000}`（旧 FreeToken 引擎的端口），
+不是真实 llama 的 `1919`，所以**一直误报 llm unavailable**。
+`deploy_verify.sh` 不信任 `/health`——项目里有三处会让它骗人（见 §10.6）。
 
 若修改 WebUI，还要用 Node 做内嵌 JavaScript 语法检查，并手动验证：
 
@@ -1598,27 +1725,84 @@ Qwen + RAG + reranker + Zvec + Neo4j + MinerU + WebUI + 文件会话
 
 ## 17. 最后检查清单
 
-部署或交接完成前确认：
+### 17.1 部署后：先跑自动验收
 
-- [ ] `Configs/.env` 已创建且没有使用默认密码。
-- [ ] Qwen、BGE-M3、reranker 目录存在。
-- [ ] `docker compose config` 通过。
-- [ ] GPU 维护覆盖文件只在有 NVIDIA Container Toolkit 时启用；常态 RAG 为 CPU。
-- [ ] MinerU `max_concurrent_requests` 为 1。
-- [ ] `hyperdrivewave-resource-coordinator.service` 为 active，维护 socket 存在。
-- [ ] `HDW_Runtime/chatdata` 可写。
-- [ ] QA API `/health` 返回 LLM、RAG、Neo4j 正常。
-- [ ] `/health` 中当前 LLM 模式和模型符合预期；在线模式不要把 API key 写进代码。
-- [ ] WebUI 使用正确的 `172.*` 网卡地址。
-- [ ] 上传一个小文档并完成一次入库。
-- [ ] 问一个能在文档中找到答案的问题，并展开引用。
-- [ ] 新建会话后刷新页面，历史消息可恢复。
-- [ ] 置顶和删除操作能在文件目录中体现。
-- [ ] 没有执行 `docker compose down -v`。
-- [ ] 连续问 10 个问题（含 1 个与知识库无关的），没有出现 503；上游日志
+```bash
+bash Scripts/deploy_verify.sh          # 完整，含端到端问答
+bash Scripts/deploy_verify.sh --deep   # 额外做重启演练
+```
+
+**必须全绿。** 它覆盖了下面这些自动化能测的项，逐条说明它为什么这么测：
+
+- [ ] **推理真的能跑**（不是只看 `/health`）。CUDA kernel 不匹配时 `/health`
+      照样通过，第一次 kernel launch 才崩；验收会真发一次生成请求，
+      读 `usage.completion_tokens` 而不是 `content`——Qwen3.8 是思考模型，
+      token 可能全被 `reasoning_content` 吃掉，只看 `content` 会误判为失败。
+- [ ] **journal 里没有** `no kernel image is available` / `CUDA error`
+      （kernel 不匹配最直接的证据），且服务 `NRestarts` 为 0。
+- [ ] **MTP 确实启用了**：日志里有 `MTP: enabled (--spec-type draft-mtp)`。
+      没启用说明后端是旧版 llama.cpp，或 GGUF 不含 nextn 张量。
+- [ ] **RAG 真的能嵌入**：调一次 `/embed` 断言维度为 1024。
+      RAG 的 `/health` 返回的是**写死的静态字典**，只查路径存在性、
+      不加载模型（模型是首次 `/embed` 才懒加载），`status` 恒为 `ok`。
+- [ ] **重排能用**：调一次 `/rerank`。注意 `documents` 要传对象数组。
+- [ ] **QA API 的三个子项**都正常。它的 `/health` 里 `"status":"ok"`
+      也是硬编码字面量，只看顶层等于没看。
+- [ ] **模型一致性**：`/props` 的实际加载模型 == `config.json:local.model`
+      == `.env:HDW_LOCAL_LLM_MODEL`。三处分叉会导致「界面显示的」和
+      「实际跑的」不是同一个模型。
+- [ ] **MinerU 镜像里确实烧进了模型**：`docker exec hdw-mineru ls /root/.cache/modelscope`。
+      它是在**镜像构建期**下载的，不在宿主挂载里，漏了要到真解析文档时才发现。
+- [ ] **远端 RAG 的 URL 条数与实际卡数一致**。单卡远端只监听 8001，
+      主站若还列着 8003，每次问答都有一半请求打到不存在的端口、
+      每个吃一次 `HDW_RAG_CONNECT_TIMEOUT`（默认 3s）。
+- [ ] **模型权重三件套字节数正确**（`fetch_models.sh` 的清单是唯一事实源）。
+- [ ] **第三方依赖就位**（`fetch_vendors.sh --check-only`）。缺 MinerU 会导致
+      `hdw-mineru` 镜像构建失败，缺 aora-bot 会导致 WebUI 情绪球加载不出来。
+- [ ] **WebUI 可访问**，且返回的确实是页面（不是 nginx 指错目录后的 200）。
+
+### 17.2 部署后：自动化测不到的，手工确认
+
+- [ ] `Configs/.env` 已按实际环境填写，**没有沿用默认密码**
+      （`POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `NEO4J_AUTH` 等还是 `change_me` 的话要改）。
+- [ ] **linger 已开启**：`loginctl show-user $USER -p Linger --value` 为 `yes`。
+      否则重启机器后 llama 和资源协调器不会自启，要先登录一次——
+      这是「部署完看着好、重启就没了」的典型原因。`deploy.sh` 会尝试用 sudo 开。
+- [ ] **无 NVIDIA 卡时**接受这些代价：本地推理走 CPU（很慢）、
+      知识入库的 GPU 加速路径（`/prepare`）不可用。
+- [ ] **非 Blackwell 卡**（cap 不是 12.0）确认后端选择合理：多架构构建
+      `build-cuda-multi/` 覆盖 sm_80/89/90/120；不在其中会回退 Vulkan，
+      MTP 失效、吞吐降 2-3 倍。
+- [ ] **上传一个小文档并完成一次入库**。
+- [ ] **问一个能在文档中找到答案的问题**，并展开引用。
+- [ ] **问一个需要实时测点的问题**（如「一号机凝汽器水位多少，然后结合知识库回答」），
+      确认返回实时值、采集时间显示为北京时间、且注明 KKS。
+- [ ] **新建会话后刷新页面**，历史消息可恢复；置顶和删除能在文件目录中体现。
+- [ ] **连续问 10 个问题**（含 1 个与知识库无关的），没有 503；
       `journalctl --user -u hyperdrivewave-llama.service | grep -c " 500"` 为 0。
-- [ ] 停用外网访问后，公网 `8080`/`8443` 确实不可达，局域网 `3000` 仍正常。
-- [ ] 需要用外网时，先确认 `HDW_ENABLE_AUTH` 已按预期设置。
+- [ ] **没有执行过 `docker compose down -v`**（`-v` 会删数据卷）。
+- [ ] 用外网时：`HDW_ENABLE_AUTH` 已按预期设置；停用外网后公网 `8080`/`8443`
+      确实不可达，局域网端口仍正常。
+
+### 17.3 提交到版本库前
+
+- [ ] **没有 gitlink**（嵌套仓库被记成 mode `160000`，clone 下来是空目录、内容全丢，
+      而且看起来像正常的子模块引用，极难排查）：
+      `git ls-files -s | awk '$1=="160000"'` 应无输出。
+- [ ] **没有敏感文件**：
+      `git ls-files | grep -E '\.env$|auth\.csv|\.key$|frpc_hdw_public|mapping\.csv|\.env\.before'`
+      应无输出。
+- [ ] **真实凭据反查**：从 `Configs/.env` 取出凭据**值**，扫每一个待提交文件。
+      不要只靠 `password=xxx` 这类正则——实测漏过一个写在散文里的明文面板密码
+      （`admin` / `口令` 这种形式），而 35 字符的 API key 一旦命中就是真泄漏，
+      不会像短字符串那样产生巧合误报。步骤见 §10.9。
+- [ ] **没有超过 50 MB 的文件**（GitHub 警告线，超 100 MB 直接拒收）：
+      `git ls-files -z | xargs -0 du -b | awk '$1>50000000'`。
+- [ ] **非 ASCII 文件名在远端没被转义破坏**。`git ls-tree` 默认会给中文路径
+      加引号并转义成八进制；拿它的输出当路径用会造出名为 `"icons` 的目录。
+      用 `git ls-tree -r -z`（NUL 分隔、不转义）。
+      **验证时不要拿同一套解析去比两边**——两边都错的话反而显示"一致"。
+- [ ] **模型/构建产物/第三方源码没有进库**，见 `.gitignore` 三、六两节。
 
 项目的最短可靠路径是：
 
