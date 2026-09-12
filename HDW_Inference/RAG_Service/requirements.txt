@@ -1,0 +1,10 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2
+python-multipart>=0.0.9
+# 钉死版本：原先是 >=0.5，实际装到的是 0.7.0。下界约束会让"今天部署"和
+# "下个月部署"拿到不同版本；而 zvec 是带原生 C++ 后端的扩展，接口变更会直接影响检索。
+zvec==0.7.0
+torch>=2.3
+transformers>=4.44
+safetensors>=0.4

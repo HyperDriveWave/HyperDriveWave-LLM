@@ -1,0 +1,298 @@
+name: hyperdrivewave
+
+services:
+  hdw-postgres:
+    image: postgres:17
+    profiles: ["base"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hdw}
+      POSTGRES_USER: ${POSTGRES_USER:-hdw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+    volumes:
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/postgres:/var/lib/postgresql/data
+      - ../HDW_DataFoundation/RelationalDB/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${HDW_POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  hdw-redis:
+    image: redis:7
+    profiles: ["base"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-change_me}
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-change_me}"]
+    volumes:
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/redis:/data
+    ports:
+      - "127.0.0.1:${HDW_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-change_me}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  hdw-neo4j:
+    image: neo4j:5
+    profiles: ["base"]
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/change_me}
+    volumes:
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/neo4j/data:/data
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/neo4j/logs:/logs
+      - ../HDW_KnowledgeGraph/cypher:/cypher:ro
+    ports:
+      - "127.0.0.1:${HDW_NEO4J_HTTP_PORT:-7474}:7474"
+      - "127.0.0.1:${HDW_NEO4J_BOLT_PORT:-7687}:7687"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  hdw-llm:
+    build:
+      context: ../HDW_Inference/FreeToken
+      args:
+        # 构建期 pip 源。docker build 不读宿主机的 pip.conf，只能这样注入。
+        # 改 Configs/.env 里的 PIP_INDEX_URL 即可切换；要回官方源填 https://pypi.org/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    profiles: ["legacy-freetoken"]
+    gpus: all
+    environment:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    volumes:
+      - ../HDW_Engines:/models:ro
+    ports:
+      - "127.0.0.1:${HDW_LLM_PORT:-8000}:1919"
+    command: >
+      ft serve
+      --model /models/LLM_Models/Qwen3.8-27B-FP8
+      --served-model-name qwen3.8-27b
+      --host 0.0.0.0
+      --port 1919
+      --gpu ${HDW_LLM_GPU:-0}
+      --max-running-requests ${HDW_LLM_MAX_RUNNING_REQUESTS:-4}
+      --memory-ratio ${HDW_LLM_MEMORY_RATIO:-0.9}
+      --max-seq-len-override ${HDW_LOCAL_MAX_SEQ_LEN:-262144}
+      --max-output-tokens ${HDW_LOCAL_MAX_OUTPUT_TOKENS:-8192}
+      --max-prefill-length ${HDW_LLM_MAX_PREFILL_LENGTH:-512}
+      --reasoning-parser ${HDW_LOCAL_REASONING_PARSER:-qwen3}
+      --sampling-defaults model
+
+  hdw-rag:
+    build:
+      context: ../HDW_Inference/RAG_Service
+      args:
+        # 构建期 pip 源。docker build 不读宿主机的 pip.conf，只能这样注入。
+        # 改 Configs/.env 里的 PIP_INDEX_URL 即可切换；要回官方源填 https://pypi.org/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    profiles: ["base"]
+    environment:
+      HDW_BGE_M3_PATH: /models/RAG_Models/bge-m3
+      HDW_RERANKER_PATH: /models/RAG_Models/bge-reranker-v2-m3
+      HDW_RAG_INDEX_PATH: /data/rag/chunks.jsonl
+      HDW_ZVEC_COLLECTION_PATH: /data/zvec/industrial_chunks
+      HDW_RAG_DEVICE: ${HDW_RAG_DEVICE:-cpu}
+      HDW_EMBED_MAX_LENGTH: ${HDW_EMBED_MAX_LENGTH:-1024}
+      HDW_RERANK_MAX_LENGTH: ${HDW_RERANK_MAX_LENGTH:-512}
+      HDW_RERANK_CANDIDATES: ${HDW_RERANK_CANDIDATES:-50}
+    volumes:
+      - ../HDW_Engines:/models:ro
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/rag:/data/rag:ro
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/zvec:/data/zvec
+    ports:
+      - "127.0.0.1:${HDW_RAG_PORT:-8001}:8001"
+
+  hdw-mineru:
+    image: hyperdrivewave-hdw-mineru:latest
+    build:
+      context: ../HDW_Knowledge/MinerU
+      dockerfile: docker/hyperdrivewave-pipeline.Dockerfile
+      args:
+        # 构建期 pip 源。docker build 不读宿主机的 pip.conf，只能这样注入。
+        # 改 Configs/.env 里的 PIP_INDEX_URL 即可切换；要回官方源填 https://pypi.org/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    profiles: ["knowledge"]
+    environment:
+      MINERU_MODEL_SOURCE: local
+      MINERU_API_OUTPUT_ROOT: /data/api_output
+      MINERU_API_MAX_CONCURRENT_REQUESTS: 1
+    volumes:
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/mineru:/data
+    ports:
+      - "127.0.0.1:${HDW_MINERU_PORT:-8002}:8002"
+    command: ["mineru-api", "--host", "0.0.0.0", "--port", "8002"]
+
+  hdw-qa-api:
+    build:
+      context: ../HDW_Orchestrator/industrial-qa-api
+      args:
+        # 构建期 pip 源。docker build 不读宿主机的 pip.conf，只能这样注入。
+        # 改 Configs/.env 里的 PIP_INDEX_URL 即可切换；要回官方源填 https://pypi.org/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    profiles: ["base"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hdw:change_me@hdw-postgres:5432/hdw}
+      NEO4J_URI: bolt://hdw-neo4j:7687
+      HDW_NEO4J_HTTP_URL: http://hdw-neo4j:7474/db/neo4j/tx/commit
+      NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/change_me}
+      HDW_LLM_BASE_URL: ${HDW_LOCAL_LLM_BASE_URL:-http://host.docker.internal:1919/v1}
+      HDW_LOCAL_LLM_BASE_URL: ${HDW_LOCAL_LLM_BASE_URL:-http://host.docker.internal:1919/v1}
+      HDW_LOCAL_LLM_MODEL: ${HDW_LOCAL_LLM_MODEL:-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf}
+      HDW_LLM_MODE: ${HDW_LLM_MODE:-offline}
+      HDW_ONLINE_LLM_BASE_URL: ${HDW_ONLINE_LLM_BASE_URL:-https://api.deepseek.com}
+      HDW_ONLINE_LLM_MODEL: ${HDW_ONLINE_LLM_MODEL:-deepseek-v4-flash}
+      HDW_ONLINE_LLM_API_KEY: ${HDW_ONLINE_LLM_API_KEY:-}
+      HDW_LLM_MAX_TOKENS: ${HDW_LLM_MAX_TOKENS:-8192}
+      HDW_ONLINE_GRAPH_TOP_K: ${HDW_ONLINE_GRAPH_TOP_K:-40}
+      HDW_LOCAL_GRAPH_TOP_K: ${HDW_LOCAL_GRAPH_TOP_K:-10}
+      HDW_LLM_TIMEOUT: ${HDW_LLM_TIMEOUT:-120}
+      HDW_CONTEXT_WINDOW_TOKENS: ${HDW_CONTEXT_WINDOW_TOKENS:-1000000}
+      HDW_LOCAL_CONTEXT_WINDOW_TOKENS: ${HDW_LOCAL_CONTEXT_WINDOW_TOKENS:-262144}
+      HDW_CONTEXT_COMPRESSION_THRESHOLD: ${HDW_CONTEXT_COMPRESSION_THRESHOLD:-0.75}
+      HDW_CONTEXT_COMPRESSION_TARGET: ${HDW_CONTEXT_COMPRESSION_TARGET:-0.55}
+      HDW_CONTEXT_COMPRESSION_MAX_TOKENS: ${HDW_CONTEXT_COMPRESSION_MAX_TOKENS:-2000}
+      HDW_RAG_BASE_URL: http://hdw-rag:8001
+      HDW_RAG_REMOTE_URLS: ${HDW_RAG_REMOTE_URLS:-}
+      HDW_RAG_TIMEOUT: ${HDW_RAG_TIMEOUT:-60}
+      HDW_RAG_CONNECT_TIMEOUT: ${HDW_RAG_CONNECT_TIMEOUT:-3}
+      HDW_RAG_HEALTH_TIMEOUT: ${HDW_RAG_HEALTH_TIMEOUT:-5}
+      HDW_MCP_BASE_URL: http://hdw-mcp:8766/mcp
+      # 检索路由与实时测点（见 README §7.4/§7.5）。这几项不影响默认行为，
+      # 但必须在 environment 里显式透传，否则 .env 里怎么改都进不了容器。
+      HDW_RETRIEVAL_ROUTER: ${HDW_RETRIEVAL_ROUTER:-true}
+      HDW_LIVE_POINTS_MAX: ${HDW_LIVE_POINTS_MAX:-3}
+      HDW_LIVE_POINT_CANDIDATES: ${HDW_LIVE_POINT_CANDIDATES:-5}
+      HDW_LIVE_TIME_OFFSET_HOURS: ${HDW_LIVE_TIME_OFFSET_HOURS:-8}
+      HDW_MODEL_CONFIG_PATH: /data/model-config/config.json
+      HDW_MINERU_BASE_URL: http://hdw-mineru:8002
+      HDW_FRP_PUBLIC_HOST: ${HDW_FRP_PUBLIC_HOST:-}
+      HDW_LLM_PRESENCE_PENALTY: ${HDW_LLM_PRESENCE_PENALTY:-0.3}
+      HDW_INTERNAL_API_KEY: ${HDW_INTERNAL_API_KEY:-local-dev-key}
+      HDW_ENABLE_AUTH: ${HDW_ENABLE_AUTH:-false}
+      HDW_MAINTENANCE_SOCKET: /run/hdw-maintenance/maintenance.sock
+      HDW_MAINTENANCE_TIMEOUT: ${HDW_MAINTENANCE_TIMEOUT:-0}
+      HDW_CHATDATA_ROOT: /data/chatdata
+      HDW_AUTH_CSV_PATH: /app/auth.csv
+      HDW_AUTH_SECRET: ${HDW_AUTH_SECRET:-change_me}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+    volumes:
+      - ../HDW_Engines/LLM_API:/app/LLM_API:ro
+      - ../HDW_Security/auth/auth.py:/app/hdw_auth.py:ro
+      - ../HDW_Security/auth/auth.csv:/app/auth.csv:ro
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/zvec:/data/zvec
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/mineru:/data/mineru
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/chatdata:/data/chatdata
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/model-config:/data/model-config
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/maintenance:/run/hdw-maintenance
+    ports:
+      - "${HDW_QA_API_PORT:-8080}:8080"
+    depends_on:
+      hdw-postgres:
+        condition: service_healthy
+      hdw-redis:
+        condition: service_healthy
+      hdw-neo4j:
+        condition: service_healthy
+      hdw-rag:
+        condition: service_started
+      hdw-mcp:
+        condition: service_started
+
+  hdw-ingest:
+    build:
+      context: ../HDW_Orchestrator/industrial-ingest-api
+      args:
+        # 构建期 pip 源。docker build 不读宿主机的 pip.conf，只能这样注入。
+        # 改 Configs/.env 里的 PIP_INDEX_URL 即可切换；要回官方源填 https://pypi.org/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    profiles: ["base"]
+    environment:
+      HDW_KNOWLEDGE_SOURCE_ROOT: /data/knowledge_sources
+      HDW_MINERU_PARSED_ROOT: /data/mineru/parsed
+      HDW_RAG_INDEX_PATH: /data/rag/chunks.jsonl
+      HDW_ZVEC_COLLECTION_PATH: /data/zvec/industrial_chunks
+      HDW_INGEST_STATE_PATH: /data/ingest/state.json
+      HDW_PIPELINES_ROOT: /pipelines
+      HDW_MINERU_BASE_URL: http://hdw-mineru:8002
+      HDW_RAG_BASE_URL: http://hdw-rag:8001
+      HDW_NEO4J_HTTP_URL: http://hdw-neo4j:7474/db/neo4j/tx/commit
+      NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/change_me}
+      HDW_RAG_REMOTE_URLS: ${HDW_RAG_REMOTE_URLS:-}
+      HDW_RAG_ADMIN_TOKEN: ${HDW_RAG_ADMIN_TOKEN:-}
+      HDW_REMOTE_RAG_SYNC_TIMEOUT: ${HDW_REMOTE_RAG_SYNC_TIMEOUT:-0}
+      HDW_MAINTENANCE_SOCKET: /run/hdw-maintenance/maintenance.sock
+      HDW_MAINTENANCE_TIMEOUT: ${HDW_MAINTENANCE_TIMEOUT:-0}
+      HDW_ENTITY_ALIASES_PATH: /app/entity_aliases.json
+      HDW_GRAPH_REVIEW_PATH: /data/ingest/entities_review.jsonl
+      HDW_AUTH_CSV_PATH: /app/auth.csv
+      HDW_AUTH_SECRET: ${HDW_AUTH_SECRET:-change_me}
+    volumes:
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/knowledge_sources:/data/knowledge_sources
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/mineru:/data/mineru
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/rag:/data/rag
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/zvec:/data/zvec:ro
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/ingest:/data/ingest
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/maintenance:/run/hdw-maintenance
+      - ../HDW_DataFoundation/ETL_Pipelines:/pipelines:ro
+      - ../HDW_KnowledgeGraph/entity_aliases.json:/app/entity_aliases.json:ro
+      - ../HDW_Security/auth/auth.py:/app/hdw_auth.py:ro
+      - ../HDW_Security/auth/auth.csv:/app/auth.csv:ro
+    ports:
+      - "127.0.0.1:${HDW_INGEST_PORT:-8090}:8090"
+    depends_on:
+      hdw-mineru:
+        condition: service_started
+      hdw-rag:
+        condition: service_started
+      hdw-neo4j:
+        condition: service_healthy
+
+  hdw-mcp:
+    build:
+      context: ../HDW_DataFoundation/MCP
+      dockerfile: Dockerfile
+      args:
+        # 构建期 pip 源。docker build 不读宿主机的 pip.conf，只能这样注入。
+        # 改 Configs/.env 里的 PIP_INDEX_URL 即可切换；要回官方源填 https://pypi.org/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    profiles: ["base"]
+    environment:
+      HDW_MCP_BIND: 0.0.0.0
+      HDW_MCP_PORT: 8766
+      HDW_MCP_MAPPING_ROOT: /data/mapping
+      HDW_MCP_THERMAL_ROOT: /data/thermal
+      HDW_MCP_LSTM_ROOT: /data/lstm
+      HDW_MCP_LOG_ROOT: /data/logs
+      HDW_SIS_BASE_URL: ${HDW_SIS_BASE_URL:-}
+      HDW_SIS_LOGIN_URL: ${HDW_SIS_LOGIN_URL:-}
+      HDW_SIS_USERNAME: ${HDW_SIS_USERNAME:-}
+      HDW_SIS_PASSWORD: ${HDW_SIS_PASSWORD:-}
+      HDW_SIS_LANGUAGE: ${HDW_SIS_LANGUAGE:-zh-Hans}
+      HDW_RTSP_STREAMS_JSON: ${HDW_RTSP_STREAMS_JSON:-}
+    volumes:
+      - ../HDW_DataFoundation/Mapping:/data/mapping
+    ports:
+      - "127.0.0.1:${HDW_MCP_PORT:-8766}:8766"
+
+  hdw-webui:
+    image: nginx:1.27-alpine
+    profiles: ["web"]
+    volumes:
+      - ../HDW_Frontend/industrial-webui/index.html:/usr/share/nginx/html/index.html:ro
+      - ../HDW_Frontend/industrial-webui/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../icons:/usr/share/nginx/html/icons:ro
+      - ../HDW_Animation/aora-bot/emotion-ball/js:/usr/share/nginx/html/ball:ro
+      - ../HDW_Frontend/FRP/certs:/etc/nginx/certs:ro
+    ports:
+      - "${HDW_WEBUI_BIND:-0.0.0.0}:${HDW_WEBUI_PORT:-3000}:8080"
+      - "${HDW_WEBUI_BIND:-0.0.0.0}:${HDW_WEBUI_TLS_PORT:-8443}:8443"
+    depends_on:
+      - hdw-qa-api
+      - hdw-ingest

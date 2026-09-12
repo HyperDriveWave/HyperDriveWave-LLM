@@ -1,0 +1,17 @@
+[Unit]
+Description=HyperDriveWave GPU resource coordinator
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/桌面/HyperDriveWave
+EnvironmentFile=-%h/桌面/HyperDriveWave/Configs/.env
+Environment=HDW_PROJECT_ROOT=%h/桌面/HyperDriveWave
+Environment=HDW_MODEL_CONFIG_PATH=%h/桌面/HyperDriveWave/HDW_Runtime/model-config/config.json
+Environment=HDW_MAINTENANCE_SOCKET=%h/桌面/HyperDriveWave/HDW_Runtime/maintenance/maintenance.sock
+ExecStart=/usr/bin/python3 %h/桌面/HyperDriveWave/Scripts/resource_coordinator.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

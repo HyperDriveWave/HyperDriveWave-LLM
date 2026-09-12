@@ -1,0 +1,4 @@
+max_chars: 1200
+overlap_chars: 120
+security_level_default: internal
+

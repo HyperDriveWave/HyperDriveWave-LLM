@@ -1,0 +1,60 @@
+name: hyperdrivewave-rag-remote
+
+services:
+  hdw-rag-gpu0:
+    image: hyperdrivewave-hdw-rag:latest
+    container_name: hdw-rag-gpu0
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      HDW_BGE_M3_PATH: /models/RAG_Models/bge-m3
+      HDW_RERANKER_PATH: /models/RAG_Models/bge-reranker-v2-m3
+      HDW_RAG_INDEX_PATH: /data/rag/chunks.jsonl
+      HDW_ZVEC_COLLECTION_PATH: /data/zvec/industrial_chunks
+      HDW_RAG_DEVICE: cuda
+      HDW_EMBED_MAX_LENGTH: "1024"
+      HDW_RERANK_MAX_LENGTH: "512"
+      HDW_RERANK_CANDIDATES: "50"
+      HDW_RAG_ADMIN_TOKEN: ${HDW_RAG_ADMIN_TOKEN:?HDW_RAG_ADMIN_TOKEN is required}
+    volumes:
+      - ../../HDW_Engines:/models:ro
+      - ../../HDW_Runtime/rag:/data/rag
+      - ../../HDW_Runtime/zvec-gpu0:/data/zvec
+    ports:
+      - "127.0.0.1:8001:8001"   # 参考值；实际由 deploy_remote_rag.sh 按探测到的网卡 IP 生成
+
+  hdw-rag-gpu1:
+    image: hyperdrivewave-hdw-rag:latest
+    container_name: hdw-rag-gpu1
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      HDW_BGE_M3_PATH: /models/RAG_Models/bge-m3
+      HDW_RERANKER_PATH: /models/RAG_Models/bge-reranker-v2-m3
+      HDW_RAG_INDEX_PATH: /data/rag/chunks.jsonl
+      HDW_ZVEC_COLLECTION_PATH: /data/zvec/industrial_chunks
+      HDW_RAG_DEVICE: cuda
+      HDW_EMBED_MAX_LENGTH: "1024"
+      HDW_RERANK_MAX_LENGTH: "512"
+      HDW_RERANK_CANDIDATES: "50"
+      HDW_RAG_ADMIN_TOKEN: ${HDW_RAG_ADMIN_TOKEN:?HDW_RAG_ADMIN_TOKEN is required}
+    volumes:
+      - ../../HDW_Engines:/models:ro
+      - ../../HDW_Runtime/rag:/data/rag
+      - ../../HDW_Runtime/zvec-gpu1:/data/zvec
+    ports:
+      - "127.0.0.1:8003:8001"

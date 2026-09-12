@@ -1,0 +1,15 @@
+[Unit]
+Description=FRP Server for SmartGasTurbine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/frp/frps -c /opt/frp/frps.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+WorkingDirectory=/opt/frp
+
+[Install]
+WantedBy=multi-user.target

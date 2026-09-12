@@ -1,0 +1,7 @@
+required:
+  - document_id
+  - chunk_id
+  - source_file
+  - text
+  - security_level
+

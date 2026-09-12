@@ -1,0 +1,10 @@
+services:
+  hdw-rag:
+    volumes:
+      - ../HDW_Inference/RAG_Service:/app
+
+  hdw-qa-api:
+    volumes:
+      - ../HDW_Orchestrator/industrial-qa-api:/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
+

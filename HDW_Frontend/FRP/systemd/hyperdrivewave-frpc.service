@@ -1,0 +1,13 @@
+[Unit]
+Description=HyperDriveWave public FRP client
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/桌面/HyperDriveWave
+ExecStart=%h/桌面/HyperDriveWave/HDW_Frontend/FRP/bin/frpc -c %h/桌面/HyperDriveWave/HDW_Frontend/FRP/conf/frpc_hdw_public.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

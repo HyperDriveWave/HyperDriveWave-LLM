@@ -1,0 +1,1632 @@
+# HyperDriveWave
+
+HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它不是只把文档切成片段后交给大模型，而是把工业文档、章节结构、设备实体、故障关系、向量检索、重排序、知识图谱、实时工具和可追溯回答组织成一条可验证链路。
+
+项目根目录：
+
+```text
+/home/xthd/桌面/HyperDriveWave
+```
+
+本文档以当前代码和 Compose 配置为准，更新时间：2026-09-09。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
+
+## 1. 设计原则
+
+项目按以下纪律演进：
+
+1. 求证：先查当前代码、接口、配置和容器状态，再修改。
+2. 需求：先明确输入、输出和验收方式，再实现。
+3. 业务：工业安全边界、启停机条件、报警处置和测点含义不能凭空推断。
+4. 复用：优先复用已有 MinerU、FreeToken、MCP SDK、Dify、n8n 和 LangGraph 源码。
+5. 测试：每个非平凡改动都保留最小可运行检查。
+6. 架构：第三方源码作为依赖或参考，自研胶水层放在 HyperDriveWave 自己的目录中。
+7. 坦诚：当前未启用的服务必须标明“预留”或“未接入”，不能把目录存在当成服务已经上线。
+8. 迭代：先保持 P0 闭环可用，再增加权限、工具路由、审批和自动化。
+
+## 2. 当前能力总览
+
+当前已形成的主要能力：
+
+| 能力 | 当前实现 | 入口 |
+| --- | --- | --- |
+| 工业聊天问答 | FastAPI QA API 调用 RAG、Neo4j 和 Qwen | WebUI 首页 |
+| Qwen 底座 | `llama.cpp` 常驻加载 `Qwen3.8-27B-GSQ` MTP 模型；FreeToken 仅保留为可选旧方案 | `hyperdrivewave-llama.service` |
+| 文档上传 | 局域网 WebUI 上传到 ingest API | 知识库入库页面 |
+| MinerU 解析 | PDF、DOCX、PPTX、XLSX 和图片解析为 Markdown/JSON | `hdw-mineru` |
+| 顺序解析 | 上层逐文件调用，MinerU API 并发上限为 1 | `MINERU_API_MAX_CONCURRENT_REQUESTS=1` |
+| 文档切分 | 按章节、编号标题和文本窗口生成 Chunk | `ingest_documents.py` |
+| 向量检索 | BGE-M3 嵌入，Zvec 持久化索引；QA 优先轮询远端双 GPU RAG，失败回本机 CPU RAG | `hdw-rag` 和远端 RAG |
+| GPU 知识库维护 | 入库、全量重建、删除重建先卸载本地 llama，临时让本机 RTX 5090 执行 RAG/MinerU，完成后恢复 CPU RAG 和 llama | 资源协调器和知识库入库任务 |
+| 查询重排序 | BGE reranker 在查询时重排 | `hdw-rag` |
+| 知识图谱 | Neo4j 保存文档、章节、Chunk、设备、参数、故障等关系 | `hdw-neo4j` |
+| 图谱增强问答 | 根据召回 Chunk 查找章节、相邻片段和实体关系 | QA API |
+| MCP | MCP 服务和工具目录页面，包含 SIS、RTSP 等工具适配 | `hdw-mcp` 和 WebUI MCP 页面 |
+| 对话历史 | 每个会话一个 JSON 文件，局域网客户端共享 | `HDW_Runtime/chatdata` |
+| 球球交互 | Aora emotion-ball 球球、鼠标跟随、Thinking、主题切换 | WebUI |
+| 知识图谱可视化 | SVG 节点、关系、筛选、搜索、拖动和悬停详情 | 知识库图谱页面 |
+
+当前明确的限制：
+
+1. Dify、n8n、LangGraph、Langfuse、Keycloak 和 Open WebUI 的源码或运行目录已经放入项目，但没有全部纳入当前主 Compose，因此不能假设它们已经启动。
+2. QA API 当前会调用 RAG 和 Neo4j，但不会对每个问题自动调用 MCP。MCP 页面用于查看工具和服务状态；实时 SIS/RTSP 工具自动路由需要后续增加意图判断、权限、超时和审计。
+3. 普通入库和全量重建仍是两种语义。全量重建会重新解析源目录内全部文档，这是为了让源文件、解析结果、Chunk、Neo4j 和 Zvec 一致。
+4. 当前没有“取消正在运行的 ingest 任务”接口。停止任务需要先确认任务状态，再停止 ingest API、清理 MinerU 工作进程，并检查数据是否需要恢复。
+5. `aora-bot/emotion-ball` 的许可证需要在商业部署前重新核对，不能因为已经能运行就默认可以商业使用。
+6. 远端双 GPU RAG 与本机 CPU RAG 的索引必须保持一致；WebUI 入库任务会在本机重建完成并拉起 llama 后自动同步远端两份索引，`Scripts/sync_remote_rag.sh` 保留作人工恢复工具。
+
+## 3. 项目结构
+
+以下是项目级结构，第三方仓库内部文件不在这里展开：
+
+```text
+HyperDriveWave/
+├── Configs/
+│   ├── .env
+│   ├── .env.example
+│   ├── docker-compose.yml
+│   ├── docker-compose.rebuild-gpu.yml
+│   ├── nginx/
+│   └── profiles/
+├── Scripts/
+│   ├── init.sh
+│   ├── prepare_dirs.sh
+│   ├── start.sh
+│   ├── stop.sh
+│   ├── restart.sh
+│   ├── status.sh
+│   ├── logs.sh
+│   ├── healthcheck.sh
+│   ├── backup.sh
+│   ├── restore.sh
+│   ├── ingest_knowledge.sh
+│   ├── resource_coordinator.py
+│   └── hyperdrivewave-resource-coordinator.service
+├── HDW_Engines/
+│   ├── LLM_Models/
+│   │   ├── Qwen3.8/
+│   │   └── Qwen3.8-27B-FP8/
+│   ├── RAG_Models/
+│   │   ├── bge-m3/
+│   │   └── bge-reranker-v2-m3/
+│   └── MODELS.md
+├── HDW_Inference/
+│   ├── llama/
+│   ├── FreeToken/
+│   └── RAG_Service/
+├── HDW_Knowledge/
+│   └── MinerU/
+├── HDW_KnowledgeGraph/
+│   ├── cypher/
+│   ├── entity_aliases.json
+│   └── neo4j-data/
+├── HDW_DataFoundation/
+│   ├── ETL_Pipelines/
+│   ├── MCP/
+│   │   ├── MCP_Tools/
+│   │   ├── python-sdk/
+│   │   └── servers/
+│   ├── Mapping/
+│   └── RelationalDB/
+├── HDW_Orchestrator/
+│   ├── industrial-qa-api/
+│   ├── industrial-ingest-api/
+│   ├── langgraph/
+│   ├── dify/
+│   └── n8n/
+├── HDW_Frontend/
+│   ├── industrial-webui/
+│   └── open-webui/
+├── HDW_Animation/
+│   └── aora-bot/
+├── HDW_Ops/
+│   └── langfuse/
+├── HDW_Security/
+│   └── keycloak/
+├── HDW_Evaluation/
+│   └── RAGAS/
+├── HDW_VectorDB/
+│   └── zvec/
+├── HDW_Runtime/
+│   ├── chatdata/
+│   ├── knowledge_sources/
+│   ├── mineru/
+│   ├── rag/
+│   ├── zvec/
+│   ├── neo4j/
+│   ├── postgres/
+│   ├── redis/
+│   ├── ingest/
+│   ├── backups/
+│   ├── graph_review/
+│   ├── dify/
+│   ├── n8n/
+│   ├── langfuse/
+│   ├── keycloak/
+│   └── open-webui/
+├── icons/
+├── README.md
+└── 架构.md
+```
+
+`.venv/` 是本机开发环境，不是生产服务；第三方仓库的 `.git/`、示例、测试和文档属于被复用项目的内部内容。
+
+## 4. 文件夹职责
+
+### 4.1 `Configs`
+
+部署入口和运行参数目录。
+
+- `docker-compose.yml`：HyperDriveWave 当前主 Compose。
+- `docker-compose.rebuild-gpu.yml`：知识库维护模式的 Compose 覆盖文件，只给 `hdw-rag` 和 `hdw-mineru` 分配本机 RTX 5090。
+- `.env.example`：配置模板，包含端口、路径、模型和服务地址样例。
+- `.env`：本机实际配置，含密码和局域网绑定信息，不应提交。
+- `profiles/`：后续保存 minimal、GPU、生产环境的 profile 参数；当前 GPU 重建使用独立覆盖文件，不改变常态 CPU 后备。
+- `nginx/`：未来可把网关、TLS、安全头和上传策略独立出来。
+
+### 4.2 `Scripts`
+
+统一运维入口：
+
+- `init.sh`：检查 Docker、Compose 和模型目录。
+- `prepare_dirs.sh`：创建 `HDW_Runtime` 持久化目录。
+- `start.sh`：按 Compose profile 启动服务。
+- `stop.sh`：停止当前 Compose 项目，不删除数据卷目录。
+- `restart.sh`：停止后重新启动全套服务。
+- `status.sh`：查看 Compose 容器状态。
+- `logs.sh`：查看全部服务或指定服务日志。
+- `healthcheck.sh`：检查 QA API、RAG、MinerU、Neo4j、WebUI 和 LLM。
+- `backup.sh`：备份配置、运行数据、关系库初始化内容和评测数据。
+- `restore.sh`：解压指定备份。
+- `ingest_knowledge.sh`：命令行执行解析、切分、图谱导入和 Zvec 重建。
+- `resource_coordinator.py`：通过 Unix socket 串行协调 llama 与本机 GPU RAG/MinerU 的占用。
+- `hyperdrivewave-resource-coordinator.service`：以用户级 systemd 服务常驻资源协调器。
+
+### 4.3 `HDW_Engines`
+
+模型权重资产层，不放业务代码。
+
+- `LLM_Models/Qwen3.8-27B-GSQ`：当前 `llama.cpp` 常驻加载的本地 Qwen GSQ/MTP 模型。
+- `LLM_Models/Qwen3.8-27B-FP8`：FreeToken 可选旧方案的模型目录，当前默认不加载。
+- `LLM_Models/Qwen3.8`：原始或备用模型目录，当前不直接加载。
+- `RAG_Models/bge-m3`：Embedding 模型，文档 Chunk 和查询问题共用。
+- `RAG_Models/bge-reranker-v2-m3`：查询时对候选 Chunk 重排序。
+- 模型通过只读 Volume 挂载，镜像不打包大模型。
+
+### 4.4 `HDW_Inference`
+
+推理运行时：
+
+- `llama`：当前 `llama.cpp` 本地推理入口，由 `hyperdrivewave-llama.service` 管理，提供 OpenAI 兼容接口。
+- `FreeToken`：保留的旧推理引擎，只有显式启用 `legacy-freetoken` profile 才会启动 `hdw-llm`。
+- `RAG_Service`：加载 BGE-M3、BGE reranker 和 Zvec，提供 `/search`、`/health`、`/admin/reindex`；常态 CPU 运行，维护任务临时切换 CUDA。
+- `RAG_Service/remote-compose.yml`：远端双 GPU RAG 部署文件；GPU 0 监听 `8001`，GPU 1 监听 `8003`，两个容器使用独立 zvec 副本。
+
+### 4.5 `HDW_Knowledge/MinerU`
+
+文档解析引擎。当前使用项目内的 MinerU 源码和 `docker/hyperdrivewave-pipeline.Dockerfile` 构建 `hdw-mineru`。
+
+解析原则：
+
+1. Markdown 文件直接复制到解析输出。
+2. PDF、DOCX、PPTX、XLSX 和图片通过 MinerU `/file_parse` 转换。
+3. `parse_documents.py` 对输入文件排序后逐个提交。
+4. Compose 设置 `MINERU_API_MAX_CONCURRENT_REQUESTS=1`，MinerU API 不接受多个文档请求并发。
+5. 单个文档内部仍可能由 MinerU 使用 OCR 或渲染子进程，这是一个文档内部的计算并行，不代表多个文档同时解析。
+
+### 4.6 `HDW_DataFoundation`
+
+数据接入和工具基础设施：
+
+- `ETL_Pipelines`：解析结果清洗、章节结构识别、Chunk 切分和图谱导入。
+- `MCP/MCP_Tools`：HyperDriveWave 自己的 SIS、报警、RTSP、热成像、边缘设备、日志、LSTM 等工具适配。
+- `MCP/python-sdk`：MCP Python SDK 上游项目，作为协议和客户端/服务端能力参考。
+- `MCP/servers`：MCP servers 上游项目集合，当前不是全部运行服务。
+- `Mapping`：SIS 测点映射、设备映射及工具需要读取的本地数据。
+- `RelationalDB`：PostgreSQL 初始化 SQL 和关系数据结构。
+
+### 4.7 `HDW_KnowledgeGraph`
+
+图谱规则和图谱导入相关资产：
+
+- `cypher/constraints.cypher`：Neo4j 约束。
+- `cypher/examples.cypher`：示例查询。
+- `entity_aliases.json`：实体别名归一化。
+- `neo4j-data/`：历史或辅助数据目录；主 Compose 实际运行数据在 `HDW_Runtime/neo4j`。
+
+当前图谱节点主要包括：
+
+```text
+Document
+Section
+Chunk
+Equipment
+Parameter
+Fault
+Alarm
+Action
+```
+
+### 4.8 `HDW_Orchestrator`
+
+编排和业务边界：
+
+- `industrial-qa-api`：当前生产问答入口，负责鉴权、RAG 调用、Neo4j 上下文查询、Qwen 调用和对话文件存储。
+- `industrial-ingest-api`：上传、文档状态、入库任务、全量重建和删除重建。
+- `langgraph`：上游编排框架，未来可把 QA API 的固定流程升级为可观测状态图；当前没有直接把业务逻辑写进上游源码。
+- `dify`：低代码应用、Prompt 实验和原型平台目录；当前主 Compose 未启动。
+- `n8n`：自动化流程平台目录；当前主 Compose 未启动。
+
+### 4.9 `HDW_Frontend`
+
+- `industrial-webui`：当前用户入口，包含聊天、历史记录、知识库入库、图谱、模型管理、外网访问、MCP 页面、思维深度和主题切换。
+- `FRP`：公网隧道资产（配置、二进制、证书、systemd 单元）。详见 `HDW_Frontend/FRP/README_FRP.md`。
+- `open-webui`：保留的上游 WebUI，当前不是主入口。
+
+`industrial-webui/nginx.conf` 的代理关系（8080 明文与 8443 TLS 共用同一组 location 规则）：
+
+```text
+/api/*            -> hdw-qa-api
+/api/knowledge/* -> hdw-ingest
+/api/mcp/*       -> hdw-mcp
+```
+
+控制中心的页面与权限：
+
+| 菜单项 | 页面 | 权限 |
+| --- | --- | --- |
+| 知识库入库 | `#knowledgeIngestPage` | 仅管理员可操作 |
+| 知识库图谱 | `#knowledgeGraphPage` | 只读 |
+| 模型管理 | `#modelManagementPage` | 仅管理员可保存 |
+| 外网访问 | `#frpPage` | 仅管理员可切换 |
+| 工作流 / MCP | `#toolPlaceholder` / `#mcpPage` | 只读 |
+
+页面可见性与管理员开关由 `data-admin-only` 属性和 `applyUserPermissions()` 统一处理，新增页面照此模式接入。
+
+### 4.10 `HDW_Animation/aora-bot`
+
+球球交互组件，当前 WebUI 以只读方式挂载其 `emotion-ball/js`：
+
+- 首页苏醒、好奇、发呆、睡眠、唤醒。
+- 输入框聚焦时等待输入并向下看。
+- 鼠标移动时目光跟随。
+- Thinking 和回答完成时使用不同表情。
+- 对话次数、空闲时间和回答内容会影响表情。
+
+### 4.11 `HDW_Runtime`
+
+运行数据目录，不放进镜像，不应随意删除：
+
+| 目录 | 内容 |
+| --- | --- |
+| `chatdata` | JSON 对话会话文件 |
+| `knowledge_sources` | 用户上传的原始文档 |
+| `mineru` | MinerU 上传、解析结果和任务数据 |
+| `rag/chunks.jsonl` | 当前 Chunk 索引源文件 |
+| `zvec` | Zvec 持久化索引 |
+| `neo4j` | Neo4j data/logs |
+| `postgres` | PostgreSQL 数据 |
+| `redis` | Redis 数据 |
+| `ingest` | 入库状态、任务和实体审查文件 |
+| `backups` | 备份归档 |
+| `graph_review` | 图谱候选实体审查结果 |
+| `dify`、`n8n`、`langfuse`、`keycloak`、`open-webui` | 未来服务的持久化目录 |
+
+### 4.12 `HDW_Ops`、`HDW_Security`、`HDW_Evaluation`、`HDW_VectorDB`
+
+- `HDW_Ops/langfuse`：后续记录 LLM trace、Prompt、Token、延迟、检索结果和反馈。
+- `HDW_Security/keycloak`：后续 OIDC、SSO、RBAC 和 JWT。
+- `HDW_Evaluation/RAGAS`：离线评测、Golden Dataset 和 RAGAS 指标。
+- `HDW_VectorDB/zvec`：向量库相关源码或参考资产；运行索引在 `HDW_Runtime/zvec`。
+
+## 5. 当前容器和端口
+
+当前主 Compose 的服务如下：
+
+| 容器 | Profile | 作用 | 默认端口 |
+| --- | --- | --- | --- |
+| `hdw-postgres` | `base` | 关系数据 | `127.0.0.1:5432` |
+| `hdw-redis` | `base` | 缓存和队列基础设施 | `127.0.0.1:6379` |
+| `hdw-neo4j` | `base` | 知识图谱 | HTTP `127.0.0.1:7474`，Bolt `127.0.0.1:7687` |
+| `hdw-rag` | `base` | BGE、重排、Zvec | `127.0.0.1:8001` |
+| `hdw-qa-api` | `base` | 问答和会话 API | `:8080` |
+| `hdw-ingest` | `base` | 文档上传和入库任务 | `127.0.0.1:8090` |
+| `hdw-mcp` | `base` | MCP 工具服务 | `127.0.0.1:8766` |
+| `hyperdrivewave-llama.service` | `systemd` | 当前 Qwen GSQ/MTP 本地推理 | `127.0.0.1:1919` |
+| `hdw-llm` | `legacy-freetoken` | 可选 FreeToken 旧推理 | `127.0.0.1:8000` |
+| `hdw-mineru` | `knowledge` | MinerU 文档解析 | `127.0.0.1:8002` |
+| `hdw-webui` | `web` | Nginx WebUI 和反向代理（含 TLS 终结） | `${HDW_WEBUI_BIND}:3000` 明文、`:8443` TLS |
+| `hyperdrivewave-frpc.service` | `systemd` | 可选公网隧道客户端，由控制中心开关 | 无本地监听 |
+
+当前默认是 9 个 Compose 容器，加 1 个由用户级 systemd 管理的 `llama.cpp` 服务，共 10 个运行服务；`hyperdrivewave-frpc.service` 是第 11 个，仅在启用外网访问时运行。FreeToken、Dify、n8n、Langfuse、Keycloak 和 Open WebUI 默认不启动；它们不应被误计为当前在线服务。
+
+当前 WebUI 的局域网地址取决于 `Configs/.env`：
+
+```text
+http://<HDW_WEBUI_BIND>:<HDW_WEBUI_PORT>
+https://<HDW_WEBUI_BIND>:<HDW_WEBUI_TLS_PORT>   # 自签证书，浏览器会告警
+```
+
+本机当前曾使用：
+
+```text
+http://<本机局域网IP>:3000
+https://<本机局域网IP>:8443
+```
+
+不要把这个地址写死到业务代码；网卡地址变化时只修改 `.env`。
+
+## 6. 文档入库链路
+
+### 6.1 WebUI 入库
+
+```text
+局域网浏览器
+  -> hdw-webui / Nginx
+  -> /api/knowledge/upload
+  -> hdw-ingest:8090 /upload
+  -> HDW_Runtime/knowledge_sources
+  -> /api/knowledge/ingest
+  -> hdw-ingest 后台任务
+  -> pipeline_input
+  -> parse_documents.py
+  -> MinerU /file_parse，一次一个文件
+  -> HDW_Runtime/mineru/parsed
+  -> ingest_documents.py
+  -> HDW_Runtime/rag/chunks.jsonl
+  -> import_graph.py
+  -> Neo4j
+  -> hdw-rag /admin/reindex
+  -> BGE-M3 嵌入
+  -> Zvec
+```
+
+上传文件先落到临时文件，完成后才替换为正式源文件。待入库文件从 WebUI 移除时，调用的是 staged 删除接口；已经进入任务的文件不能用 staged 删除接口绕过任务一致性。
+
+### 6.2 普通入库
+
+普通入库通过 WebUI 选中文件后提交对应 `document_ids`。任务会经过：
+
+1. MinerU 解析。
+2. Markdown 结构化切分。
+3. Chunk 稳定化，生成固定 `document_id` 和 `chunk_id`。
+4. Neo4j 图谱导入。
+5. Zvec 全量索引刷新。
+6. 更新 `HDW_Runtime/ingest/state.json`。
+
+执行期间由资源协调器控制本机 5090 的使用，完整阶段为：
+
+```text
+大模型卸载
+  -> 本机 GPU MinerU 解析、切分、图谱构建、BGE-M3 嵌入与 Zvec 重建
+  -> 重建完成
+  -> 拉起大模型
+  -> 同步远端 RAG
+  -> 同步完成
+  -> 最终完成
+```
+
+常态 `hdw-rag` 保持 CPU，作为远端不可用时的检索后备；GPU 维护模式只在任务期间
+重建 `hdw-rag` 和 `hdw-mineru`，不会删除本机 CPU 后备，也不会占用远端 RAG 容器。
+
+当前普通入库仍有一个需要持续修正的边界：如果调用方不传 `document_ids`，API 会使用状态中的文档集合；不能把“上传一个新文件”误解成已经实现完全增量索引。后续应以文档内容哈希为依据做真正增量解析和增量索引。
+
+### 6.3 全量一致性重建
+
+全量重建会读取当前源目录内全部文档，重新执行：
+
+```text
+源文档 -> MinerU -> Markdown -> Chunk -> Neo4j replace-all -> BGE/Zvec reindex
+```
+
+已入库文档也会再次解析，这是全量重建的定义，不是重复误操作。它用于修复以下不一致：
+
+- 源文档和解析结果不一致。
+- Chunk 文件和 Neo4j 不一致。
+- Neo4j 和 Zvec 不一致。
+- 删除文档后旧关系或旧向量仍残留。
+
+全量重建和删除重建都使用与普通入库相同的 GPU 维护流程。进度页面会依次显示
+“大模型卸载”“MinerU 文档解析”“文档切分”“知识图谱构建”“BGE-M3 嵌入与向量索引”
+“重建完成”“拉起大模型”“同步远端RAG中”和“最终完成”，并保留当前文档或片段计数。
+
+重建期间不要移动或删除：
+
+```text
+HDW_Runtime/knowledge_sources
+HDW_Runtime/mineru/parsed
+HDW_Runtime/rag/chunks.jsonl
+HDW_Runtime/zvec
+HDW_Runtime/neo4j
+```
+
+不要执行：
+
+```bash
+docker compose down -v
+```
+
+这会把容器卷一起处理，风险远大于普通 `docker compose down`。
+
+## 7. 在线问答链路
+
+```text
+用户问题
+  -> industrial-webui
+  -> hdw-qa-api /qa/query
+  -> hdw-rag /search
+  -> BGE-M3 向量召回
+  -> Zvec 候选集
+  -> bge-reranker-v2-m3 查询时重排序
+  -> 返回高质量 Chunk
+  -> QA API 根据 chunk_id 查询 Neo4j
+  -> 补充文档、章节、前后 Chunk、设备、参数、故障、报警、动作
+  -> Qwen3.8-27B-FP8
+  -> 返回 answer、citations、graph_context、status
+  -> WebUI 展示回答和可展开依据
+```
+
+Qwen 是底座模型。RAG、Neo4j、MCP 和球球不是替代模型，而是围绕模型的扩展：
+
+- RAG 提供文档证据。
+- reranker 提高候选证据顺序。
+- Neo4j 补充知识结构和关系路径。
+- MCP 读取受控外部数据或工具结果。
+- QA API 负责编排、边界和返回格式。
+- WebUI 负责交互和证据展示。
+
+当前 QA API 已经接入 RAG 和 Neo4j；MCP 自动调用还未并入 `/qa/query`。后续接入 MCP 时必须先定义：
+
+1. 哪些问题允许读实时测点。
+2. 哪些工具只读，哪些工具允许写入。
+3. 工具超时、重试和失败文案。
+4. SIS 账号、权限和审计记录。
+5. 工具结果如何与文档证据分栏展示。
+
+### 7.1 RAG 远端轮询与本机回退
+
+当前问答检索链路如下：
+
+```text
+QA API
+  ├─ 请求 1 -> <远端RAG主机IP>:8001 -> 远端 GPU 0
+  ├─ 请求 2 -> <远端RAG主机IP>:8003 -> 远端 GPU 1
+  ├─ 请求 3 -> <远端RAG主机IP>:8001
+  └─ ...
+       远端当前节点失败 -> 尝试另一个远端节点
+       远端全部失败     -> http://hdw-rag:8001（本机 CPU fallback）
+```
+
+两个远端容器均使用相同的 `bge-m3`、`bge-reranker-v2-m3`、`chunks.jsonl`
+和知识库内容，但各自绑定一张物理 GPU，并各自使用独立的 zvec 索引目录：
+
+```text
+远端主机：<远端RAG主机IP>
+├── hdw-rag-gpu0 -> GPU 0 -> :8001
+└── hdw-rag-gpu1 -> GPU 1 -> :8003
+```
+
+主项目的 `hdw-rag` 必须保留。它既是本机入库链路使用的 RAG 服务，也是远端
+不可用时的最后检索后备。远端 RAG 不参与本机文档入库，避免在索引尚未同步时
+影响入库一致性。
+
+知识库更新后同步远端：
+
+```bash
+cd /home/xthd/桌面/HyperDriveWave
+SSHPASS='远端SSH密码' bash Scripts/sync_remote_rag.sh
+```
+
+脚本只上传新的 `HDW_Runtime/rag/chunks.jsonl`，并分别请求两个远端节点执行
+`/admin/reindex`；模型权重不会重复上传。两个重建任务都成功后才返回成功。
+
+### 7.2 本地推理的故障边界
+
+本地 `llama.cpp` 曾有两个会打断问答的故障点，**已通过升级 llama.cpp 版本解决**。
+
+**① 对话模板解析失败 + 输出污染（已修复）**
+
+旧版 llama.cpp（`src/llama.cpp-8681+dfsg`）会从模型的 Jinja 模板自动生成 PEG 解析器，
+把**模型输出**切分成思考/正文/工具调用；模型跑偏时输出不符合语法，上游直接 `throw`，
+被 QA API 包装成 `503`，用户侧表现为「提问后返回错误、没有回答」。
+
+同一根因还有一个更隐蔽的表现：**输出污染** —— 模型稳定地在中文里插入英文/阿拉伯文
+碎片（典型是「物理」错成 `ysics`）。这些碎片**都是词表里的精确 token**（`ysics`=16735，
+`ifs`=21163），所以不是丢字乱码，而是模型**选错了 token**。实测污染率约 20-25%，
+且与温度无关（贪心解码逐字节可复现）。
+
+排查中逐项排除的变量（都**不是**原因）：后端（Vulkan/CUDA）、KV 缓存量化（q4_0/f16）、
+Flash Attention 开关、采样参数（`temperature` / `presence_penalty`）、量化版本
+（IQ3_S 与 Q5_K_M 都复现，且错成同一个 token）。
+
+**升级到 `HDW_Inference/llama/llama.cpp-upstream` 后两者都消失：**
+
+| 配置 | 解码速度 | 输出污染 |
+| --- | --- | --- |
+| 旧版 + Vulkan | 66.7 tok/s | 2-3/12（~22%）|
+| 旧版 + CUDA | 78.6 tok/s | 2-3/12（~22%）|
+| 新版 + CUDA | 93.6 tok/s | 0/16 |
+| 新版 + CUDA + MTP | 117-124 tok/s | 0/32 |
+
+旧版曾打过自定义补丁（`common/chat.cpp` 等 4 个文件：解析失败降级为纯文本而非抛异常）。
+**新版不再需要** —— 上游已改为 `LOG_WRN("unparsed ...")` 记警告不抛异常。补丁源码留在
+`src/llama.cpp-8681+dfsg/*.bak_before_parse_fix`，仅作历史记录。
+
+排查命令：
+
+```bash
+journalctl --user -u hyperdrivewave-llama.service -n 50 --no-pager | grep -E "unparsed|exception|draft acceptance"
+```
+
+**② 前端在失败时删除用户提问**
+
+`industrial-webui` 原先的请求失败分支会把用户刚发出的提问从会话里 `pop()` 掉并
+重新存盘，一次瞬时上游抖动就丢掉用户输入。现在改为保留提问和失败气泡，失败信息
+作为一条 assistant 消息留痕，用户可直接重问。
+
+### 7.3 本地推理后端与 MTP 投机解码
+
+**后端**由 `Configs/.env` 两行控制，改完 `systemctl --user restart hyperdrivewave-llama.service` 生效：
+
+```bash
+HDW_LLAMA_DEVICE=CUDA0
+HDW_LLAMA_BINARY=<项目>/HDW_Inference/llama/llama.cpp-upstream/build-cuda/bin/llama-server
+```
+
+`start.sh` 会打印实际使用的二进制和设备（`llama.cpp binary: ... (device ...)`），
+排查时先看这一行。三个二进制都在，可随时切换：
+
+| 路径 | 版本 | 后端 |
+| --- | --- | --- |
+| `llama.cpp-upstream/build-cuda/bin/` | 新版（2026-09-08） | CUDA ← **当前使用** |
+| `build-cuda/bin/` | 旧版 | CUDA |
+| `build/bin/` | 旧版 | Vulkan |
+
+**MTP 投机解码**（Multi-Token Prediction）由控制中心 **模型管理 → 本地推理 → 启用 MTP**
+勾选框控制，无需改配置文件。
+
+模型自带 MTP 头（`qwen35.nextn_predict_layers=1`，`blk.64` 的 4 个 `nextn` 张量）。
+开启后 llama-server 额外建立 draft 上下文，实测：
+
+```
+开启 MTP：解码 117-124 tok/s，接受率 0.45-0.50，mean len 2.34-2.49
+关闭 MTP：解码  93.6 tok/s
+```
+
+链路：**勾选框 → 模型配置 `local.mtp_enabled` → `PATCH /model-config`（触发 `/switch-llm`
+重启）→ `start.sh` 读取该字段 → 加 `--spec-type draft-mtp`**。
+
+两个注意点：
+
+1. **`--spec-type` 只有新版支持。** `start.sh` 会探测二进制的 `--help`，不支持时只打印
+   一行提示并跳过 MTP，**不会导致启动失败** —— 所以切回旧版二进制是安全的。
+2. **MTP 只影响解码，预填充会略降**（draft 上下文有开销）。解码占问答总耗时的 74-87%，
+   所以净收益仍然显著。
+
+启用 MTP 前后的端到端实测（同一组问题）：
+
+| 问题 | 旧版 + Vulkan | 新版 + CUDA + MTP |
+| --- | --- | --- |
+| 汽轮机轴承温度高怎么处理 | 13.6s | **8.1s** |
+| 简要说明 ETS 系统的作用 | 16.0s | **8.0s** |
+| 轴封系统与真空系统的关系 | 19.1s | **12.2s** |
+
+### 7.4 检索路由（按需检索）
+
+**问题**：`/qa/query` 之前无条件走 RAG + Neo4j。问「你的上下文长度是多少」这类系统能力问题
+时，会检索出 10 条毫不相关的证据（消防参数、循蝶阀文件）挂进回答，既浪费时间也污染界面。
+
+**方案**：检索前先让模型判一次「这个问题要不要查知识库」。判定为不需要时，**完全不碰
+RAG 和 Neo4j** —— 下游拿到空 contexts 会自然产出空 `citations`/`graph_context`，
+前端的 `addEvidence()` 在两者都空时不渲染依据面板，无需改前端。
+
+链路：
+
+```text
+问题 → _needs_retrieval()  ← 一次极小调用：无证据、只出 1 个 token
+         ├─ no  → 空 contexts，直接进 LLM
+         └─ yes → _plan_rag → RAG → Neo4j → LLM
+```
+
+实测（同一批问题）：
+
+| 问题 | 路由判定 | 证据 | 耗时 |
+| --- | --- | --- | --- |
+| 你的上下文长度是多少 | no | 0 | 1.4s |
+| 你是什么模型 | no | 0 | 1.5s |
+| 今天天气怎么样 | no | 0 | 1.4s |
+| 汽轮机轴承温度高怎么处理 | yes | 10 | 7.4s |
+| 轴封系统与真空系统的关系 | yes | 10 | 11.7s |
+
+路由准确率 8/8，边界情况也对：`你好，请问汽轮机轴承温度高怎么处理` 会正确忽略寒暄去检索，
+`我们聊聊别的好吗` 会跳过。
+
+**设计要点**
+
+1. **判断前置到检索之前**，这才省得掉检索开销（事后判断只能解决展示问题）。
+2. **路由开销约 185ms**（无证据的小 prompt，只出 1 个 token），相对问答总耗时 5% 以内。
+3. **失败一律保守处理**：调用异常、超时、回答无法解析成 yes/no 时，**一律照常检索**。
+   漏检一次只是多花几百毫秒，误判成「不需检索」会让本该查知识库的问题答不出来。
+4. **不用关键词启发式**。曾试过「自称词 + 元信息关键词 + 短问题」的规则，17 个用例能过，
+   但它对换种问法就失效、且规则散落在代码里难维护。模型路由能处理任意说法。
+5. **未检索时的提示词不同**：不拼「检索证据：无」这种框架 —— 否则模型会顺着说
+   「证据中没有」，而不是直接依据自身设定回答。同时保留防幻觉指令：涉及本系统具体
+   配置数值时，不确知就说明无法确认，不要给估计值。
+
+开关：`HDW_RETRIEVAL_ROUTER=false` 可退回「一律检索、不读测点」（无需重建镜像）。
+
+### 7.5 实时测点（MCP sis_point）
+
+**问题**：MCP 有 27 个工具，但 `/qa/query` 只用到了 `rag_query_plan`，从不调工具。
+问「现在主汽温度多少」只会拿到文档里写的定值，不是实测值。
+
+**方案**：和检索路由**合并成同一次规划调用**，一次决定「要不要查文档」和「要读哪些实时测点」。
+规划的产物里，测点关键词并行去查 SIS，结果作为**独立区块**进 prompt —— 实时数据与文档证据
+分栏，不混为一谈。
+
+```text
+问题 → 一次规划（模型出两行：检索: yes/no ｜ 测点: <关键词> 或 无）
+        ├─ 测点 → 并行 point_query_current_value（最多 3 个）
+        └─ 检索 → RAG + Neo4j
+        ↓
+      LLM（实时测点数据 与 检索证据 分两个区块）
+        ↓
+      前端：citations 为空时不渲染依据面板
+```
+
+实测：
+
+| 问题 | 检索 | 测点 | 结果 |
+| --- | --- | --- | --- |
+| 现在主汽温度是多少 | ✗ | 主蒸汽温度 | 24.265587 ℃ @2026-09-12T03:41:42 |
+| 闭式冷却水泵的振动值 | ✗ | 闭式冷却水泵AX向振动 | 0.079346 μm |
+| 凝结水和主蒸汽温度分别是多少 | ✗ | 两个 | 46.77 ℃ + 24.27 ℃ |
+| 轴封系统的作用是什么 | ✓ | — | 正常走 RAG |
+| 你是什么模型 | ✗ | — | 直接回答 |
+
+**SIS 配置**
+
+MCP 的 `runtime.py` **纯读环境变量**（不是配置文件），需要的键在 `Configs/.env`：
+
+```bash
+HDW_SIS_BASE_URL / HDW_SIS_LOGIN_URL / HDW_SIS_USERNAME / HDW_SIS_PASSWORD / HDW_SIS_LANGUAGE
+```
+
+端点、超时、分片大小都有与 SmartGasTurbine 一致的默认值，不用写。改完要
+`--force-recreate hdw-mcp` 才生效（环境变量在容器启动时注入）。
+
+**设计要点**
+
+1. **只接只读工具。** MCP 里有 `alarm_acknowledge`（报警确认）和
+   `edge_device_power_action`（设备电源操作）两个**写操作**，工业场景不允许模型自动调。
+2. **规划合并成一次调用**，不是两次 —— 两者都在回答「这个问题需要什么」，分开是白花一次往返。
+3. **单点失败不拖垮回答**：`_fetch_live_points()` 并行取数，某个测点失败只记进 `live_errors`，
+   文档问答照常。缺实时数据不该让整个回答失败。
+4. **关键词对不上测点名时的三级兜底**。用户的说法和测点表的命名经常对不上 ——
+   表里叫「凝汽器液位」，用户问「凝汽器水位」，整词匹配直接落空。处理链：
+
+   ```text
+   ① current_value(query_text=关键词)          快路径，命中就返回
+   ② search_points(关键词)                     拿候选
+      搜不到 → 逐级去掉尾字再搜（凝汽器水位 → 凝汽器水 → 凝汽器）
+   ③ 把候选列表交给模型，由它选最符合意图的 KKS → current_value(kks=选中)
+   ```
+
+   ②的「去尾字」只放宽**搜索范围**，选哪个仍由③的模型从真实候选里判断 ——
+   所以不是硬编码同义词表（水位→液位 那种），换机组、换命名习惯都不用改。
+   即便如此，`一号机凝汽器水位` 这种带前缀的长关键词仍会让测点检索的排序跑偏，
+   所以 planner 被要求只产出 2-6 字的短关键词（只描述物理量，不带机组号）。
+5. **模型会主动说明边界**：接了实时数据但不检索文档时，模型会说明「无法提供历史趋势、
+   报警阈值」，因为那些在文档里 —— 这是期望行为，不是缺陷。
+6. **答案模型是最后一道防线**：若选中的测点与问题意图不符（例如问水位却拿到真空度），
+   答案模型会主动指出「该测点为 X，不是 Y」。这是最后的安全网，不是可以依赖的常态。
+7. **实时数据与文档证据分栏**：live 数据是「此刻的实测值」，文档是「规程里的定值」，
+   prompt 里分两个区块，回答里也要说清哪句来自哪个。
+8. **采集时间统一按北京时间展示**。SIS 返回的是 UTC ISO-8601（`2026-09-12T04:00:45+00:00`），
+   直接给模型和界面看既反直觉，模型还会自己补一句时区换算。换算只在
+   [`_fetch_live_points()` 的 `shape()`](HDW_Orchestrator/industrial-qa-api/app/main.py)
+   里做一次（`_format_live_time()`，偏移量 `HDW_LIVE_TIME_OFFSET_HOURS`，默认 8），
+   输出 `YYYY-MM-DD HH:MM:SS` 无后缀。`_prompt()` 只展示、不再二次换算 ——
+   重算会把已经本地化的值再当 UTC 加 8 小时。无时区的输入按 UTC 解释（SIS 侧就是 UTC，
+   当成本地时间会少算 8 小时）；解析失败原样返回，不丢采集时间。
+**其他工具组的现状**（未接入）
+
+| 工具组 | 状态 |
+| --- | --- |
+| thermal | 服务 ready，但无匹配测量点 |
+| rtsp | 服务 ready，但 `HDW_RTSP_STREAMS_JSON` 为空 → 0 路流 |
+| lstm | 服务 ready，但 0 个模型 |
+| alarm / edge_device / custom_rule / liems_log | 缺数据文件，不可用 |
+
+## 8. 对话历史文件存储
+
+### 8.1 存储位置
+
+主机目录：
+
+```text
+/home/xthd/桌面/HyperDriveWave/HDW_Runtime/chatdata
+```
+
+容器内目录：
+
+```text
+/data/chatdata
+```
+
+`hdw-qa-api` 通过 Compose 挂载两者，环境变量为：
+
+```text
+HDW_CHATDATA_ROOT=/data/chatdata
+```
+
+每个会话一个 JSON 文件，例如：
+
+```text
+HDW_Runtime/chatdata/local-1788679371-ab12cd.json
+```
+
+### 8.2 文件结构
+
+```json
+{
+  "id": "local-1788679371-ab12cd",
+  "title": "热机运行规程",
+  "group": "今天",
+  "pinned": false,
+  "created_at": "2026-09-06T15:00:00+08:00",
+  "updated_at": "2026-09-06T15:02:00+08:00",
+  "messages": [
+    {
+      "role": "user",
+      "content": "启动前需要检查什么？",
+      "created_at": "2026-09-06T15:00:00+08:00"
+    },
+    {
+      "role": "assistant",
+      "content": "回答正文",
+      "citations": [],
+      "graph_context": [],
+      "emotion_id": "33",
+      "created_at": "2026-09-06T15:02:00+08:00"
+    }
+  ]
+}
+```
+
+保存采用临时文件写入后 `replace()`，避免浏览器刷新或进程中断时留下半个 JSON。会话 ID 只允许字母、数字、下划线和短横线，防止路径穿越。
+
+### 8.3 会话接口
+
+QA API 提供：
+
+```text
+GET    /conversations
+GET    /conversations/{id}
+PUT    /conversations/{id}
+PATCH  /conversations/{id}
+DELETE /conversations/{id}
+```
+
+WebUI 行为：
+
+- 启动时从服务端读取历史摘要。
+- 点击左侧历史记录时读取完整 JSON 并恢复消息。
+- 新问题先写入用户消息。
+- QA 返回后再写入回答、引用和图谱上下文。
+- 右键置顶调用 `PATCH`。
+- 右键删除调用 `DELETE`，成功后删除当前 JSON。
+- 多台局域网电脑访问同一个 WebUI 时共享同一目录。
+
+浏览器 `localStorage` 现在只用于主题模式 `D/N/A`，不再作为对话记录来源。
+
+当前方案适合单机、少量局域网用户。进程内全局锁只解决单个 QA API 进程的并发写入；未来出现多副本、多主机或高并发时，再迁移到 PostgreSQL 或对象存储，不要提前引入复杂存储层。
+
+## 9. 部署前提
+
+建议部署主机具备：
+
+1. Linux x86_64。
+2. Docker Engine 和 Docker Compose v2。
+3. NVIDIA 驱动和 NVIDIA Container Toolkit，若启用 `gpu` profile。
+   **不需要单独安装 CUDA toolkit** —— `HDW_Inference/llama/llama.cpp-upstream/build-cuda-multi/`
+   里已随包携带所需的 CUDA runtime 库，`start.sh` 会按自身位置设好 `LD_LIBRARY_PATH`。
+4. systemd 用户管理器可用（`systemctl --user`）——llama 与资源协调器都是用户级服务，
+   容器或精简系统里通常没有，`deploy.sh` 会前置检查并明确报错。
+5. 足够的磁盘空间：Qwen、BGE、MinerU 模型和运行索引都不小。完整部署约需 60G 以上。
+6. 能访问本机 Docker 镜像源或已经准备好基础镜像。
+7. 局域网网卡有稳定 IP，防火墙允许 WebUI 端口。
+8. Qwen、BGE-M3 和 reranker 目录完整——缺失时 `deploy.sh` 会从魔搭自动补齐。
+
+以上条件由 `deploy.sh` 逐项检查，不必手工核对；换机器部署见 §10.4。
+
+不要把以下内容写入公开代码仓库：
+
+- SIS 用户名和密码。
+- Neo4j、PostgreSQL、Redis 密码。
+- `HDW_INTERNAL_API_KEY`。
+- Keycloak 和 Langfuse 密钥。
+- 企业内部文档和聊天 JSON。
+
+## 10. 首次部署
+
+### 10.1 准备配置
+
+```bash
+cd /home/xthd/桌面/HyperDriveWave
+cp Configs/.env.example Configs/.env
+```
+
+修改 `Configs/.env` 中至少这些项目：
+
+```text
+HDW_PROJECT_ROOT=/home/xthd/桌面/HyperDriveWave
+HDW_RUNTIME_ROOT=/home/xthd/桌面/HyperDriveWave/HDW_Runtime
+HDW_WEBUI_BIND=0.0.0.0
+HDW_WEBUI_PORT=3000
+POSTGRES_PASSWORD=<strong-password>
+REDIS_PASSWORD=<strong-password>
+NEO4J_AUTH=neo4j/<strong-password>
+HDW_INTERNAL_API_KEY=<strong-key>
+```
+
+`HDW_WEBUI_BIND=0.0.0.0` 代表监听所有网卡。更严格的做法是改成服务器实际的 `172.*` 网卡地址，避免监听 RTSP 摄像头所在的 `192.*` 网段。
+
+### 10.2 检查
+
+```bash
+bash Scripts/init.sh
+bash Scripts/prepare_dirs.sh
+docker compose --env-file Configs/.env -f Configs/docker-compose.yml config
+```
+
+`init.sh` 会检查实际 Compose 使用的：
+
+```text
+HDW_Engines/LLM_Models/Qwen3.8-27B-FP8
+HDW_Engines/RAG_Models/bge-m3
+HDW_Engines/RAG_Models/bge-reranker-v2-m3
+```
+
+### 10.3 一键启动
+
+项目启动入口只有 `Scripts/start.sh`。根目录没有 `start.sh`，所以在项目根目录执行 `bash start.sh` 会提示文件不存在。
+
+```bash
+cd /home/xthd/桌面/HyperDriveWave
+bash Scripts/start.sh
+```
+
+脚本会根据自身位置定位项目根目录，使用相对项目结构读取 `Configs/.env`、`Configs/docker-compose.yml` 和 `Scripts/prepare_dirs.sh`，因此不依赖当前终端所在目录，也不写死项目绝对路径。
+
+默认启动当前 Compose 定义的 9 个容器，并拉起 1 个用户级 systemd 的本地 llama 服务：
+
+```text
+PostgreSQL、Redis、Neo4j、RAG、MinerU、Ingest、MCP、QA API、工业 WebUI，以及 llama.cpp 本地 LLM
+```
+
+脚本会先单独执行一次 `docker compose build hdw-rag`，再执行
+`docker compose up -d --build --remove-orphans`。先建 rag 是因为 `hdw-mineru` 的
+Dockerfile 第一行是 `FROM hyperdrivewave-hdw-rag:latest`，而 compose 里 mineru
+没声明对 rag 的 `depends_on`，`up --build` 的构建顺序没有保证——全新机器上会随机失败。
+
+重启系统后再次执行同一条命令即可恢复服务；已存在的镜像会复用缓存，只有源码或 Dockerfile 变化时才会重新构建。
+
+如只需要调试 WebUI 和基础问答链路，可以临时覆盖 profile：
+
+```bash
+HDW_COMPOSE_PROFILES="base knowledge web" bash Scripts/start.sh
+```
+
+等容器启动后检查：
+
+```bash
+bash Scripts/status.sh
+bash Scripts/healthcheck.sh
+curl -fsS http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:8002/health
+curl -fsS http://127.0.0.1:8001/health
+```
+
+预期：
+
+- QA API 返回 `status: ok`。
+- llama 服务为 active，`http://127.0.0.1:1919/health` 可访问，并返回当前 GSQ/MTP 模型。
+- RAG 状态包含 `bge-m3`、`bge-reranker-v2-m3` 和 Zvec。
+- MinerU 返回 `max_concurrent_requests: 1`。
+- Neo4j 健康检查通过。
+
+浏览器访问：
+
+```text
+http://<服务器172网卡IP>:3000
+```
+
+不要使用：
+
+```text
+http://192.*:3000
+```
+
+除非那确实是服务器提供 WebUI 的网卡；摄像头 RTSP 所在网卡不等于 WebUI 网卡。
+
+### 10.4 部署到另一台服务器（一键）
+
+把项目拷到新机器，跑一条命令即可完成部署，模型缺失时自动从魔搭补齐。
+
+**第一步：在源机打包。** 整个文件夹 253G，其中 239G 是当前用不到的备份模型、
+另有 34G 是历史下载残块，直接 `rsync` 整个目录会白搬 270G。
+
+```bash
+bash Scripts/pack_hdw.sh --out /media/usb/hdw      # 带在用的 3 个模型，约 25G
+bash Scripts/pack_hdw.sh --app-only --out /media/usb/hdw   # 只带代码，约 7G
+bash Scripts/pack_hdw.sh --remote-rag --out /media/usb/rag # 只打远端 RAG 节点要的
+```
+
+不带 `--out` 时用 `--tar <文件>` 打成单个压缩包。打包前会先算需要多少空间，
+不够会直接拒绝——**中途空间不足会产出静默不完整的包，只有到目标机才发现**。
+
+**第二步：目标机部署。**
+
+```bash
+cd <目标机上的项目目录>
+bash Scripts/deploy.sh
+```
+
+脚本按阶段执行：前置检查 → 环境探测 → 建目录 → 渲染配置 → 补模型 →
+构建镜像 → 调用 `Scripts/start.sh` → 验收。想先看会改什么而不实际动手：
+
+```bash
+bash Scripts/deploy.sh --dry-run
+```
+
+常用开关：
+
+| 开关 | 用途 |
+| --- | --- |
+| `--network online\|mirror\|offline` | 网络模式。不指定则交互式询问；非交互默认 `online` |
+| `--proxy <url>` | `mirror` 模式下的 HTTP 代理 |
+| `--bind <ip>` | 手动指定 WebUI 绑定地址，默认自动探测默认路由出口 IP |
+| `--skip-models` | 模型已备好，跳过检查与下载 |
+| `--with-frp` | 一并安装 frpc 单元（只安装不启用，启停仍由控制中心控制） |
+
+**目标机前置条件**：Docker Engine + Compose v2、systemd 用户管理器可用
+（llama 和资源协调器都是用户级服务）、若用 GPU 则需 NVIDIA 驱动 +
+nvidia-container-toolkit。**不需要装 CUDA toolkit** ——
+`build-cuda-multi/` 里已随包携带所需的 runtime 库。
+
+**关于路径：全部相对，项目可以随便移动。** 代码本身是自定位的
+（脚本用 `BASH_SOURCE` 推根目录、compose 用 `../` 相对挂载、`start.sh` 自动选后端
+并按自身位置设 `LD_LIBRARY_PATH`），所以部署脚本做的是**删掉 `.env` 里的绝对路径覆盖**，
+把控制权还给这些默认值，而不是写一批新的绝对路径进去。
+项目在家目录下时 systemd 单元用 `%h/...` 形式，家目录内移动无需重装单元；
+换机器或改路径后重跑一次 `deploy.sh` 即可恢复。
+
+**显卡适配**：自动探测 `compute_cap` 并据此选后端，判据是"编的架构能不能在目标卡上跑"
+而不是"目录存不存在"。多架构构建 `build-cuda-multi/` 覆盖 sm_80/89/90/120，
+4090/A100/H100/5090 都能用 CUDA + MTP；没有匹配的 CUDA 构建时回退 Vulkan
+（MTP 失效、吞吐降 2-3 倍），并打印重编命令。无 NVIDIA 卡时仍会拉起 llama，
+但走 CPU 并明确标记为慢。
+
+### 10.5 远端 RAG 节点
+
+远端 GPU 机可以只部署 RAG 服务，不需要主站那套 WebUI/数据库/llama。
+
+```bash
+cd <远端机上的项目目录>
+bash Scripts/deploy_remote_rag.sh               # 自动探测卡数，自动选镜像来源
+bash Scripts/deploy_remote_rag.sh --dry-run     # 只生成 compose 不启动
+```
+
+服务数量按**实际卡数**决定：0 卡起 1 个 CPU 服务、1 卡起 1 个、2 卡起 2 个。
+原 `HDW_Inference/RAG_Service/remote-compose.yml` 写死了两张卡和 IP，
+脚本改为按探测结果生成到 `HDW_Runtime/remote-rag/`（不写回仓库，
+免得这个文件夹拷到下一台机器时带着上一台的 IP 和卡号）。
+
+镜像三种来源，不指定时自动选：
+
+| 方式 | 说明 |
+| --- | --- |
+| `--image-tar <文件>` | 用包内的 `docker save` 产物 |
+| `--image-from <user@host>` | 从主站直接 `docker save \| ssh \| docker load`（默认优先） |
+| `--image-mode build` | 远端本地构建（需要能连公网 PyPI） |
+
+部署完成后脚本会打印主站要改的那一行，**必须照抄**：
+
+```text
+HDW_RAG_REMOTE_URLS=http://<远端IP>:8001
+```
+
+单卡远端只监听 8001，若主站仍列着 8003，每次问答都会有一半请求打到不存在的端口，
+每个都要吃一次 `HDW_RAG_CONNECT_TIMEOUT`（默认 3s）。
+
+然后回主站推数据并重建远端索引：
+
+```bash
+SSHPASS='<远端密码>' bash Scripts/sync_remote_rag.sh
+```
+
+注意该脚本用的是主站 `.env` 里的 `HDW_REMOTE_RAG_SSH_TARGET` / `HDW_REMOTE_RAG_ROOT`，
+换远端时要同步改。
+
+### 10.6 验收
+
+`healthcheck.sh` 是**日常巡检**，`deploy_verify.sh` 是**部署验收**，两者职责不同：
+
+```bash
+bash Scripts/healthcheck.sh            # 快，日常看
+bash Scripts/deploy_verify.sh          # 全，部署后/交接前
+bash Scripts/deploy_verify.sh --quick  # 跳过端到端问答
+bash Scripts/deploy_verify.sh --deep   # 额外做重启演练
+```
+
+验收脚本刻意**不信任 `/health`**，因为项目里有两处会误导：
+
+- RAG 的 `GET /health` 返回的是写死的静态字典，只查路径存在性、**不加载模型**
+  （模型是首次 `/embed` 才懒加载），`status` 恒为 `ok`；
+- QA API 的 `/health` 里 `"status":"ok"` 也是硬编码字面量。
+
+所以验收会真调一次 `/embed`（断言维度 1024）、真跑一次生成
+（读 `usage.completion_tokens` 而不是 `content` —— Qwen3.8 是思考模型，
+token 可能全被 `reasoning_content` 吃掉，只看 `content` 会误判为失败）、
+并扫 journal 里的 `no kernel image is available`（CUDA kernel 不匹配时
+`/health` 照样通过，只有真推理才暴露）。
+
+端到端问答需要一个登录会话。不指定时脚本会取 `HDW_Security/auth/auth.csv`
+里的第一个账号换取会话（**只打印账号名，不打印登录码**），也可用
+`--login-code <code>` 显式指定。
+
+### 10.7 镜像源（国内网络建议先做）
+
+```bash
+bash Scripts/setup_mirrors.sh --check   # 只报当前状态和会改什么，不动手
+bash Scripts/setup_mirrors.sh           # 交互式：显示检测到的默认值，问 Y/n
+bash Scripts/setup_mirrors.sh --yes     # 全部采用检测到的值
+```
+
+覆盖 **Docker registry mirror / pip / npm / apt** 四项。默认值取自**本机现有配置**
+（不是写死的清单）——目的是让新机器配得和现在这台一样。选 `n` 可逐项手工填写。
+
+每一项都是幂等的：内容没变就跳过（**不会白白重启 Docker**）；改前备份到
+`<原文件>.hdw-bak-<时间戳>`；apt 改完会跑一次 `apt-get update` 验证，失败自动回滚。
+
+也可以只跑一部分：
+
+```bash
+bash Scripts/setup_mirrors.sh --only docker,pip
+bash Scripts/setup_mirrors.sh --docker "https://mirror.example.com" --pip "https://mirrors.ustc.edu.cn/pypi/simple/"
+```
+
+一键部署时用 `--setup-mirrors` 带上这一步；选 `--network mirror` 但宿主机还没配
+registry-mirrors 时会提示你先跑它。
+
+**关键限制：`docker build` 里的 pip 不读宿主机的 `/etc/pip.conf`。**
+构建期的源只能通过 build-arg 注入，所以 5 个 Dockerfile 都加了：
+
+```dockerfile
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" -r requirements.txt
+```
+
+`docker-compose.yml` 已经把这 6 个服务的 `build.args` 接上 `.env` 的 `PIP_INDEX_URL`，
+所以**切换构建期源只要改 `.env` 一处**：
+
+```bash
+# 回官方源
+PIP_INDEX_URL=https://pypi.org/simple
+```
+
+改完需要 `docker compose build <服务>` 重建（build-arg 变化会失效对应层的缓存）。
+MinerU 和 FreeToken 的 Dockerfile 另外支持 `--build-arg APT_MIRROR=<url>` 换 apt 源。
+
+### 10.8 第三方依赖（vendor）
+
+项目用到 10 个第三方仓库，但**它们不进版本库**——仓库里只留一份锁文件，
+部署时按需克隆回原路径（项目结构完全不变）。
+
+```bash
+bash Scripts/fetch_vendors.sh                 # 只拉默认需要的（MinerU、aora-bot）
+bash Scripts/fetch_vendors.sh --all           # 全部（含 6 个预留仓库，约 2.7G）
+bash Scripts/fetch_vendors.sh --with dify,n8n # 默认的 **加上** 这两个
+bash Scripts/fetch_vendors.sh --only MinerU   # 只要这一个
+bash Scripts/fetch_vendors.sh --check-only    # 只报状态，不克隆
+bash Scripts/fetch_vendors.sh --prefer gitee  # 优先走 gitee（国内网络强烈建议）
+```
+
+**为什么这么做**：这 10 个目录合计 3.45 GiB，其中 **2.66 GiB 是 `.git`**——
+真正的源码只有 606 MiB，而构建产物一个都没有（`node_modules` 全项目为零）。
+把 git 历史搬进项目仓库纯属浪费。实测默认的那 3 个克隆下来只要 **62 MB**。
+
+**版本锁在 [`vendor/vendor.lock`](vendor/vendor.lock)**，制表符分隔，每行是
+`路径 / commit / 是否默认拉 / 分支 / URL`。用的是 commit SHA 而非分支名——
+实测上游推进很快，其中 7 个仓库在克隆后几周内分支头就变了，只写分支名不可复现。
+
+**URL 一栏是「规范上游在前、镜像兜底在后」**，按顺序尝试。这不是摆设：
+本机实测 `github.com` 的按 commit 拉取会**无限挂起**（GitHub 对未广告的 SHA
+要做一次完整可达性遍历，大仓库上能卡几分钟），靠回退到 `gitee.com` 才装上。
+
+国内网络建议直接加 `--prefer gitee` 把 gitee 提到前面，省掉那次白等：
+
+```text
+（不指定）        冷克隆 3 个依赖 54s，其中 45s 花在 github 的超时上
+--prefer gitee    同样的 3 个依赖 22s，全部走 gitee 浅取
+```
+
+只影响本次运行，不改锁文件——锁文件保持规范上游在前，便于他人复用和溯源。
+
+克隆走三级回退，**层级为主、URL 为辅**（先把最便宜的浅取对所有镜像试一遍，
+都不行才升级）：
+
+| 级别 | 做法 | 代价 |
+| --- | --- | --- |
+| 1 | `git fetch --depth 1 origin <sha>` | 几十 MB，最快 |
+| 2 | `git clone --filter=blob:none` + checkout | 中等 |
+| 3 | 全量 `git clone` + checkout | 最慢，但一定成功 |
+
+第 1 级依赖服务端支持取任意 SHA（`uploadpack.allowReachableSHA1InWant`）。
+每级都有超时（默认 45s / 150s / 1800s，可用 `HDW_VENDOR_T*_TIMEOUT` 调），
+某个 host 三级全挂后**本次运行内不再尝试它**。
+
+**项目自有的 3 个文件**放在 [`vendor/overlays/`](vendor/overlays/)，克隆后自动拷回原位：
+
+```text
+HDW_Knowledge/MinerU/docker/hyperdrivewave-pipeline.Dockerfile
+HDW_Inference/FreeToken/Dockerfile
+HDW_Inference/FreeToken/.dockerignore
+```
+
+它们必须在 build context 内部（Docker 要求 Dockerfile 在 context 里，
+compose 的 `dockerfile:` 也是相对 context 解析的），所以不能只存一份在外面改指向。
+
+**升级某个依赖**：
+
+```bash
+cd <依赖路径> && git fetch && git log --oneline origin/<分支> | head
+# 挑好 commit，填进 vendor/vendor.lock 第 2 列
+bash Scripts/fetch_vendors.sh --with <名字>
+bash Scripts/deploy_verify.sh
+```
+
+**注意 `zvec` 不在此列**——它曾经被 vendored 在 `HDW_VectorDB/zvec/`，但**从未被使用**
+（RAG 实际用 PyPI 的版本，该目录既没被 COPY 也没被挂载）。现在直接在
+`HDW_Inference/RAG_Service/requirements.txt` 里钉 `zvec==0.7.0`。
+
+**许可证**：`vendor/` 下都是别人的代码，各自遵循上游许可证。
+`aora-bot/emotion-ball`（WebUI 首页那个情绪球）的许可证在商业部署前需重新核对。
+
+## 11. 日常运维命令
+
+查看状态：
+
+```bash
+bash Scripts/status.sh
+```
+
+查看全部日志：
+
+```bash
+bash Scripts/logs.sh
+```
+
+查看指定服务：
+
+```bash
+bash Scripts/logs.sh hdw-qa-api
+bash Scripts/logs.sh hdw-ingest
+bash Scripts/logs.sh hdw-mineru
+bash Scripts/logs.sh hdw-rag
+```
+
+停止服务但保留数据：
+
+```bash
+bash Scripts/stop.sh
+```
+
+修改 QA API 或 WebUI 后只重建相关服务：
+
+```bash
+docker compose --env-file Configs/.env \
+  -f Configs/docker-compose.yml \
+  --profile base --profile web \
+  up -d --build hdw-qa-api hdw-webui
+```
+
+修改 MinerU Compose 配置后：
+
+```bash
+docker compose --env-file Configs/.env \
+  -f Configs/docker-compose.yml \
+  --profile knowledge \
+  up -d --force-recreate hdw-mineru
+```
+
+查看 GPU 维护协调器：
+
+```bash
+systemctl --user status hyperdrivewave-resource-coordinator.service --no-pager
+curl --unix-socket HDW_Runtime/maintenance/maintenance.sock http://localhost/status
+```
+
+手动触发维护模式只用于验收或故障排查。它会停止本地 llama，切换本机 RAG/MinerU
+到 CUDA；完成后必须恢复：
+
+```bash
+curl --unix-socket HDW_Runtime/maintenance/maintenance.sock \
+  -X POST http://localhost/prepare
+curl --unix-socket HDW_Runtime/maintenance/maintenance.sock \
+  -X POST http://localhost/restore
+```
+
+资源协调器同时承载外网隧道开关：
+
+```bash
+curl --unix-socket HDW_Runtime/maintenance/maintenance.sock http://localhost/frp
+curl --unix-socket HDW_Runtime/maintenance/maintenance.sock -X POST http://localhost/frp-enable
+curl --unix-socket HDW_Runtime/maintenance/maintenance.sock -X POST http://localhost/frp-disable
+```
+
+### 11.1 外网访问（公网隧道）
+
+推荐入口：**控制中心 → 外网访问**。管理员可切换，普通用户只能看状态。停用后公网
+入口立即失效，局域网不受影响。
+
+命令行等价操作：
+
+```bash
+systemctl --user status  hyperdrivewave-frpc.service
+systemctl --user enable  --now hyperdrivewave-frpc.service   # 启用
+systemctl --user disable --now hyperdrivewave-frpc.service   # 停用
+tail -f HDW_Runtime/frp/frpc_hdw_public.log
+```
+
+完整的架构图、部署方式、证书更换和回滚步骤见
+`HDW_Frontend/FRP/README_FRP.md`。三点必须记住：
+
+1. **单元用 `cp` 安装，不要用 `systemctl --user link`。** `link` 创建的单元，符号链接
+   本身就是「启用」机制，`systemctl disable` 会把链接删掉、单元直接消失，导致再也
+   启用不了。`hyperdrivewave-llama.service` 和 coordinator 目前仍用 `link`：它们从
+   不需要 `disable`，所以没暴露这个问题，但若要给它们做开关必须先改成 `cp`。
+2. **公网端口 8080/8443 是共享资源。** 中转 frps 的 `allowPorts` 硬限制为这两个口。
+   在 217 上手动重启 SmartGasTurbine 的 FRP 会抢端口、顶掉本项目隧道（frpc 会重试恢复）。
+3. **开机自启依赖用户会话。** 本机 `Linger=no`，systemd 用户服务只在用户登录会话存在
+   时运行，与 llama/coordinator 行为一致。需要无登录也自启时：
+   `sudo loginctl enable-linger xthd`（会影响所有用户服务）。
+
+中转面板（查公网代理是否在线）：`http://<公网中转机IP>:7500`
+
+### 11.2 改动生效方式（易踩的坑）
+
+Compose 里有三类挂载，改完文件后的生效方式不同：
+
+| 挂载方式 | 涉及文件 | 生效方式 |
+| --- | --- | --- |
+| 单文件 bind mount | `industrial-webui/index.html`、`nginx.conf` | **必须 `--force-recreate`** |
+| 目录 bind mount | `HDW_Engines/LLM_API`（qa-api 的 `client.py` 等） | `docker restart` 即可 |
+| 烧进镜像 | `HDW_Orchestrator/industrial-qa-api/app/` | `up -d --build` |
+
+单文件 bind mount 锁的是 **inode**。编辑工具通常用 rename 替换文件，产生新 inode，
+容器仍指向旧 inode —— 此时 `docker compose up -d` 会判定「无变更」而不重建：
+
+```bash
+docker compose --env-file Configs/.env -f Configs/docker-compose.yml \
+  --profile base --profile knowledge --profile web \
+  up -d --force-recreate --no-deps hdw-webui
+```
+
+## 12. 文档入库操作
+
+推荐使用 WebUI：
+
+1. 进入“控制中心”。
+2. 打开“知识库入库”。
+3. 上传文档或拖拽文档。
+4. 等待待入库文件显示上传完成。
+5. 需要重新整理全部文档时勾选“全量一致性重建”。
+6. 点击“知识库入库”。
+7. 等待 MinerU、切分、Neo4j 和 Zvec 全部完成。
+
+命令行上传：
+
+```bash
+curl -f -X POST http://127.0.0.1:8090/upload \
+  -F "file=@/path/to/document.docx"
+```
+
+查看文档：
+
+```bash
+curl -fsS http://127.0.0.1:8090/documents
+```
+
+查看任务：
+
+```bash
+curl -fsS http://127.0.0.1:8090/jobs/<job-id>
+```
+
+普通入库请求：
+
+```bash
+curl -f -X POST http://127.0.0.1:8090/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"document_ids":["<document-id>"],"full_rebuild":false}'
+```
+
+全量重建请求：
+
+```bash
+curl -f -X POST http://127.0.0.1:8090/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"document_ids":[],"full_rebuild":true}'
+```
+
+删除已入库文档必须使用文档删除接口，让系统重新构建剩余图谱和向量：
+
+```bash
+curl -f -X DELETE \
+  http://127.0.0.1:8090/documents/<document-id>
+```
+
+删除“已上传但尚未进入任务”的文件才使用 staged 接口：
+
+```bash
+curl -f -X DELETE \
+  http://127.0.0.1:8090/documents/<document-id>/staged
+```
+
+## 13. 清空知识库
+
+清空知识库前必须确认没有 running 或 queued 任务：
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+state = json.loads(Path("HDW_Runtime/ingest/state.json").read_text())
+for job in state.get("jobs", {}).values():
+    if job.get("status") in {"queued", "running"}:
+        print("ACTIVE", job.get("id"), job.get("status"), job.get("stage"))
+PY
+```
+
+建议流程：
+
+1. 停止 WebUI 发起新入库。
+2. 确认所有任务为 `completed` 或 `failed`。
+3. 执行 `bash Scripts/backup.sh`。
+4. 备份或移走 `HDW_Runtime/knowledge_sources` 内的源文档。
+5. 清理 `HDW_Runtime/mineru/parsed`。
+6. 清空 `HDW_Runtime/rag/chunks.jsonl`，保留空文件或由流程重建。
+7. 通过 `full_rebuild=true` 触发空知识库重建。
+8. 检查 Neo4j 节点、Zvec 索引和 WebUI 文档列表。
+
+不要删除整个 `HDW_Runtime/neo4j`、`postgres` 或 `redis`，除非明确要初始化所有基础设施。
+
+## 14. 交给另一个 AI 时的接手流程
+
+把项目交给新的 AI 或开发者时，要求按下面顺序执行：
+
+### 第一步：确认根目录
+
+```bash
+cd /home/xthd/桌面/HyperDriveWave
+pwd
+find . -maxdepth 2 -type d | sort
+```
+
+不要先删除文件，不要先执行 `docker compose down -v`。
+
+### 第二步：阅读入口文档
+
+按顺序阅读：
+
+```text
+README.md
+架构.md
+Configs/docker-compose.yml
+Configs/.env.example
+Scripts/start.sh
+Scripts/stop.sh
+HDW_Orchestrator/industrial-qa-api/app/main.py
+HDW_Orchestrator/industrial-ingest-api/app.py
+HDW_DataFoundation/ETL_Pipelines/parse_documents.py
+HDW_DataFoundation/ETL_Pipelines/ingest_documents.py
+```
+
+### 第三步：判断什么是真正上线的
+
+检查完整 profile 下的 Compose 服务列表：
+
+```bash
+docker compose --env-file Configs/.env \
+  -f Configs/docker-compose.yml \
+  --profile base --profile gpu --profile knowledge --profile web \
+  config --services
+```
+
+目录存在只表示源码或预留目录存在；服务是否上线以 Compose、容器状态和 HTTP 健康检查为准。
+
+### 第四步：检查数据和任务
+
+```bash
+docker compose --env-file Configs/.env \
+  -f Configs/docker-compose.yml ps
+
+curl -fsS http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:8090/documents
+```
+
+如果有入库任务，先查看：
+
+```bash
+cat HDW_Runtime/ingest/state.json
+```
+
+正在解析时不要移动源文档、解析结果、Chunk、Zvec 或 Neo4j 数据。
+
+### 第五步：只做最小改动
+
+遵守以下边界：
+
+- 新功能先复用现有容器。
+- 不重复引入第二个聊天数据库。
+- 不把第三方源码直接改成业务代码。
+- 不把模型权重打进镜像。
+- 不让 WebUI 直接访问 Neo4j、SIS 或数据库。
+- 不绕过 ingest API 直接修改索引。
+- 不把账号密码写进 README、前端或提交记录。
+
+### 第六步：完成最小验收
+
+至少执行：
+
+```bash
+python3 -m py_compile \
+  HDW_Orchestrator/industrial-qa-api/app/config.py \
+  HDW_Orchestrator/industrial-qa-api/app/main.py \
+  HDW_Orchestrator/industrial-ingest-api/app.py \
+  HDW_DataFoundation/ETL_Pipelines/parse_documents.py
+
+docker compose --env-file Configs/.env \
+  -f Configs/docker-compose.yml config
+
+bash Scripts/healthcheck.sh
+```
+
+若修改 WebUI，还要用 Node 做内嵌 JavaScript 语法检查，并手动验证：
+
+1. 新建会话后 `HDW_Runtime/chatdata` 出现 JSON。
+2. 刷新页面后历史会话仍可打开。
+3. 另一台局域网电脑能看到同一历史记录。
+4. 右键置顶会移动到置顶区域。
+5. 删除会话后对应 JSON 消失。
+6. 回答依据仍能展开。
+
+## 15. 后续接入路线
+
+### P0：当前闭环
+
+```text
+Qwen + RAG + reranker + Zvec + Neo4j + MinerU + WebUI + 文件会话
+```
+
+### P1：真实增量知识库
+
+1. 使用源文件 SHA-256 判断新增、修改和删除。
+2. 只重新解析变化文档。
+3. 删除旧文档对应的 Chunk、图谱节点和向量。
+4. 让普通入库真正成为增量流程。
+5. 给任务增加取消、重试和断点恢复。
+
+### P2：MCP 真实问答链路
+
+1. QA API 增加问题分类。
+2. 只读问题允许调用 SIS、报警和 RTSP 工具。
+3. 工具结果标注时间、测点、单位、质量码和来源。
+4. 工具失败时明确区分“没有数据”和“服务不可用”。
+5. 文档证据、图谱证据和实时工具结果分开展示。
+6. 所有工具调用写审计日志。
+
+### P3：Dify 和 n8n
+
+- Dify：接入 `hdw-qa-api` 的 OpenAI 兼容接口，用于 Prompt 实验和业务应用原型。
+- n8n：接收文档上传事件、定时重建、低置信度告警、审批和通知。
+- Dify 和 n8n 不应绕开 QA API 直接操作 Neo4j 或 Zvec。
+
+### P4：生产治理
+
+1. Keycloak 提供 OIDC、SSO 和 RBAC。
+2. Langfuse 记录 LLM trace 和用户反馈。
+3. PostgreSQL 保存文档元数据、权限、审计和任务索引。
+4. RAGAS 和 Golden Dataset 形成版本评测。
+5. 单机 JSON 会话迁移到 PostgreSQL 或对象存储。
+6. 根据吞吐量再拆分多副本和队列，不提前增加容器。
+
+## 16. 重要配置索引
+
+| 变量 | 作用 |
+| --- | --- |
+| `HDW_PROJECT_ROOT` | 主机项目根目录 |
+| `HDW_RUNTIME_ROOT` | 主机持久化目录 |
+| `HDW_COMPOSE_PROFILES` | `Scripts/start.sh` 启动的 Compose profile，默认 `base knowledge web` |
+| `HDW_WEBUI_BIND` | WebUI 绑定网卡 |
+| `HDW_WEBUI_PORT` | WebUI 明文端口 |
+| `HDW_WEBUI_TLS_PORT` | WebUI TLS 端口（自签证书，由 hdw-webui 的 nginx 终结） |
+| `HDW_FRP_PUBLIC_HOST` | 公网中转主机地址，仅用于「外网访问」页展示入口地址 |
+| `HDW_FRP_SYSTEMD_UNIT` | frpc 的 systemd 用户单元名，默认 `hyperdrivewave-frpc.service` |
+| `HDW_LLM_PRESENCE_PENALTY` | 送入上游 LLM 的 `presence_penalty`，默认 `0.3`；抑制模型复读检索原文（复读会撞 `max_tokens` 上限并触发模板解析失败）。调大更不易复读、更易跑题 |
+| `HDW_RETRIEVAL_ROUTER` | 检索路由开关，默认 `true`；设为 `false` 退回「一律检索、不读测点」。见 §7.4 |
+| `HDW_LIVE_POINTS_MAX` | 单个问题最多并行查几个实时测点，默认 `3` |
+| `HDW_LIVE_POINT_CANDIDATES` | 关键词搜不到精确匹配时，交给模型挑选的候选测点数，默认 `5` |
+| `HDW_LIVE_TIME_OFFSET_HOURS` | 实时测点采集时间的展示时区偏移，默认 `8`（UTC+8）；只影响展示，输出不带时区后缀。见 §7.5 |
+| `HDW_SIS_BASE_URL` / `HDW_SIS_LOGIN_URL` / `HDW_SIS_USERNAME` / `HDW_SIS_PASSWORD` | SIS 实时测点认证，供 MCP 的 `point_query_*` 取实时值。见 §7.5。**改后需 `--force-recreate hdw-mcp`** |
+| `HDW_SIS_LANGUAGE` | SIS 接口语言，默认 `zh-Hans` |
+| `HDW_LLM_GPU` | FreeToken 旧方案使用的 GPU |
+| `HDW_LLM_MEMORY_RATIO` | LLM 显存比例 |
+| `HDW_LLM_MODE` | 默认推理模式：`online` 或 `offline` |
+| `HDW_LOCAL_LLM_BASE_URL` | 本地 FreeToken OpenAI 兼容地址 |
+| `HDW_LOCAL_LLM_MODEL` | 本地模型名称 |
+| `HDW_ONLINE_LLM_BASE_URL` | 在线模型供应商地址 |
+| `HDW_ONLINE_LLM_MODEL` | 在线模型名称 |
+| `HDW_ONLINE_LLM_API_KEY` | 在线模型密钥，只放在被忽略的 `Configs/.env` |
+| `HDW_ONLINE_GRAPH_TOP_K` | 在线问答送入 LLM 的图谱上下文上限，默认 40 |
+| `HDW_LOCAL_GRAPH_TOP_K` | 离线问答送入 LLM 的图谱上下文上限，默认 10；先由 reranker 排序，再取前 10 条 |
+| `HDW_CONTEXT_WINDOW_TOKENS` | 在线上下文估算上限，当前为 262,144 |
+| `HDW_LOCAL_CONTEXT_WINDOW_TOKENS` | 离线上下文估算上限 |
+| `HDW_CONTEXT_COMPRESSION_THRESHOLD` | 触发上下文压缩的比例，当前为 75% |
+| `HDW_CONTEXT_COMPRESSION_TARGET` | 压缩后目标比例 |
+| `HDW_RAG_DEVICE` | 常态 RAG 使用 CPU 或 GPU；WebUI 维护重建时由覆盖文件临时设为 `cuda` |
+| `HDW_LLM_BASE_URL` | QA API 使用的 LLM 地址 |
+| `HDW_RAG_BASE_URL` | QA API 使用的 RAG 地址 |
+| `HDW_RAG_REMOTE_URLS` | 远端 RAG 地址列表，逗号分隔，QA 按轮询调用，当前为 `<远端RAG主机IP>:8001,8003` |
+| `HDW_RAG_CONNECT_TIMEOUT` | RAG 建立连接超时；远端不可达时用于快速进入下一个节点或本机 fallback |
+| `HDW_RAG_HEALTH_TIMEOUT` | QA `/health` 检查单个 RAG 节点的超时 |
+| `HDW_REMOTE_RAG_SSH_TARGET` | 远端 RAG 同步脚本的 SSH 目标，不包含密码 |
+| `HDW_REMOTE_RAG_ROOT` | 远端 RAG 独立部署目录 |
+| `HDW_MINERU_BASE_URL` | ingest 使用的 MinerU 地址 |
+| `HDW_MAINTENANCE_SOCKET` | llama/RAG/MinerU 资源协调器 Unix socket |
+| `HDW_MAINTENANCE_TIMEOUT` | 维护切换等待上限；`0` 表示不设置总等待上限 |
+| `HDW_CHATDATA_ROOT` | QA API 容器内的会话目录 |
+| `HDW_ENABLE_AUTH` | 是否启用内部 Bearer 鉴权 |
+| `HDW_INTERNAL_API_KEY` | 内部 API key |
+| `NEO4J_AUTH` | Neo4j 认证 |
+| `HDW_SIS_BASE_URL` | SIS 服务地址 |
+| `HDW_SIS_USERNAME` | SIS 用户名，必须放本地环境变量 |
+| `HDW_SIS_PASSWORD` | SIS 密码，必须放本地环境变量 |
+| `MINERU_API_MAX_CONCURRENT_REQUESTS` | MinerU 请求并发上限，当前固定为 1 |
+
+## 17. 最后检查清单
+
+部署或交接完成前确认：
+
+- [ ] `Configs/.env` 已创建且没有使用默认密码。
+- [ ] Qwen、BGE-M3、reranker 目录存在。
+- [ ] `docker compose config` 通过。
+- [ ] GPU 维护覆盖文件只在有 NVIDIA Container Toolkit 时启用；常态 RAG 为 CPU。
+- [ ] MinerU `max_concurrent_requests` 为 1。
+- [ ] `hyperdrivewave-resource-coordinator.service` 为 active，维护 socket 存在。
+- [ ] `HDW_Runtime/chatdata` 可写。
+- [ ] QA API `/health` 返回 LLM、RAG、Neo4j 正常。
+- [ ] `/health` 中当前 LLM 模式和模型符合预期；在线模式不要把 API key 写进代码。
+- [ ] WebUI 使用正确的 `172.*` 网卡地址。
+- [ ] 上传一个小文档并完成一次入库。
+- [ ] 问一个能在文档中找到答案的问题，并展开引用。
+- [ ] 新建会话后刷新页面，历史消息可恢复。
+- [ ] 置顶和删除操作能在文件目录中体现。
+- [ ] 没有执行 `docker compose down -v`。
+- [ ] 连续问 10 个问题（含 1 个与知识库无关的），没有出现 503；上游日志
+      `journalctl --user -u hyperdrivewave-llama.service | grep -c " 500"` 为 0。
+- [ ] 停用外网访问后，公网 `8080`/`8443` 确实不可达，局域网 `3000` 仍正常。
+- [ ] 需要用外网时，先确认 `HDW_ENABLE_AUTH` 已按预期设置。
+
+项目的最短可靠路径是：
+
+```text
+先确认任务和数据状态
+  -> 读取现有接口
+  -> 复用现有容器
+  -> 做最小修改
+  -> 通过健康检查和端到端测试
+  -> 再进入下一阶段
+```

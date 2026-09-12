@@ -1,0 +1,55 @@
+# vendored 第三方依赖清单 —— 由 Scripts/fetch_vendors.sh 消费。
+#
+# 这些仓库**不进版本库**（见 .gitignore）。仓库里只留这份锁文件，
+# 部署时按下面的 URL 和 commit 克隆回原路径，项目结构保持不变。
+#
+# 格式（制表符分隔，空行和 # 开头的行忽略）：
+#   <相对路径> <TAB> <commit> <TAB> <默认拉取> <TAB> <分支> <TAB> <URL，逗号分隔按序尝试>
+#
+# default 列：
+#   yes = 默认部署需要，fetch_vendors.sh 直接拉
+#   no  = 预留未启用（当前 compose 无服务、代码无引用），用 --all / --with 才拉
+#
+# URL 列：**规范上游在前，镜像兜底在后**。多数现有 remote 是 gitee 镜像或
+# 个人 fork，存续性没有保证；因为锚定的是 commit（SHA 不可变），换 URL
+# 不影响可复现性，所以优先写规范上游。
+#
+# 升级某个依赖的步骤：
+#   1. cd <路径> && git fetch && git log --oneline origin/<分支> | head
+#   2. 挑好 commit，把它填到本文件第 2 列
+#   3. bash Scripts/fetch_vendors.sh --with <名字>   重新检出
+#   4. bash Scripts/deploy_verify.sh                 确认没坏
+
+# ── 默认部署需要 ───────────────────────────────────────────────
+# MinerU：knowledge profile，hdw-mineru 镜像的构建上下文（Dockerfile 里 COPY . .）
+HDW_Knowledge/MinerU	2fbeef09960c7ed0643a15a576ba21e104036375	yes	master	https://github.com/opendatalab/MinerU.git,https://gitee.com/pplus_open_source/MinerU.git
+# aora-bot：web profile，hdw-webui 把 emotion-ball/js 挂到 nginx 下当情绪球用
+HDW_Animation/aora-bot	e3b6148c818da4a8e1966f2bc89cdb3cee473b73	yes	main	https://gitee.com/hou-dongwei/aora-bot.git
+
+# ── 按需（非默认 profile 或预留）───────────────────────────────
+# FreeToken：legacy-freetoken profile 的旧推理引擎，默认不启动
+HDW_Inference/FreeToken	e05cff83a04b322fc7823678aa2d05c826aad26c	no	main	https://github.com/FlashML-org/FreeToken.git,https://gitee.com/hou-dongwei/FreeToken.git
+
+# MCP 的 Python SDK。**hdw-mcp 镜像构建依赖它**（Dockerfile 里 COPY python-sdk）。
+# 注意：本地那份有一处**真实补丁**（src/mcp/__init__.py 改成惰性导入，好让服务端
+# 在缺平台依赖时也能用），已存进 vendor/overlays/，克隆后会自动覆盖回去。
+HDW_DataFoundation/MCP/python-sdk	2b0da5631a7cb460c17d60b8cc735626d5e1b3f8	yes	main	https://gitee.com/hou-dongwei/python-sdk.git
+
+# MCP 官方 servers 集合。**全项目零引用**（grep 不到任何 COPY/挂载/import），
+# 保留在清单里只是记录当初拉的是哪个版本。
+HDW_DataFoundation/MCP/servers	4503e2d12b799448cd05f789dd40f9643a8d1a6c	no	main	https://gitee.com/hou-dongwei/servers.git
+
+# 以下六个当前**零引用**：compose 无服务、代码无 import，
+# HDW_N8N_ENABLED / HDW_DIFY_ENABLED / HDW_LANGFUSE_ENABLED 这类开关没有任何消费者。
+# 保留在本清单里是为了「以后要用时知道该拉哪个版本」，不是因为它们此刻有用。
+HDW_Orchestrator/dify	57144b0094b083815824295a41bcdef7a43c181c	no	main	https://github.com/langgenius/dify.git,https://gitee.com/hou-dongwei/dify.git,https://gitee.com/dify_ai/dify.git
+HDW_Orchestrator/n8n	c5c5b3ea7863e2fbeb7b6643f20fcf7bdbe6e9cc	no	master	https://github.com/n8n-io/n8n.git,https://gitee.com/hou-dongwei/n8n.git
+HDW_Orchestrator/langgraph	11ee185999b86bfea2d8c0e69cef9a5e37acf686	no	main	https://github.com/langchain-ai/langgraph.git,https://gitee.com/mirrors/langgraph.git
+HDW_Security/keycloak	9e2fb0ed578058a42b3194d7d6f179c11ea11462	no	main	https://github.com/keycloak/keycloak.git,https://gitee.com/mirrors/keycloak.git
+HDW_Ops/langfuse	e94743fee2287a64e30f429f550a9d47827e26ae	no	main	https://github.com/langfuse/langfuse.git,https://gitee.com/mirrors/langfuse.git
+HDW_Frontend/open-webui	d3e8bf3405e848cfba377814d0aa7ba7290e414d	no	main	https://github.com/open-webui/open-webui.git,https://gitee.com/mirrors/open-webui.git
+
+# ── 已移除 ─────────────────────────────────────────────────────
+# HDW_VectorDB/zvec 曾经 vendored 在这里，但**从未被使用**：
+# 它的 requirements.txt 写的是 zvec>=0.5，RAG 容器实际装的是 PyPI 上的 0.7.0，
+# 且该目录既没被 COPY 也没被挂载。现在直接在 requirements.txt 里钉版本。

@@ -1,0 +1,152 @@
+# HyperDriveWave 版本库排除清单
+#
+# 原则：**能重建的不进库，敏感的绝不进库**。
+# 模型、第三方源码、构建产物都有对应脚本按需获取（见「获取方式」一栏），
+# 所以仓库里只留它们的一份"配方"（清单/锁文件），而不是正文。
+
+# ═══════════════════════════════════════════════════════════════
+# 一、密钥与个人信息 —— 绝不允许进入版本库
+# ═══════════════════════════════════════════════════════════════
+
+Configs/.env
+.env
+# 推送说明文档。**含明文 PAT**，只在本机用，绝不进版本库。
+# 这条规则必须排在创建该文件之前——顺序反了的话，中间任何一次
+# `git add -A` 都会把 token 一起提交上去。
+推送.md
+推送*.md
+Configs/*.bak-*
+# 历史 .env 备份。**这是最容易漏的一类**：它长得不像 .env（名字是
+# .env.before-remote-rag-20260909），但内容就是一份完整的凭据快照——
+# 实测里面躺着真实的 HDW_ONLINE_LLM_API_KEY 和 HDW_AUTH_SECRET。
+# 建议直接删掉，留着既没用又是风险。
+Configs/.env.*
+Configs/*.env.before*
+Configs/*.env.[0-9]*
+
+# FRP 配置里带真实 auth token 的那几个。它们指向的是**别的** FRP 服务器
+# （第三方 FRP 服务器和 SmartGasTurbine 自己的 frps），和本项目部署无关。
+# 本项目在用的只有 frpc_hdw_public.toml，已在上面单独排除。
+HDW_Frontend/FRP/conf/frpc_deploy.toml
+HDW_Frontend/FRP/conf/frps_deploy.toml
+HDW_Frontend/FRP/conf/frps_8765.toml
+HDW_Frontend/FRP/conf/frps_full_example.toml
+HDW_Frontend/FRP/conf/*smartgasturbine*.reference
+# SmartGasTurbine 遗留脚本：路径指向另一个项目和一台 NAS，本项目无引用
+HDW_Frontend/FRP/control/
+
+# frps 是**服务端**二进制（19.5 MB，占仓库一半以上体积），只在公网中转机上跑，
+# 本机只用 frpc。需要时从 frp 官方 release 取。
+HDW_Frontend/FRP/bin/frps
+
+# 员工工号 + 姓名花名册（个人信息，且被登录流程直接使用）
+HDW_Security/auth/auth.csv
+
+# TLS 私钥与公网隧道认证
+HDW_Frontend/FRP/certs/
+HDW_Frontend/FRP/conf/frpc_hdw_public.toml
+HDW_Frontend/FRP/conf/*.token
+
+# ═══════════════════════════════════════════════════════════════
+# 二、模型权重（约 19 GB）—— 获取方式：bash Scripts/fetch_models.sh
+# ═══════════════════════════════════════════════════════════════
+# 清单在 Scripts/lib/models.sh，从魔搭精确下载（字节级校验）。
+# 备注：这里只排除当前在用的三个模型；其余备份模型也应一并排除，
+# 它们的体积(200G+)远超 GitHub 单文件上限。
+
+HDW_Engines/LLM_Models/
+HDW_Engines/RAG_Models/
+*.gguf
+*.safetensors
+*.bin.partial
+
+# ═══════════════════════════════════════════════════════════════
+# 三、第三方源码 —— 获取方式：bash Scripts/fetch_vendors.sh
+# ═══════════════════════════════════════════════════════════════
+# 版本锁在 vendor/vendor.lock（URL + 固定 commit），部署时克隆回原路径。
+# 项目自有的 3 个覆盖文件在 vendor/overlays/，克隆后自动拷回。
+
+HDW_Knowledge/MinerU/
+HDW_Animation/aora-bot/
+HDW_Inference/FreeToken/
+HDW_Orchestrator/dify/
+HDW_Orchestrator/n8n/
+HDW_Orchestrator/langgraph/
+HDW_Security/keycloak/
+HDW_Ops/langfuse/
+HDW_Frontend/open-webui/
+
+# MCP 的两个嵌套仓库。**必须在 git 里排除，不能只是"没加进来"**：
+# 带 .git 的目录被 git add 后会变成 gitlink（mode 160000），
+# clone 下来是空目录、内容全丢，而且看起来像正常的子模块引用，很难排查。
+# hdw-mcp 镜像构建依赖 python-sdk（Dockerfile 里 COPY python-sdk）。
+HDW_DataFoundation/MCP/python-sdk/
+HDW_DataFoundation/MCP/servers/
+
+# zvec 曾经 vendored 在 HDW_VectorDB/zvec/，但它**从未被使用**：
+# requirements.txt 写的是 zvec>=0.5，容器里实际装的是 PyPI 上的 0.7.0，
+# 且该目录既没被 COPY 也没被挂载。现已改为在 requirements.txt 里钉版本。
+HDW_VectorDB/zvec/
+
+# 显式保护锁文件与 overlay。上面的模式因为含中间斜杠会被锚定到根目录，
+# 理论上不会误伤 vendor/overlays/ 下的同名路径；这条否定规则让意图明确，
+# 也防止以后有人把某个模式改成不带斜杠的写法而静默吞掉这几个文件。
+!vendor/vendor.lock
+!vendor/overlays/**
+!vendor/overlays/**/*
+
+# ═══════════════════════════════════════════════════════════════
+# 四、运行数据 —— 新机器上自动生成，不该跨机器搬运
+# ═══════════════════════════════════════════════════════════════
+
+HDW_Runtime/
+# 517 MB 的 Neo4j 库文件（在 HDW_Runtime 之外，要单独排）
+HDW_KnowledgeGraph/neo4j-data/
+HDW_Runtime/**/*.log
+HDW_Runtime/**/*.pid
+
+# ═══════════════════════════════════════════════════════════════
+# 五、内部资料
+# ═══════════════════════════════════════════════════════════════
+
+# 607 个测点的厂站拓扑表。**注意**：排除后新克隆的机器需要另行提供，
+# 否则 MCP 的 point_query_* 工具不可用。
+HDW_DataFoundation/Mapping/
+
+# ═══════════════════════════════════════════════════════════════
+# 六、构建产物 —— 目标机重新编译
+# ═══════════════════════════════════════════════════════════════
+
+# llama.cpp 构建目录。build-cuda-multi 是随包分发的多架构产物（443 MB），
+# 但如果目标机要换 CUDA 架构就得重编，所以不进库。
+HDW_Inference/llama/build/
+HDW_Inference/llama/build-cuda/
+HDW_Inference/llama/build-cuda-multi/
+# Debian 版 llama.cpp 源码包（83 MB）
+HDW_Inference/llama/src/
+# 上游 llama.cpp 源码树（含自己的 .git），需要时单独 clone
+HDW_Inference/llama/llama.cpp-upstream/
+HDW_Inference/llama/*.bak_*
+HDW_Inference/llama/*.bak-*
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+node_modules/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+target/
+
+# ═══════════════════════════════════════════════════════════════
+# 七、备份与临时
+# ═══════════════════════════════════════════════════════════════
+
+*.tgz
+*.tar.gz
+_config.yml
+.DS_Store

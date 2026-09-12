@@ -1,0 +1,16 @@
+[Unit]
+Description=HyperDriveWave llama.cpp local inference
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/桌面/HyperDriveWave
+EnvironmentFile=-%h/桌面/HyperDriveWave/Configs/.env
+ExecStart=%h/桌面/HyperDriveWave/HDW_Inference/llama/start.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=60
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target

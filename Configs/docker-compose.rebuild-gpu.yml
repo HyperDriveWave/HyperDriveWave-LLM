@@ -1,0 +1,12 @@
+services:
+  hdw-rag:
+    gpus: all
+    environment:
+      HDW_RAG_DEVICE: cuda
+      NVIDIA_VISIBLE_DEVICES: "0"
+
+  hdw-mineru:
+    gpus: all
+    environment:
+      MINERU_DEVICE_MODE: cuda
+      NVIDIA_VISIBLE_DEVICES: "0"

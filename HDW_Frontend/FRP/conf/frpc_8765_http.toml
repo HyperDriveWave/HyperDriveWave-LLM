@@ -1,0 +1,11 @@
+serverAddr = "YOUR_PUBLIC_SERVER_IP"
+serverPort = 7000
+
+[[proxies]]
+name = "local-8765-http"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 6688
+
+# Replace this with your real domain that resolves to the frps server.
+customDomains = ["YOUR_DOMAIN"]
