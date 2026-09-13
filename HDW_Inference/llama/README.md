@@ -8,7 +8,7 @@ The project launcher keeps this service resident even when the WebUI remains
 in online mode:
 
 ```bash
-bash /home/xthd/桌面/HyperDriveWave/Scripts/start.sh
+bash <项目根>/Scripts/start.sh
 ```
 
 It is managed as the user service `hyperdrivewave-llama.service`, so a
@@ -26,7 +26,7 @@ journalctl --user -u hyperdrivewave-llama.service -n 120 --no-pager
 For direct debugging only:
 
 ```bash
-bash /home/xthd/桌面/HyperDriveWave/HDW_Inference/llama/start.sh
+bash <项目根>/HDW_Inference/llama/start.sh
 ```
 
 ## Defaults

@@ -5,7 +5,7 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
 项目根目录：
 
 ```text
-/home/xthd/桌面/HyperDriveWave
+<项目根>
 ```
 
 本文档以当前代码和 Compose 配置为准，更新时间：2026-09-09。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
@@ -565,7 +565,7 @@ QA API
 知识库更新后同步远端：
 
 ```bash
-cd /home/xthd/桌面/HyperDriveWave
+cd <项目根>
 SSHPASS='远端SSH密码' bash Scripts/sync_remote_rag.sh
 ```
 
@@ -797,7 +797,7 @@ HDW_SIS_BASE_URL / HDW_SIS_LOGIN_URL / HDW_SIS_USERNAME / HDW_SIS_PASSWORD / HDW
 主机目录：
 
 ```text
-/home/xthd/桌面/HyperDriveWave/HDW_Runtime/chatdata
+<项目根>/HDW_Runtime/chatdata
 ```
 
 容器内目录：
@@ -905,15 +905,15 @@ WebUI 行为：
 ### 10.1 准备配置
 
 ```bash
-cd /home/xthd/桌面/HyperDriveWave
+cd <项目根>
 cp Configs/.env.example Configs/.env
 ```
 
 修改 `Configs/.env` 中至少这些项目：
 
 ```text
-HDW_PROJECT_ROOT=/home/xthd/桌面/HyperDriveWave
-HDW_RUNTIME_ROOT=/home/xthd/桌面/HyperDriveWave/HDW_Runtime
+HDW_PROJECT_ROOT=<项目根>
+HDW_RUNTIME_ROOT=<项目根>/HDW_Runtime
 HDW_WEBUI_BIND=0.0.0.0
 HDW_WEBUI_PORT=3000
 POSTGRES_PASSWORD=<strong-password>
@@ -955,7 +955,7 @@ HDW_Engines/RAG_Models/bge-reranker-v2-m3
 项目启动入口只有 `Scripts/start.sh`。根目录没有 `start.sh`，所以在项目根目录执行 `bash start.sh` 会提示文件不存在。
 
 ```bash
-cd /home/xthd/桌面/HyperDriveWave
+cd <项目根>
 bash Scripts/start.sh
 ```
 
@@ -1020,9 +1020,9 @@ http://192.*:3000
 另有 34G 是历史下载残块，直接 `rsync` 整个目录会白搬 270G。
 
 ```bash
-bash Scripts/pack_hdw.sh --out /media/usb/hdw      # 带在用的 3 个模型，约 25G
-bash Scripts/pack_hdw.sh --app-only --out /media/usb/hdw   # 只带代码，约 7G
-bash Scripts/pack_hdw.sh --remote-rag --out /media/usb/rag # 只打远端 RAG 节点要的
+bash Scripts/pack_hdw.sh --out DIR                 # 带在用的 3 个模型，约 25G
+bash Scripts/pack_hdw.sh --app-only --out DIR      # 只带代码，约 7G
+bash Scripts/pack_hdw.sh --remote-rag --out DIR    # 只打远端 RAG 节点要的
 ```
 
 不带 `--out` 时用 `--tar <文件>` 打成单个压缩包。打包前会先算需要多少空间，
@@ -1745,7 +1745,7 @@ PY
 ### 第一步：确认根目录
 
 ```bash
-cd /home/xthd/桌面/HyperDriveWave
+cd <项目根>
 pwd
 find . -maxdepth 2 -type d | sort
 ```

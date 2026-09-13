@@ -7,7 +7,7 @@
 #
 # 用法：
 #   bash Scripts/deploy_remote_rag.sh                      # 自动探测，交互选镜像来源
-#   bash Scripts/deploy_remote_rag.sh --image-mode load --image-tar /media/hdw-rag.tar.gz
+#   bash Scripts/deploy_remote_rag.sh --image-mode load --image-tar FILE
 #   bash Scripts/deploy_remote_rag.sh --image-mode save-ssh --image-from user@<主站IP>
 #   bash Scripts/deploy_remote_rag.sh --image-mode build
 #   bash Scripts/deploy_remote_rag.sh --bind 10.0.0.9 --admin-token <token>

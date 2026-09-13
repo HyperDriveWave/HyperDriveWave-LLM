@@ -51,6 +51,15 @@ class Settings:
     neo4j_auth = os.getenv("NEO4J_AUTH", "neo4j/change_me")
     graph_timeout = float(os.getenv("HDW_GRAPH_TIMEOUT", "15"))
     mineru_base_url = os.getenv("HDW_MINERU_BASE_URL", "http://localhost:8002")
+    # 图片转写用 MinerU 时的超时。**与摄取侧刻意不同**：parse_documents.py 里
+    # 明写「MinerU may spend many minutes on large OCR PDFs; do not impose a
+    # client deadline」——那是批处理，调用方是任务队列，没人在等。问答路径
+    # **有用户在等**，且一次挂起的请求会占住一个 httpx 连接和一个 asyncio 任务。
+    # 实测单页卷子图约 17 s，180 s 留了充足余量又不至于挂死。
+    mineru_timeout = float(os.getenv("HDW_MINERU_TIMEOUT", "180"))
+    # MinerU 是单并发（max_concurrent_requests=1）。队列里已有任务时直接放弃
+    # 这个候选，而不是排在知识库入库任务后面等几分钟——失败快、可预期。
+    mineru_max_queue = int(os.getenv("HDW_VISION_MINERU_MAX_QUEUE", "1"))
     mcp_base_url = os.getenv("HDW_MCP_BASE_URL", "http://hdw-mcp:8766/mcp").strip().rstrip("/")
     model_config_path = Path(
         os.getenv("HDW_MODEL_CONFIG_PATH", "/data/model-config/config.json")

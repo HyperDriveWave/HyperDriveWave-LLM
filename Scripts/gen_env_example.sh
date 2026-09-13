@@ -41,8 +41,14 @@ def keys(p):
             out.append(s.split("=", 1)[0].strip())
     return out
 src, dst = keys(sys.argv[1]), keys(sys.argv[2])
-miss = [k for k in src if k not in dst]
+# 这些键在模板里**故意**只以注释形态存在（原因见下面 REMOTE_ONLY_KEYS 处）。
+# 不排除的话 --check 会永久报红——红久了的检查等于没有检查。
+REMOTE_ONLY = {"HDW_REMOTE_RAG_ROOT"}
+miss = [k for k in src if k not in dst and k not in REMOTE_ONLY]
+by_design = [k for k in src if k not in dst and k in REMOTE_ONLY]
 print(f"  .env 有 {len(src)} 个键，模板有 {len(dst)} 个")
+if by_design:
+    print(f"  · 其中 {len(by_design)} 个按设计只以注释形态存在：{', '.join(by_design)}")
 if miss:
     print(f"  ❌ 模板缺少 {len(miss)} 个（新机器会缺这些配置）：")
     for k in miss: print(f"     {k}")
@@ -53,7 +59,7 @@ PY
 fi
 
 # 清空凭据：只报键名，不回显值
-BLANKED="$(python3 - "$SRC" "$DST" <<'PY'
+BLANKED="$(python3 - "$SRC" "$DST" "$HDW_ROOT" <<'PY'
 import pathlib, re, sys
 
 # 键名匹配。**必须带词边界**（`_` 或结尾），不能用裸子串：
@@ -65,6 +71,11 @@ import pathlib, re, sys
 KEY_PAT = re.compile(r"_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|USERNAME)$", re.I)
 # 明确不是凭据的例外
 EXEMPT = {"HDW_ENABLE_AUTH", "HDW_INTERNAL_API_KEY"}
+
+# 指向**别的机器**的路径键。这类键和下面 unset_abs_path_key 处理的那批不同：
+# 那批有自定位的相对默认值，注释掉等于「用默认值」；这批没有默认值，
+# 注释掉等于「这台机器上必须自己填」。所以在模板里只能以注释形态出现。
+REMOTE_ONLY_KEYS = {"HDW_REMOTE_RAG_ROOT"}
 
 def placeholder(key: str) -> str:
     base = key.replace("HDW_", "").lower()
@@ -87,11 +98,33 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replac
     k, v = k.strip(), v.strip()
     if k in EXEMPT:
         out.append(line); continue
+    if k in REMOTE_ONLY_KEYS:
+        # 指向**别的机器**的路径。不能原样留在模板里：新机器照抄会拿到一个
+        # 本机不存在的路径，而且要等 sync_remote_rag.sh 报错才发现。
+        # 也不能换成占位符后保持生效——那会让新机器拿到一个字面量路径当真实值。
+        # 唯一正确的形态是注释掉，并说明必须按实际部署填。
+        out.append("# [deploy] 已注释以保持可移植：这是**远端机**上的项目根，本机代码无法自定位，")
+        out.append("# 必须按实际部署填写。留空时 Scripts/sync_remote_rag.sh 会明确报错而不是猜一个路径。")
+        out.append(f"# {k}=/home/<远端用户名>/HyperDriveWave-RAG")
+        blanked.append(k)
+        continue
     if KEY_PAT.search(k) and v and "change_me" not in v and not v.startswith("your"):
         out.append(f"{k}={placeholder(k)}")
         blanked.append(k)
     else:
         out.append(line)
+
+# 模板里不该出现任何主机绝对路径——它既暴露部署环境，也会让新机器以为可以照抄。
+# 项目根换成 <项目根>（注释里的示例路径也一并换），其余 /home/<某用户> 收敛成 <用户>。
+_project_root = sys.argv[3].rstrip("/")
+
+
+def _scrub(text: str) -> str:
+    text = text.replace(_project_root, "<项目根>")
+    return re.sub(r"/home/(?!<)[^/\s\"']+", "/home/<用户>", text)
+
+
+out = [_scrub(line) for line in out]
 
 header = """# HyperDriveWave 配置模板 —— 由 Scripts/gen_env_example.sh 从 Configs/.env 生成。
 #

@@ -1902,7 +1902,10 @@
 
     .vision-priority-row {
       display: grid;
-      grid-template-columns: 26px 100px minmax(0, 1fr) 76px;
+      /* 序号 / 来源类型 / 推理模式 / 模型名 / 启用。
+         **列数必须与控件数一致**：少一列就会换行，而自动摆放会把模型输入框
+         塞进序号那一格（26px 宽），窄屏上尤其明显。 */
+      grid-template-columns: 26px 96px 88px minmax(0, 1fr) 68px;
       gap: 8px;
       align-items: center;
     }
@@ -2979,6 +2982,40 @@
       #graphSvg {
         min-height: 420px;
       }
+
+      /* 视觉来源优先级：每行有 5 个控件（序号／来源类型／推理模式／模型名／启用）。
+         窄屏一行放不下——少一列就会换行，而自动摆放会把模型输入框塞进序号那一格
+         （24px 宽），「启用」还会被甩到最左边脱离它所属的行，看起来像属于下一行。
+         改成卡片式：序号 + 两个下拉占一行，模型名独占一行（它是唯一需要输入文字
+         的），启用独占一行。加边界是为了让四行一眼能看出哪几行属于同一条来源。
+
+         **放在 760 而不是 520**：521~760 之间用桌面栅格时模型名会被截断
+         （实测 560px 下 `Qwen3.8-27B-GSQ-RCO-IQ3_S-mt` 就看不全），
+         而这是本面板里最需要看清的字段。 */
+      .model-panel-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+      }
+
+      .vision-priority-row {
+        grid-template-columns: 24px minmax(0, 1fr) minmax(0, 1fr);
+        gap: 6px 8px;
+        padding: 8px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface-soft);
+      }
+
+      /* 模型名是行内唯一的**直接** input 子元素——启用复选框在 label 里面，不受影响 */
+      .vision-priority-row > input {
+        grid-column: 1 / -1;
+      }
+
+      .vision-priority-row label {
+        grid-column: 1 / -1;
+        justify-content: flex-start;
+      }
     }
 
     @media (max-width: 520px) {
@@ -3054,15 +3091,6 @@
       .model-page .tool-page-header p {
         margin-top: 7px;
         white-space: normal;
-      }
-
-      .vision-priority-row {
-        grid-template-columns: 24px 82px minmax(0, 1fr);
-      }
-
-      .vision-priority-row label {
-        grid-column: 2 / -1;
-        justify-content: flex-start;
       }
 
       .document-row {
@@ -3388,6 +3416,13 @@
                   <input id="modelLocalMultimodal" type="checkbox" />
                   <span>启用多模态（图片；视频暂未接入）</span>
                 </label>
+                <div class="model-fields">
+                  <label class="model-field model-field-wide">
+                    <span>视觉投影器（mmproj）</span>
+                    <input id="modelLocalMmproj" type="text"
+                           placeholder="留空表示不用本地视觉；可填文件名，会在 HDW_Engines/LLM_Models/ 下查找" />
+                  </label>
+                </div>
                 <label class="model-checkbox">
                   <input id="modelLocalMtp" type="checkbox" />
                   <span>启用 MTP</span>
@@ -3465,32 +3500,21 @@
                 </div>
               </section>
 
-              <section class="model-panel model-panel-wide" aria-label="视觉模型优先级">
+              <section class="model-panel model-panel-wide" aria-label="视觉来源优先级">
                 <div class="model-panel-header">
-                  <h3>视觉模型优先级</h3>
-                  <span>上传图片后按顺序尝试，失败才回退下一项</span>
+                  <h3>视觉来源优先级</h3>
+                  <span>上传图片后按顺序尝试转写，失败才回退下一项</span>
                 </div>
-                <div class="vision-priority-list">
-                  <div class="vision-priority-row">
-                    <strong>1</strong>
-                    <select id="visionPriority1Mode" aria-label="视觉优先级1推理模式">
-                      <option value="online">在线</option>
-                      <option value="offline">本地</option>
-                    </select>
-                    <input id="visionPriority1Model" type="text" placeholder="模型名称" aria-label="视觉优先级1模型" />
-                    <label><input id="visionPriority1Enabled" type="checkbox" />启用</label>
-                  </div>
-                  <div class="vision-priority-row">
-                    <strong>2</strong>
-                    <select id="visionPriority2Mode" aria-label="视觉优先级2推理模式">
-                      <option value="online">在线</option>
-                      <option value="offline">本地</option>
-                    </select>
-                    <input id="visionPriority2Model" type="text" placeholder="模型名称" aria-label="视觉优先级2模型" />
-                    <label><input id="visionPriority2Enabled" type="checkbox" />启用</label>
-                  </div>
-                </div>
-                <p class="model-help">文字推理模式与视觉路由独立；本地模式上传图片时按视觉优先级使用可用视觉模型，实际模型会在回答中标明。</p>
+                <!-- 行由 JS 生成（见 buildVisionPriorityRows）。**不在 HTML 里写死**：
+                     行数与后端 vision_priority 的 1~4 上限必须一致，写死在两处必然漂移，
+                     而漂移的后果是静默的——界面行数少于配置项数时，保存会把多出来的项删掉。 -->
+                <div class="vision-priority-list" id="visionPriorityList"></div>
+                <p class="model-help">
+                  「模型对话」走在线或本地大模型识别图片，快（约 2~3 秒）但本地需要视觉投影器；
+                  「MinerU 解析」走本机文档解析，完全不出网，但慢约一个量级（约 5~20 秒），
+                  且单并发——有入库任务在跑时会直接跳过它而不是排队。
+                  识别出的文字用于检索知识库，原图仍会发给答题模型。
+                </p>
               </section>
             </div>
           </section>
@@ -3782,6 +3806,7 @@
     const modelLocalMtp = document.querySelector("#modelLocalMtp");
     const modelLocalThinking = document.querySelector("#modelLocalThinking");
     const modelLocalCapability = document.querySelector("#modelLocalCapability");
+    const modelLocalMmproj = document.querySelector("#modelLocalMmproj");
     const modelOnlineBaseUrl = document.querySelector("#modelOnlineBaseUrl");
     const modelOnlineModel = document.querySelector("#modelOnlineModel");
     const modelOnlineContext = document.querySelector("#modelOnlineContext");
@@ -3795,12 +3820,60 @@
     const modelSaveButton = document.querySelector("#modelSaveButton");
     const modelRefreshButton = document.querySelector("#modelRefreshButton");
     const modelRuntimeNote = document.querySelector("#modelRuntimeNote");
-    const visionPriorityFields = [1, 2].map((index) => ({
-      index,
-      mode: document.querySelector(`#visionPriority${index}Mode`),
-      model: document.querySelector(`#visionPriority${index}Model`),
-      enabled: document.querySelector(`#visionPriority${index}Enabled`),
-    }));
+    // 视觉来源优先级。行数**必须**与后端 vision_priority 的 1~4 上限一致：
+    // 界面行数少于配置项数时，保存会把多出来的项静默删掉（配置里 3 项、
+    // 界面只发 2 项，第 3 项就没了），而且没有任何提示。
+    const VISION_PRIORITY_ROWS = 4;
+    const VISION_KIND_OPTIONS = [
+      { value: "chat", label: "模型对话" },
+      { value: "mineru", label: "MinerU 解析" },
+    ];
+    const VISION_MODE_OPTIONS = [
+      { value: "online", label: "在线" },
+      { value: "offline", label: "本地" },
+    ];
+    let visionPriorityFields = [];
+
+    function buildVisionPriorityRows() {
+      const list = document.querySelector("#visionPriorityList");
+      if (!list) return;
+      list.textContent = "";
+      for (let index = 1; index <= VISION_PRIORITY_ROWS; index += 1) {
+        const row = document.createElement("div");
+        row.className = "vision-priority-row";
+        const order = document.createElement("strong");
+        order.textContent = String(index);
+        const kind = document.createElement("select");
+        kind.id = `visionPriority${index}Kind`;
+        kind.setAttribute("aria-label", `视觉优先级${index}来源类型`);
+        const mode = document.createElement("select");
+        mode.id = `visionPriority${index}Mode`;
+        mode.setAttribute("aria-label", `视觉优先级${index}推理模式`);
+        const model = document.createElement("input");
+        model.id = `visionPriority${index}Model`;
+        model.type = "text";
+        model.placeholder = "模型名称";
+        model.setAttribute("aria-label", `视觉优先级${index}模型`);
+        const enabledLabel = document.createElement("label");
+        const enabled = document.createElement("input");
+        enabled.id = `visionPriority${index}Enabled`;
+        enabled.type = "checkbox";
+        enabledLabel.append(enabled, document.createTextNode("启用"));
+        row.append(order, kind, mode, model, enabledLabel);
+        list.appendChild(row);
+      }
+      visionPriorityFields = Array.from({ length: VISION_PRIORITY_ROWS }, (_, offset) => {
+        const index = offset + 1;
+        return {
+          index,
+          kind: document.querySelector(`#visionPriority${index}Kind`),
+          mode: document.querySelector(`#visionPriority${index}Mode`),
+          model: document.querySelector(`#visionPriority${index}Model`),
+          enabled: document.querySelector(`#visionPriority${index}Enabled`),
+        };
+      });
+    }
+    buildVisionPriorityRows();
     const attachmentButton = document.querySelector("#attachmentButton");
     const attachmentMenu = document.querySelector("#attachmentMenu");
     const uploadImageButton = document.querySelector("#uploadImageButton");
@@ -4508,17 +4581,29 @@
       fillModelSelect(modelLocalModel, local.model_options, local.model || "");
       fillModelSelect(modelLocalEngine, local.engine_options, local.engine || "llama.cpp");
       modelLocalContext.value = local.context_window || 262144;
-      modelLocalMultimodal.checked = Boolean(local.multimodal_enabled && local.actual_multimodal);
-      modelLocalMultimodal.dataset.unavailable = local.actual_multimodal ? "false" : "true";
+      modelLocalMmproj.value = local.mmproj || "";
+      // 这个复选框表达的是**意图**（要不要本地视觉），不是**能力**（本地此刻能不能看图）。
+      // 原来写成 `multimodal_enabled && actual_multimodal` 并据此禁用，形成了一个
+      // 打不开的死结：没有 mmproj → actual_multimodal=false → 复选框被禁用且取消勾选
+      // → 保存时把 multimodal_enabled 写成 false → 那是 _vision_candidates 的一道闸
+      // → 即使后来补上 mmproj 也仍然被拒。
+      // 「能力」由下面的 modelLocalCapability 单独展示——那个 idiom 管的是
+      // 「这条路在这个引擎上存在吗」，不该管「这个功能你想不想开」。
+      modelLocalMultimodal.checked = local.multimodal_enabled !== false;
+      // mmproj 只有 llama.cpp 认；FreeToken 走 ft serve，没有这个概念。
+      modelLocalMmproj.dataset.unavailable = local.engine === "llama.cpp" ? "false" : "true";
       modelLocalMtp.checked = Boolean(local.mtp_enabled);
       modelLocalThinking.checked = local.thinking_enabled !== false;
       thinkingEnabledByMode.offline = local.thinking_enabled !== false;
+      const mmprojHint = local.mmproj && !local.actual_multimodal
+        ? "；已配置视觉投影器，保存后会重启本地推理并生效"
+        : "";
       setModelCapability(
         modelLocalCapability,
         Boolean(local.actual_multimodal),
         local.actual_multimodal
           ? `本地多模态可用：${local.capability_detail || "已检测"}`
-          : `本地多模态不可用：${local.capability_detail || "未检测到视觉能力"}`,
+          : `本地多模态不可用：${local.capability_detail || "未检测到视觉能力"}${mmprojHint}`,
       );
 
       modelOnlineBaseUrl.value = online.base_url || "";
@@ -4541,12 +4626,44 @@
       modelEmbedding.value = retrieval.embedding_model || "";
       modelReranker.value = retrieval.reranker_model || "";
       const priorities = Array.isArray(config.vision_priority) ? config.vision_priority : [];
+      const unrecognized = [];
       visionPriorityFields.forEach((field, index) => {
-        const candidate = priorities[index] || {};
-        field.mode.value = candidate.mode || (index === 0 ? "online" : "offline");
+        const candidate = priorities[index];
+        if (!candidate) {
+          // 配置里没有这一项：这是一个空行。**默认不勾选**——空行的 model 是空的，
+          // 若默认勾选，保存时会被后端按「启用的 chat 项必须有 model」拒绝，
+          // 而用户根本没动过这一行，报错会显得莫名其妙。
+          fillModelSelect(field.kind, VISION_KIND_OPTIONS, "");
+          fillModelSelect(field.mode, VISION_MODE_OPTIONS, "");
+          field.model.value = "";
+          field.enabled.checked = false;
+          return;
+        }
+        const kind = String(candidate.kind || "chat").toLowerCase();
+        if (!VISION_KIND_OPTIONS.some((option) => option.value === kind)) {
+          unrecognized.push(`第 ${index + 1} 项的 kind=${kind}`);
+        }
+        const mode = String(candidate.mode || "").toLowerCase();
+        if (!VISION_MODE_OPTIONS.some((option) => option.value === mode)) {
+          unrecognized.push(`第 ${index + 1} 项的 mode=${mode}`);
+        }
+        // 用 fillModelSelect：它会把选项表里没有的值追加成「xxx（当前配置）」，
+        // 而不是让 <select> 静默回落到第一项——那样一保存就把配置改掉了。
+        fillModelSelect(field.kind, VISION_KIND_OPTIONS, kind);
+        fillModelSelect(field.mode, VISION_MODE_OPTIONS, mode);
         field.model.value = candidate.model || "";
         field.enabled.checked = candidate.enabled !== false;
+        // MinerU 的模型名只是标签，填了也没用。走既有的「能力不可用」通道
+        // （dataset.unavailable）而不是直接设 .disabled——renderModelConfig 末尾会调
+        // applyUserPermissions()，它按 admin 与 dataset 统一重设所有控件的 disabled，
+        // 直接设的值会被它覆盖掉。
+        field.model.dataset.unavailable = kind === "mineru" ? "true" : "false";
+        field.model.placeholder = kind === "mineru" ? "（MinerU 不需要模型名）" : "模型名称";
       });
+      if (unrecognized.length) {
+        // 静默是最糟的选项：认不出来的值如果不点破，用户只会看到「保存成功」。
+        modelRuntimeNote.textContent = `视觉优先级有无法识别的值，已按原文保留：${unrecognized.join("、")}`;
+      }
       const localRuntime = payload.runtime?.local || {};
       const runtimeParts = [];
       if (localRuntime.loaded_model) {
@@ -4583,6 +4700,16 @@
       modelSaveButton.disabled = true;
       setModelState("保存中", "running");
       try {
+        // 兜底：万一在 renderModelConfig 跑完之前就点了保存，下拉框可能还是空的。
+        // 空串发给后端只会得到一句「mode is invalid」，用户看不出是哪个控件的问题；
+        // 这里拦住并说清楚。
+        const blankVisionRow = visionPriorityFields.find(
+          (field) => !field.kind.value || !field.mode.value,
+        );
+        if (blankVisionRow) {
+          showNotice(`视觉优先级第 ${blankVisionRow.index} 行的来源或模式未就绪，请刷新页面后重试`);
+          return;
+        }
         const payload = {
           local: {
             base_url: modelLocalBaseUrl.value.trim(),
@@ -4592,6 +4719,7 @@
             multimodal_enabled: modelLocalMultimodal.checked,
             mtp_enabled: modelLocalMtp.checked,
             thinking_enabled: modelLocalThinking.checked,
+            mmproj: document.querySelector("#modelLocalMmproj").value.trim(),
           },
           online: {
             base_url: modelOnlineBaseUrl.value.trim(),
@@ -4607,6 +4735,7 @@
           },
           vision_priority: visionPriorityFields.map((field, index) => ({
             priority: index + 1,
+            kind: field.kind.value,
             mode: field.mode.value,
             model: field.model.value.trim(),
             enabled: field.enabled.checked,

@@ -7,6 +7,7 @@ import math
 import os
 import re
 import threading
+import time
 import asyncio
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -126,6 +127,9 @@ def _default_model_config() -> dict[str, Any]:
             "multimodal_enabled": True,
             "mtp_enabled": True,
             "thinking_enabled": True,
+            # 空串 = 不要本地视觉。也可以只写文件名，start.sh 会去
+            # HDW_Engines/LLM_Models/ 下解析。
+            "mmproj": "",
             "model_options": [
                 {
                     "value": settings.local_llm_model,
@@ -236,6 +240,8 @@ def _validate_model_config_patch(patch: ModelConfigPatch) -> None:
             "multimodal_enabled",
             "mtp_enabled",
             "thinking_enabled",
+            # 视觉投影器（mmproj）。空串合法，表示不要本地视觉。
+            "mmproj",
         },
         "online": {
             "base_url",
@@ -266,6 +272,11 @@ def _validate_model_config_patch(patch: ModelConfigPatch) -> None:
             elif key in {"model", "engine", "embedding_model", "reranker_model"}:
                 if not str(value).strip() or len(str(value)) > 240:
                     raise HTTPException(status_code=422, detail=f"invalid {section}.{key}")
+            elif key == "mmproj":
+                # **允许空**：空串表示「不要本地视觉」，是合法且默认的状态。
+                # 只在超长时拒绝，避免把垃圾塞进 llama 的启动参数。
+                if len(str(value)) > 240:
+                    raise HTTPException(status_code=422, detail=f"invalid {section}.{key}")
             elif key == "context_window":
                 if not isinstance(value, int) or not 4096 <= value <= 2_000_000:
                     raise HTTPException(status_code=422, detail=f"invalid {section}.context_window")
@@ -282,9 +293,24 @@ def _validate_model_config_patch(patch: ModelConfigPatch) -> None:
         if not 1 <= len(priorities) <= 4:
             raise HTTPException(status_code=422, detail="vision_priority must contain 1 to 4 candidates")
         for index, candidate in enumerate(priorities, 1):
+            # kind 缺省为 chat：老配置里没有这个字段，必须当 chat 用，
+            # 否则升级后所有视觉候选都会被判非法，视觉整体失效。
+            kind = str(candidate.get("kind") or "chat").strip().lower()
+            if kind not in _VISION_KINDS:
+                raise HTTPException(
+                    status_code=422, detail=f"vision_priority[{index}].kind is invalid"
+                )
+            # mode 保持只允许 online/offline。mineru 行里它不参与调用，
+            # 但仍要求填一个合法值——**不引入第三态**，避免牵连
+            # `_resolve_inference_mode` 那三处 Literal。
             if candidate.get("mode") not in {"online", "offline"}:
                 raise HTTPException(status_code=422, detail=f"vision_priority[{index}].mode is invalid")
-            if not str(candidate.get("model") or "").strip():
+            # mineru 的 model 只是界面上的标签，允许留空（内部补成 "mineru"）。
+            # chat 的 model 是真要拿去调用的，启用时必须非空；**停用的项不校验**——
+            # 它不会被调用，填没填都不影响行为。界面固定给 4 行（与 1~4 的上限对齐），
+            # 空行以 enabled=false 提交，不校验才存得下去。
+            disabled = candidate.get("enabled", True) is False
+            if kind == "chat" and not disabled and not str(candidate.get("model") or "").strip():
                 raise HTTPException(status_code=422, detail=f"vision_priority[{index}].model is required")
             if "enabled" in candidate and not isinstance(candidate["enabled"], bool):
                 raise HTTPException(status_code=422, detail=f"vision_priority[{index}].enabled is invalid")
@@ -555,6 +581,7 @@ def _llm_client(
     *,
     model_override: str | None = None,
     base_url_override: str | None = None,
+    timeout_override: float | None = None,
 ) -> tuple[Literal["online", "offline"], OpenAICompatibleClient]:
     selected = _resolve_inference_mode(mode)
     profile = _effective_profile(selected)
@@ -565,12 +592,15 @@ def _llm_client(
             base_url_override or profile["base_url"],
             model_override or profile["model"],
             api_key=settings.online_llm_api_key,
-            timeout=settings.llm_timeout,
+            timeout=timeout_override or settings.llm_timeout,
         )
     return selected, OpenAICompatibleClient(
         base_url_override or profile["base_url"],
         model_override or profile["model"],
-        timeout=None,
+        # 本地默认**无超时**：本地推理可能被长上下文拖到几分钟，卡死一个超时值
+        # 会把正常的长回答误杀。但视觉转写这类辅助调用必须有界，否则一次挂起的
+        # 请求会占住一个 asyncio 任务不放——所以留 timeout_override 这个出口。
+        timeout=timeout_override,
     )
 
 
@@ -1337,22 +1367,44 @@ def _empty_capabilities() -> dict[str, Any]:
 # 那一次是紧挨着重放的；这里隔开再试，覆盖的是稍纵即逝的那类抖动。
 _PLANNER_ATTEMPTS = 2
 
-# 问题里出现这些词，说明用户要的是「某测点的数据」。
-# 只在**规划结果一项实时数据都没要**时用它判断是否重试——正常解析出「无」
-# 的计划（例如「轴封系统的作用」）不会命中这些词，不会白白多调一次。
-_REALTIME_CUES = (
-    "趋势", "走势", "曲线", "变化", "历史", "当前", "现在", "此刻", "目前",
-    "多少", "数值", "读数", "参数是", "日志", "记录", "一直", "最近", "这几天",
-    "涨", "跌", "上升", "下降",
-)
+# 规划器被要求输出的行数：检索／测点／历史／趋势／日志。
+_PLAN_REQUIRED_LINES = 5
 
 
-def _wants_realtime(question: str) -> bool:
-    return any(cue in question for cue in _REALTIME_CUES)
+def _plan_is_complete(text: str) -> bool:
+    """规划器的输出是否具备应有的结构。
+
+    缺行说明它这次没把问题读完——那种情况下它对「要取哪些数据」的判断不可信，
+    值得重试一次。
+
+    **判的是结构完整性，不是内容像不像某个意图**。内容判断是这个模型调用本身
+    该干的事；再拿一张词表去猜一遍，只会把它的结论覆盖掉，而且词表对换种问法
+    就失效。这里只问一个模型答不出来的问题：你按格式答了吗。
+    """
+    return len([line for line in str(text or "").splitlines() if line.strip()]) >= _PLAN_REQUIRED_LINES
 
 
 def _plan_has_realtime(plan: dict[str, Any]) -> bool:
     return bool(plan.get("points") or plan.get("history") or plan.get("trend") or plan.get("logs"))
+
+
+# ── 检索闸门：带图必须走知识库 ──
+#
+# 实测：用户传一张试卷照片问「做一下这张卷子」，规划器只看到这句纯文本，
+# 判不出知识需求 → `检索: no` → `_retrieve_planned` 直接返回空 contexts，
+# `_plan_rag` 与多轮检索根本不执行。6/6 次都这样，是确定性误判不是抖动。
+# 后果不是「答得糙」，是模型手里一份证据都没有，只能用自己的常识答题——
+# 于是答出满篇「（或10，视电厂具体要求）」这类猜测。电厂场景里这很危险，
+# 因为它看起来像答案。
+#
+# 修法是**只向「要检索」单向覆写**：带图时把 False 改成 True。
+# 反向不成立，所以「你好」「今天天气怎么样」这类正确跳过在结构上不可能被破坏。
+#
+# **刻意不按关键词判断提问类型**。曾经写过一份「试卷专有词」表，
+# 但那是错的方向：本系统要的是「判断该不该检索」这个**能力**，试卷只是它的
+# 一个用例。词表对换种问法就失效，而且规则散落在这里长不了。
+# README 的「设计要点」里已经为路由写过同样的结论：不用关键词启发式。
+_VISION_FORCE_RAG = os.getenv("HDW_VISION_FORCE_RAG", "true").lower() != "false"
 
 
 async def _plan_retrieval(question: str, mode: Literal["online", "offline"]) -> dict[str, Any]:
@@ -1391,11 +1443,11 @@ async def _plan_retrieval(question: str, mode: Literal["online", "offline"]) -> 
         plan = _parse_plan(result.content)
         if plan["needs_rag"] is None:
             plan["needs_rag"] = True
-        # 解析成功但一项实时数据都没要，而问题明显在问数据——也当这次没问对，再试。
-        # 最后一次不再重试，直接采用（它是模型真实的判断，只是不合预期）。
-        if _plan_has_realtime(plan) or not _wants_realtime(question) or attempt == _PLANNER_ATTEMPTS:
+        # 输出结构不完整（少了应有的行）说明这次没读全，再试一次。
+        # 内容合不合预期**不判**——那是模型自己的结论，不该被外部的词表覆盖。
+        if _plan_is_complete(result.content) or attempt == _PLANNER_ATTEMPTS:
             return plan
-        failure = "规划结果未包含任何实时数据项"
+        failure = "规划输出结构不完整"
     plan = _empty_capabilities()
     plan["degraded"] = failure or "未知原因"
     return plan
@@ -1445,19 +1497,87 @@ async def _pick_live_point(
     return chosen if chosen in {str(item.get("kks")) for item in candidates} else None
 
 
-def _keyword_variants(keyword: str) -> list[str]:
-    """逐级去掉尾字放宽搜索范围。
+_POINT_ALIAS_PROMPT = (
+    "用户想查一个电厂测点，但按他说的词在测点表里搜不到。\n"
+    "测点表有自己的命名习惯，现场口语常常对不上——例如用户说「凝汽器水位」，"
+    "表里写的是「凝汽器液位」；说「润滑油压」，表里是「润滑油压力」。\n"
+    "给出 1~3 个更可能搜到的检索词，每行一个。"
+    "只输出检索词本身，不要编号、不要解释。\n"
+)
 
-    测点表里叫「凝汽器液位」，用户会问「凝汽器水位」—— 整词匹配直接落空。
-    这里**只放宽候选范围**，具体读哪个测点仍由模型从真实候选里判断，
-    所以不是硬编码同义词表（水位→液位 那种），换机组、换命名习惯都不用改。
+
+async def _point_aliases(keyword: str, mode: Literal["online", "offline"]) -> list[str]:
+    """让模型给出更可能搜到的检索词。失败返回空列表，绝不抛异常。
+
+    取代原来的「逐级去掉尾字」规则。那条规则只能把
+    「凝汽器水位」放宽到「凝汽器水」「凝汽器」，**换词**是它做不到的
+    （水位→液位、润滑油压→润滑油压力），而换词恰恰是不命中的主因——
+    放宽到「凝汽器」能撞上纯属运气。
     """
-    text = keyword.strip()
-    variants = [text]
-    while len(text) > 2 and len(variants) < 3:
-        text = text[:-1]
-        variants.append(text)
-    return variants
+    try:
+        _, client = _llm_client(mode)
+        result = await client.complete(
+            [
+                {"role": "system", "content": _POINT_ALIAS_PROMPT},
+                {"role": "user", "content": keyword},
+            ],
+            max_tokens=64,
+            temperature=0.0,
+            chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
+        )
+    except Exception:
+        return []
+    aliases: list[str] = []
+    for raw in str(result.content or "").splitlines():
+        term = _QUERY_PREFIX.sub("", raw.strip()).strip().strip("`\"'")
+        if term and term != keyword and term not in aliases:
+            aliases.append(term)
+        if len(aliases) >= 3:
+            break
+    return aliases
+
+
+async def _search_point_candidates(
+    keyword: str, mode: Literal["online", "offline"]
+) -> tuple[list[dict[str, Any]], str | None]:
+    """取候选测点：原词搜一次，搜不到再让模型给别名搜。
+
+    **只在原词搜空时才多花一次模型调用**——能直接搜到的占多数。
+    注意这个分叉依据是**搜索结果本身**（有没有候选），不是关键词长什么样，
+    所以它不是「按词形猜意图」那类会随命名习惯失效的规则。
+    """
+    seen: set[str] = set()
+    attempted: list[str] = [keyword]
+
+    async def search(term: str) -> list[dict[str, Any]]:
+        data = await _mcp_call_tool(
+            "point_query_search_points",
+            {"query_text": term, "limit": _LIVE_POINT_CANDIDATES},
+        )
+        found: list[dict[str, Any]] = []
+        for item in (data or {}).get("items") or []:
+            kks = str(item.get("kks") or "").strip()
+            if kks and kks not in seen:
+                seen.add(kks)
+                found.append(item)
+        return found
+
+    try:
+        candidates = await search(keyword)
+    except Exception as exc:
+        return [], f"{keyword}: {exc}"
+    if candidates:
+        return candidates, None
+
+    for alias in await _point_aliases(keyword, mode):
+        attempted.append(alias)
+        try:
+            candidates = await search(alias)
+        except Exception:
+            continue
+        if candidates:
+            return candidates, None
+    return [], f"{keyword}: 测点表中无匹配项（试过：{'、'.join(attempted)}）"
 
 
 async def _fetch_live_points(
@@ -1481,51 +1601,23 @@ async def _fetch_live_points(
                 "value_source": str(data.get("value_source") or ""),
             }
 
-        # 快路径：直接按关键词取，命中时最省一次检索。
-        # **但必须校验相关性**：工具内部是按相似度取 top-1，模糊匹配可能返回
-        # 完全无关的测点（实测搜「轴封供汽压力」top-1 是「高压主蒸汽压力3选1后」）。
-        # 值非空就采用，等于把错数据当成事实喂给模型——比不返回更糟。
+        # **先确定是哪个测点，再按 KKS 取值**。
+        # 原来是「按 query_text 直接取 top-1，再用字符规则校验相关性」——
+        # 那条规则把「相关性」简化成了字面重叠，而 tool 内部本就是按相似度取
+        # top-1，模糊匹配可能返回完全无关的测点（实测搜「轴封供汽压力」top-1
+        # 是「高压主蒸汽压力3选1后」）。拿到 KKS 再取值，这一步就没有歧义了。
+        point, error = await _resolve_point(keyword, mode)
+        if error or not point:
+            return None, error or f"{keyword}: 未匹配到测点"
         try:
-            data = await _mcp_call_tool("point_query_current_value", {"query_text": keyword})
-            if isinstance(data, dict) and data.get("value") is not None:
-                point = data.get("point") or {}
-                if _point_matches(keyword, str(point.get("description") or "")):
-                    return shape(data), None
-        except Exception:
-            pass
-
-        # 回退：top-1 没值往往不是「这个测点没数据」，而是关键词匹配偏了
-        # （例如「锅炉给水温度」匹配到「主蒸汽温度」）。拿候选逐个按 KKS 精确取值，
-        # 命中第一个有值的就返回。命中场景耗时不变，只有失败的才多花这几百毫秒。
-        candidates: list[dict[str, Any]] = []
-        for variant in _keyword_variants(keyword):
-            try:
-                found = await _mcp_call_tool(
-                    "point_query_search_points",
-                    {"query_text": variant, "limit": _LIVE_POINT_CANDIDATES},
-                )
-            except Exception as exc:
-                return None, f"{keyword}: {exc}"
-            candidates = [
-                item
-                for item in (found.get("items") or [])
-                if str(item.get("kks") or "").strip()
-            ]
-            if candidates:
-                break
-
-        if not candidates:
-            return None, f"{keyword}: 测点表中无匹配项"
-        picked = await _pick_live_point(keyword, candidates, mode)
-        if not picked:
-            return None, f"{keyword}: 候选中无匹配项"
-        try:
-            data = await _mcp_call_tool("point_query_current_value", {"kks": picked})
+            data = await _mcp_call_tool(
+                "point_query_current_value", {"kks": str(point.get("kks") or "")}
+            )
         except Exception as exc:
             return None, f"{keyword}: {exc}"
-        if isinstance(data, dict) and data.get("value") is not None:
-            return shape(data), None
-        return None, f"{keyword}: 选中测点无实时值"
+        if not isinstance(data, dict) or data.get("value") is None:
+            return None, f"{keyword}: 选中测点无实时值"
+        return shape(data), None
 
     results = await asyncio.gather(*(one(keyword) for keyword in keywords))
     return (
@@ -1533,81 +1625,147 @@ async def _fetch_live_points(
         [error for _, error in results if error],
     )
 
+def _round_robin_by_round(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按检索轮次轮转取一条，组内保持原（分数）顺序。
+
+    为什么需要：合并后的排序键是 `(score, -round, -position)`，纯按分数。
+    简答题那组往往条数多、分数高，会把填空题那组的证据整体挤出窗口——
+    而 `_llm_contexts` 是**头切**，所以只要重排，头 N 条自然组组有份。
+    重排而不新增截断点，是为了不动既有那两条对 `_llm_contexts` 的断言。
+    """
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    order: list[int] = []
+    for item in contexts:
+        index = int(item.get("_rag_round", 1) or 1)
+        if index not in buckets:
+            buckets[index] = []
+            order.append(index)
+        buckets[index].append(item)
+
+    output: list[dict[str, Any]] = []
+    position = 0
+    while True:
+        added = False
+        for index in order:
+            bucket = buckets[index]
+            if position < len(bucket):
+                output.append(bucket[position])
+                added = True
+        if not added:
+            return output
+        position += 1
+
+
+# ── 检索规划：由模型决定发几路 ──
+#
+# 之前这里是两条启发式（MCP 的 `rag_query_plan` 用关键词表 + 正则切分），
+# 都换掉了。原因不是它们不准，是**方向错了**：本系统要的是「判断该怎么检索」
+# 这个能力，而不是「识别试卷」这个特例。规则对换种问法就失效，而且散落在
+# 代码里长不了——README 的「设计要点」早已为路由写过同样的结论。
+#
+# 由模型决定的好处是它天然按**内容**切：一段材料里有一个问题就出一条，
+# 有一份含多道题的卷子就按题出，一份并列的小问就按小问出。
+# 不需要任何人预先定义「什么算多问」。
+_RAG_QUERY_PLAN_PROMPT = (
+    "你在为知识库检索拆查询。把用户要回答的内容拆成若干条**各自独立**的"
+    "检索查询，每条都单独拿去检索。\n"
+    "· 只有一个问题时，**只输出一条**\n"
+    "· 一段材料里有多个并列的问题时，**每个问题一条**——"
+    "一路查询覆盖不到的问题，后面只能靠猜，而猜出来的答案从表面看不出来\n"
+    "· 每条的写法：写成**能直接检索的查询**，保留区分性的限定词"
+    "（设备名、部位、参数名），去掉「请简述」「是多少」这类问句外壳\n"
+    "· **不要**输出「相关定义、范围和判断依据」这类空泛查询，它们检不到东西\n"
+    "· 最多 {max_queries} 条；超出就把相邻的合并成一条\n"
+    "只输出查询本身，每行一条。不要编号、不要解释、不要空行。\n"
+)
+
+_RAG_MAX_QUERIES = int(os.getenv("HDW_RAG_MAX_QUERIES", "60"))
+# 每一路取几条证据。总量靠 `_retrieval_evidence_budget` 兜底。
+_RAG_QUERY_TOP_K = int(os.getenv("HDW_RAG_QUERY_TOP_K", "8"))
+# 证据总预算的上限。一路约 400 字，80 条约 3 万字，离上下文上限还很远。
+_RAG_ONLINE_EVIDENCE_CAP = int(os.getenv("HDW_RAG_ONLINE_EVIDENCE_CAP", "120"))
+_RAG_LOCAL_EVIDENCE_CAP = int(os.getenv("HDW_RAG_LOCAL_EVIDENCE_CAP", "80"))
+
+# 模型偶尔会加行首编号，或者在行尾带解释。剥掉编号；解释留着也无害
+# （检索器对长句本来就有截断），所以不做更激进的清洗。
+_QUERY_PREFIX = re.compile(r"^\s*(?:[-*·]\s*|\d{1,2}\s*[.、．)）]\s*)")
+
+
+def _parse_query_plan(text: str) -> list[str]:
+    """把模型的输出解析成查询列表。纯函数，可进自检。"""
+    queries: list[str] = []
+    for raw in str(text or "").splitlines():
+        line = _QUERY_PREFIX.sub("", raw.strip()).strip()
+        line = line.strip("`\"' ").strip()
+        if not line or line in queries:
+            continue
+        queries.append(line)
+        if len(queries) >= _RAG_MAX_QUERIES:
+            break
+    return queries
+
+
+async def _plan_queries(
+    question: str, mode: Literal["online", "offline"]
+) -> tuple[list[str], str | None]:
+    """让模型决定要发几路检索。**任何失败都退回单路**，绝不抛异常。"""
+    prompt = _RAG_QUERY_PLAN_PROMPT.format(max_queries=_RAG_MAX_QUERIES)
+    failure: str | None = None
+    for attempt in range(1, _PLANNER_ATTEMPTS + 1):
+        try:
+            _, client = _llm_client(mode)
+            result = await client.complete(
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": question},
+                ],
+                # 60 条查询每条约 20-40 字，4096 够用；再多说明拆得过细了。
+                max_tokens=4096,
+                temperature=0.0,
+                chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
+            )
+        except Exception as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+            continue
+        queries = _parse_query_plan(result.content)
+        if queries:
+            return queries, None
+        failure = "模型没有给出任何查询"
+    return [question], failure
+
+
+def _retrieval_evidence_budget(
+    mode: Literal["online", "offline"], rounds: int
+) -> int:
+    """证据总预算随检索路数增长。
+
+    **必须跟着涨**：一路查询只覆盖一个问题，N 路就覆盖 N 个——预算不涨的话，
+    后面几路检索到了也进不了提示词，等于白发。单路时它就等于原来的默认预算
+    （10/40），所以不需要为「多轮」单独开一条路径。
+    """
+    base = settings.online_graph_top_k if mode == "online" else settings.local_graph_top_k
+    cap = _RAG_ONLINE_EVIDENCE_CAP if mode == "online" else _RAG_LOCAL_EVIDENCE_CAP
+    return max(base, min(cap, rounds * _RAG_QUERY_TOP_K))
+
+
 async def _plan_rag(
     question: str,
     mode: Literal["online", "offline"],
     base_top_k: int,
 ) -> tuple[dict[str, Any], str | None]:
-    try:
-        plan = await _mcp_call_tool(
-            "rag_query_plan",
-            {
-                "question": question,
-                "inference_mode": mode,
-                "base_top_k": _graph_top_k(mode, base_top_k),
-            },
-        )
-        rounds = max(1, min(8, int(plan.get("rounds") or 1)))
-        queries = [
-            str(item).strip()
-            for item in plan.get("queries", [])
-            if str(item).strip()
-        ][:rounds]
-        if not queries:
-            queries = [question]
-        rounds = len(queries)
-        top_k = max(5, math.ceil(_graph_top_k(mode, base_top_k) / rounds))
-        return {
-            "rounds": rounds,
-            "queries": queries,
-            "top_k": top_k,
-            "base_top_k": _graph_top_k(mode, base_top_k),
-            "reason": str(plan.get("reason") or ""),
-            "planner": "mcp:rag_query_plan",
-        }, None
-    except Exception as exc:
-        return {
-            "rounds": 1,
-            "queries": [question],
-            "top_k": _graph_top_k(mode, base_top_k),
-            "base_top_k": _graph_top_k(mode, base_top_k),
-            "planner": "fallback",
-        }, str(exc)
+    queries, error = await _plan_queries(question, mode)
+    # 单路时至少给到原来的预算：否则「不拆」反而比拆了拿到更少的证据，
+    # 而单路正是最常见的路径，不该被这次改动顺带削弱。
+    single_round = _graph_top_k(mode, base_top_k) if len(queries) == 1 else 0
+    return {
+        "rounds": len(queries),
+        "queries": queries,
+        "top_k": max(_RAG_QUERY_TOP_K, single_round),
+        "base_top_k": _graph_top_k(mode, base_top_k),
+        "reason": f"模型拆出 {len(queries)} 路检索",
+        "planner": "model",
+    }, error
 
-
-def _point_matches(keyword: str, description: str) -> bool:
-    """关键词与测点描述是否**足够**相关。
-
-    **不能只看检索排序**。实测：搜「轴封供汽压力」返回 5 条，正确答案排第 4，
-    而 top-1 是完全无关的「高压主蒸汽压力3选1后」——SIS 的检索是模糊匹配，
-    取 top-1 会静默用错测点，比报「没找到」更糟。
-
-    判据取关键词的**首二字与尾二字**都必须出现在描述里：
-    首二字是设备标识（「轴封」），尾二字是物理量（「压力」）。
-    两者同时命中才算相关——只命中设备会把「轴封供汽管道疏水母管气动关断阀
-    开反馈」这种阀门反馈误当成压力测点。
-    """
-    text = (description or "").strip()
-    if not text:
-        return False
-    probe = (keyword or "").strip()
-    if len(probe) < 2:
-        return probe in text
-    if probe[:2] not in text:
-        return False
-    # 关键词太短（如「压力」）时尾部就是首部，不重复判定
-    if len(probe) < 4:
-        return True
-    if probe[-2:] not in text:
-        return False
-    # 中间那段限定词至少要见一个。「轴封供气压力」的中间是「供气」——
-    # 实测它被规划器简化成「轴封压力」后，唯一命中是「低压轴封压力测点1」，
-    # 首尾都合、只有「供气」对不上，结果串到了另一个测点。
-    # 只要求**命中一个**而不是全中：汽／气 这类异体字差异不该被拦下。
-    middle = probe[2:-2]
-    if not middle:
-        return True
-    return any(ch in text for ch in middle)
 
 
 async def _resolve_point(
@@ -1615,38 +1773,19 @@ async def _resolve_point(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """中文关键词 → 具体测点。返回 (点, 错误)。
 
-    三步：原词精确 → 放宽变体 → 模型从候选里选。
-    任何一步都不接受「相关性不达标」的测点——宁可报没找到，也不能给错数据。
+    **相关性完全由模型判**，不再做字符级判定。原来这里是「首二字与尾二字都必须
+    出现在描述里」——它把「用户想查的是不是这个测点」简化成了字面重叠，
+    既拦不住「轴封供汽压力 → 轴封供汽管道疏水母管气动关断阀开反馈」这类
+    （首尾字都对，但根本不是测点），也挡不住同义换词。判断这件事模型做得更好，
+    而它本来就有一次调用（`_pick_live_point`），不必再拿规则省。
+
+    唯一保留的硬约束：**选出的 KKS 必须确实在候选集合内**——这是防幻觉，
+    不是启发式。宁可报「没找到」，也不能给错测点的数据。
     """
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for variant in _keyword_variants(keyword):
-        try:
-            data = await _mcp_call_tool(
-                "point_query_search_points",
-                {"query_text": variant, "limit": _LIVE_POINT_CANDIDATES},
-            )
-        except Exception as exc:
-            return None, f"{keyword}: {exc}"
-        for item in (data or {}).get("items") or []:
-            kks = str(item.get("kks") or "").strip()
-            if not kks or kks in seen:
-                continue
-            seen.add(kks)
-            candidates.append(item)
-        if candidates:
-            break
+    candidates, error = await _search_point_candidates(keyword, mode)
+    if error or not candidates:
+        return None, error or f"{keyword}: 测点表中无匹配项"
 
-    if not candidates:
-        return None, f"{keyword}: 测点表中无匹配项"
-
-    # 字符级判定优先：够相关就直接用，不必再花一次模型调用
-    for item in candidates:
-        if _point_matches(keyword, str(item.get("description") or "")):
-            return item, None
-
-    # 字符判定全不中（测点表叫「凝汽器液位」而用户问「凝汽器水位」）：
-    # 让模型从真实候选里挑。选出来的 KKS 必须确实在候选集合内。
     picked = await _pick_live_point(keyword, candidates, mode)
     for item in candidates:
         if str(item.get("kks")) == picked:
@@ -1948,10 +2087,20 @@ async def _retrieve_planned(
     question: str,
     mode: Literal["online", "offline"],
     top_k: int,
+    *,
+    has_images: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     # 规划在检索之前：一次调用同时决定要不要查文档，以及要取哪几类实时数据
     # （测点当前值／历史序列／趋势／运行日志）。
-    intent = await _plan_retrieval(question, mode)
+    intent = await _plan_retrieval(_truncate_for_planner(question), mode)
+
+    # 单向覆写：只在模型判了「不检索」时把它拉回 True，永不反向。
+    # 唯一依据是**本轮带了图片**——上传图片在这个系统里永远是「要处理的材料」
+    # （试卷、图纸、仪表照片、铭牌），不存在「闲聊配图」这个场景。
+    forced_reason: str | None = None
+    if _VISION_FORCE_RAG and has_images and not intent["needs_rag"]:
+        forced_reason = "本轮带图"
+        intent["needs_rag"] = True
 
     if not intent["needs_rag"]:
         realtime, rt_errors = await _fetch_realtime(intent, mode)
@@ -1973,6 +2122,10 @@ async def _retrieve_planned(
             **realtime,
         }
     plan, planning_error = await _plan_rag(question, mode, top_k)
+    if forced_reason:
+        # 覆写要留痕：否则「模型判了不检索、被网关拉回来」这件事在响应里看不出来，
+        # 排查时无法区分「检索了」和「本该跳过却检索了」。
+        plan["reason"] = f"{plan.get('reason') or ''}（本轮强制检索：{forced_reason}）".strip()
     if plan.get("no_retrieval"):
         # 不检索也不查图谱：下游拿到空 contexts 会自然产出空 citations / graph_context，
         # 前端 addEvidence() 在两者都空时不渲染依据面板。
@@ -2019,6 +2172,11 @@ async def _retrieve_planned(
         ),
         reverse=True,
     )
+    if len(plan.get("queries") or []) > 1:
+        # 多路检索才重排：纯按分数排序会让某一路（往往是条数多、分数高的那路）
+        # 把别路的证据整体挤出窗口，而 `_llm_contexts` 是**头切**——
+        # 挤出去的那几路等于白发。单路检索没有这个问题，保持原排序。
+        contexts = _round_robin_by_round(contexts)
     info = {
         "plan": plan,
         "rounds": round_infos,
@@ -2070,8 +2228,10 @@ def _graph_top_k(mode: Literal["online", "offline"], requested_top_k: int) -> in
 def _llm_contexts(
     mode: Literal["online", "offline"],
     contexts: list[dict[str, Any]],
+    budget: int | None = None,
 ) -> list[dict[str, Any]]:
-    return contexts[:_graph_top_k(mode, len(contexts))]
+    limit = budget if budget is not None else _graph_top_k(mode, len(contexts))
+    return contexts[: max(1, limit)]
 
 
 def _conversation_messages(
@@ -2249,6 +2409,342 @@ async def _llm_health() -> dict[str, Any]:
             },
             "error": str(exc),
         }
+
+
+# ── 图片转写：把图片变成可检索的文本 ──
+#
+# 为什么需要这一步：检索链（规划器、分组、RAG）只吃文本，图片一个字节都到不了。
+# 用户传一张试卷照片问「做一下这张卷子」，检索拿到的 query 就是**这句指令本身**，
+# 拿去查知识库什么也查不到。于是模型手里一份证据都没有，只能凭常识答——答出
+# 满篇「（或10，视电厂具体要求）」这类猜测。
+#
+# 所以：作答前先把图片转成文字，**用题面去检索**。图片本身仍照常发给答题模型
+# （它能看懂图），转写的唯一职责是解锁检索。
+_VISION_TRANSCRIBE_MAX_TOKENS = int(os.getenv("HDW_VISION_TRANSCRIBE_MAX_TOKENS", "4096"))
+_VISION_TRANSCRIBE_TIMEOUT = float(os.getenv("HDW_VISION_TRANSCRIBE_TIMEOUT", "180"))
+
+# 规划器出参只有 160 tokens、目标是 200-400ms。整张卷子的题面（几千字）喂进去
+# 只会拖慢它，判断质量并不会更好——它要判的是「要不要查文档」，不是读懂每道题。
+_PLANNER_INPUT_MAX_CHARS = int(os.getenv("HDW_PLANNER_INPUT_MAX_CHARS", "2000"))
+
+_TRANSCRIBE_PROMPT = (
+    "你在做文字识别。逐字转写图片里的全部文字，只输出转写结果。\n"
+    "· 保留题号、题型标题（如「一、填空题」）、空格、下划线、括号、选项和单位\n"
+    "· **不要作答、不要解释、不要补全**——只转写你看到的字\n"
+    "· 看不清的字用「?」代替，不要猜\n"
+    "· 如果图片不是文字材料（仪表盘、设备铭牌、现场照片），"
+    "改用一段话客观描述图中的关键信息\n"
+)
+
+# 明确在推脱的表述：它们指向「模型自己识别不了」，而不是图片里的内容。
+# **不能收裸的「看不清」**——题目本身可能就在说这件事（例如安全规程里的
+# 「当发现仪表看不清时，应……」），收进来会把一份正常转写整段判死，
+# 于是检索退回现状，而原因看不出来。自检里有一条专门钉这个反例。
+_TRANSCRIPT_REFUSALS = (
+    "无法识别", "无法读取", "无法辨认", "无法看清", "图片不清晰", "图片模糊",
+    "抱歉", "对不起", "我不能", "I cannot", "I'm sorry", "I am sorry",
+)
+
+# 转写来源的种类。`chat` 走对话模型（在线 DeepSeek / 本地带 mmproj 的 llama），
+# `mineru` 走本地 MinerU 文档解析。二者产物形态不同但下游一视同仁。
+_VISION_KINDS = ("chat", "mineru")
+
+
+def _ordered_vision_candidates(
+    config: dict[str, Any], kinds: set[str]
+) -> list[dict[str, Any]]:
+    """按 `vision_priority` 排出可用于**图片转写**的候选。纯函数，不发请求。
+
+    与 `_vision_candidates` 的分工：那个决定「**答题**用哪个视觉模型」，
+    只接受 `kind=chat`；这个决定「**转写**用哪个来源」，还接受 `kind=mineru`。
+    两者读同一份配置，只是视图不同——这样界面上一个优先级列表就能同时管两件事。
+    """
+    output: list[dict[str, Any]] = []
+    for item in config.get("vision_priority") or []:
+        if not isinstance(item, dict) or not item.get("enabled", True):
+            continue
+        kind = str(item.get("kind") or "chat").strip().lower()
+        if kind not in _VISION_KINDS or kind not in kinds:
+            continue
+        mode = str(item.get("mode") or "").strip().lower()
+        model = str(item.get("model") or "").strip()
+        if kind == "chat":
+            # chat 必须有合法的 mode 与模型名，否则这一项无法调用。
+            if mode not in ("online", "offline") or not model:
+                continue
+        else:
+            # mineru 不区分在线/本地，模型名只是界面上的标签。
+            mode = ""
+            model = model or "mineru"
+        output.append(
+            {
+                "kind": kind,
+                "mode": mode,
+                "model": model,
+                "priority": int(item.get("priority") or 999),
+            }
+        )
+    output.sort(key=lambda candidate: candidate["priority"])
+    return output
+
+
+def _usable_transcript(text: str) -> bool:
+    """转写结果能不能拿去检索。
+
+    **坏的转写比没有转写更糟**：它会把检索引到完全无关的文档上，而下游看不出
+    区别——模型会拿着错误证据一本正经地作答，比「没证据」更难发现。
+    所以宁可判不可用，换下一个候选。
+    """
+    stripped = str(text or "").strip()
+    if len(stripped) < 8:
+        return False
+    # 只看**开头**：模型真拒绝时会以道歉开头；而正文中间出现「抱歉」是可能的
+    # （例如题目在考服务用语）。放宽到全段会把正常转写误杀。
+    head = stripped[:20]
+    return not any(cue in head for cue in _TRANSCRIPT_REFUSALS)
+
+
+def _compose_retrieval_question(question: str, vision: dict[str, Any] | None) -> str:
+    """把「用户指令」和「图片转写」拼成用来检索的文本。
+
+    **保留原指令**：它带着用户意图（「只给答案」「按题号给」），规划器要靠它
+    判断该取哪几类数据。转写文本排在后面，是检索真正拿来匹配知识库的素材。
+    """
+    text = str((vision or {}).get("text") or "").strip()
+    if not text:
+        return question
+    return f"{question}\n\n[图片内容]\n{text}"
+
+
+def _truncate_for_planner(question: str) -> str:
+    """把喂给规划器的文本截到有界长度。见 `_PLANNER_INPUT_MAX_CHARS` 的说明。"""
+    text = str(question or "")
+    if len(text) <= _PLANNER_INPUT_MAX_CHARS:
+        return text
+    return text[:_PLANNER_INPUT_MAX_CHARS] + "…（已截断）"
+
+
+async def _transcribe_with_chat(
+    candidate: dict[str, Any],
+    images: list[dict[str, str]],
+    *,
+    allow_online: bool,
+) -> tuple[str, bool]:
+    """走对话模型转写图片，返回 `(文本, 是否被截断)`。
+
+    在线与本地走的是**同一条**协议路径，只是 profile 不同——这正是把 mmproj
+    归到 `offline` 而不是新开一个 mode 的理由。
+    """
+    mode = candidate["mode"]
+    if mode == "online" and not allow_online:
+        raise RuntimeError("当前用户未开放在线推理")
+    if mode == "online" and not settings.online_llm_api_key:
+        raise RuntimeError("在线 API key 未配置")
+    if mode == "online" and not bool(_read_model_config().get("online", {}).get("multimodal_enabled", True)):
+        raise RuntimeError("在线多模态已停用")
+    if mode == "offline" and not bool(_read_model_config().get("local", {}).get("multimodal_enabled", False)):
+        raise RuntimeError("本地多模态已停用")
+
+    profile = _effective_profile(mode)
+    if mode == "offline":
+        # 本地候选的实际上下文以 llama 报的为准（与 _vision_candidates 一致）。
+        runtime = await _local_runtime_info(profile["base_url"])
+        if not runtime["available"]:
+            raise RuntimeError(str(runtime["detail"]))
+        if not bool(runtime["vision"]):
+            raise RuntimeError(str(runtime["detail"]))
+
+    _, client = _llm_client(
+        mode,
+        model_override=candidate["model"],
+        base_url_override=profile["base_url"],
+        timeout_override=_VISION_TRANSCRIBE_TIMEOUT,
+    )
+    content: list[dict[str, Any]] = [{"type": "text", "text": _TRANSCRIBE_PROMPT}]
+    content.extend(
+        {"type": "image_url", "image_url": {"url": image["data_url"]}}
+        for image in images
+    )
+    result = await client.complete(
+        [{"role": "user", "content": content}],
+        max_tokens=_VISION_TRANSCRIBE_MAX_TOKENS,
+        temperature=0.0,
+        chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
+    )
+    # 被 max_tokens 截断：转写不完整。**不能当成失败**——前半张卷子仍有用；
+    # 但也必须让调用方知道，否则「后半张卷子凭空消失」无人察觉。
+    return result.content, result.finish_reason == "length"
+
+
+# 上传给 MinerU 的扩展名。结果字典的键是**上传文件名的 stem**，所以文件名必须
+# 可预测，否则按 stem 取结果会取空（而「取空」看起来和「解析失败」一模一样）。
+_MINERU_SUFFIX = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+# 与 ETL 侧同名同默认值（parse_documents.py:19-21），改一处即两边都改。
+_MINERU_BACKEND = os.getenv("HDW_MINERU_BACKEND", "pipeline")
+_MINERU_LANG = os.getenv("HDW_MINERU_LANG", "ch")
+
+
+def _decode_image_bytes(image: dict[str, str]) -> bytes:
+    """从 data URL 取出原始图片字节。`_validate_image_attachments` 只保留
+    data_url，而 MinerU 要的是原始字节。"""
+    _, _, encoded = str(image.get("data_url") or "").partition(",")
+    if not encoded:
+        raise ValueError("图片缺少 base64 内容")
+    return base64.b64decode(encoded, validate=True)
+
+
+def _mineru_upload_name(index: int, image: dict[str, str]) -> str:
+    """给 MinerU 的上传文件名。
+
+    结果字典按**上传文件名的 stem** 索引，对不上就取空——而「取空」在日志里
+    看起来和「解析失败」一模一样，排查时会被引到完全错误的方向。
+    所以不沿用用户的文件名：中文在 multipart 里的编码处理各实现不一致，
+    而这里需要的是**可预测**。序号名天然满足，也天然不重复。
+    """
+    mime = str(image.get("mime_type") or "").lower()
+    return f"image{index}{_MINERU_SUFFIX.get(mime, '.png')}"
+
+
+async def _mineru_transcribe(images: list[dict[str, str]]) -> str:
+    """用本地 MinerU 解析图片，返回 markdown 文本。
+
+    MinerU 是**文档解析器**而不是纯 OCR：它做版式分析并输出 markdown，
+    题型标题会带 `## `。这对下游没有影响：转写文本只用来给检索规划器看，
+    它读得懂 markdown。
+
+    实测单页卷子图约 17 s，比在线视觉慢一个量级，所以它更适合当兜底来源。
+    """
+    base = settings.mineru_base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(settings.mineru_timeout, connect=5)) as client:
+        # 先探队列：MinerU 是单并发，有入库任务在跑时排队可能等几分钟。
+        # 与其让用户干等，不如快速失败、换下一个候选。
+        health = await client.get(f"{base}/health")
+        health.raise_for_status()
+        state = health.json()
+        busy = int(state.get("queued_tasks") or 0) + int(state.get("processing_tasks") or 0)
+        if busy > settings.mineru_max_queue:
+            raise RuntimeError(f"MinerU 忙（队列 {busy}），本次跳过")
+
+        files = [
+            (
+                "files",
+                (
+                    _mineru_upload_name(index, image),
+                    _decode_image_bytes(image),
+                    str(image.get("mime_type") or "image/png"),
+                ),
+            )
+            for index, image in enumerate(images)
+        ]
+        response = await client.post(
+            f"{base}/file_parse",
+            files=files,
+            data={
+                "backend": _MINERU_BACKEND,
+                "lang_list": _MINERU_LANG,
+                "parse_method": "auto",
+                "return_md": "true",
+                "return_middle_json": "false",
+                "return_model_output": "false",
+                "return_content_list": "false",
+                "return_images": "false",
+                "response_format_zip": "false",
+                "return_original_file": "false",
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+    parts: list[str] = []
+    for index, image in enumerate(images):
+        stem = Path(_mineru_upload_name(index, image)).stem
+        markdown = str(((payload.get("results") or {}).get(stem) or {}).get("md_content") or "").strip()
+        if markdown:
+            parts.append(markdown)
+    if not parts:
+        raise RuntimeError("MinerU 未返回任何 markdown")
+    return "\n\n".join(parts)
+
+
+async def _transcribe_images(
+    images: list[dict[str, str]],
+    *,
+    allow_online: bool,
+) -> dict[str, Any] | None:
+    """把图片转成可检索的文本。**失败一律返回 None，绝不抛异常。**
+
+    与 `_vision_candidates` 刻意不同：那里选不出候选会让 `_llm_answer` 抛 503，
+    因为答题**必须要**视觉；而转写失败只是让检索退回现状（模型仍能看图，
+    只是没有知识库证据），不该把「能答」变成「答不了」。
+    """
+    if not images:
+        return None
+    candidates = _ordered_vision_candidates(_read_model_config(), {"chat", "mineru"})
+    attempts: list[dict[str, str]] = []
+    started = time.monotonic()
+    for candidate in candidates:
+        label = f"{candidate['kind']}:{candidate['mode'] or '-'}:{candidate['model']}"
+        try:
+            if candidate["kind"] == "mineru":
+                # MinerU 是同步解析，没有 finish_reason 一说——它的产物要么完整
+                # 要么报错，不存在「说了一半被截断」。
+                text, truncated = await _mineru_transcribe(images), False
+            else:
+                text, truncated = await _transcribe_with_chat(
+                    candidate, images, allow_online=allow_online
+                )
+        except Exception as exc:
+            attempts.append({"candidate": label, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        if not _usable_transcript(text):
+            attempts.append({"candidate": label, "error": "转写结果不可用（过短或为推脱语）"})
+            continue
+        return {
+            "kind": candidate["kind"],
+            "mode": candidate["mode"] or None,
+            "model": candidate["model"],
+            "source": f"{candidate['mode']}:{candidate['model']}" if candidate["mode"] else candidate["kind"],
+            "text": str(text).strip(),
+            "truncated": truncated,
+            "chars": len(str(text).strip()),
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "attempts": attempts,
+        }
+    return None
+
+
+def _has_chat_vision_candidate() -> bool:
+    """配置里有没有启用中的 chat 类视觉候选。**不探测可用性**，只看配置。
+
+    只用来决定「要不要把原图发给答题模型」。真正的可用性判断仍在
+    `_vision_candidates`——那里失败会抛 503，这里只负责别把一个注定失败的
+    请求发出去（例如用户只配了 MinerU 时）。
+    """
+    return bool(_ordered_vision_candidates(_read_model_config(), {"chat"}))
+
+
+def _vision_diagnostics(vision: dict[str, Any] | None) -> dict[str, Any]:
+    """给响应体用的转写元信息。**不带转写正文**——正文已经在提示词里，
+    再回一份到 JSON 里只会让响应体大一倍。"""
+    if not vision:
+        return {"source": None, "used": False}
+    return {
+        "source": vision.get("source"),
+        "kind": vision.get("kind"),
+        "mode": vision.get("mode"),
+        "model": vision.get("model"),
+        "chars": vision.get("chars"),
+        "truncated": vision.get("truncated"),
+        "elapsed_ms": vision.get("elapsed_ms"),
+        "attempts": vision.get("attempts") or [],
+        "used": True,
+    }
 
 
 def _local_vision_status(
@@ -2568,6 +3064,7 @@ def _prompt(
     history_messages: list[dict[str, str]] | None = None,
     model_name: str | None = None,
     image_attachments: list[dict[str, str]] | None = None,
+    image_text: str | None = None,
     skip_retrieval: bool = False,
     live_points: list[dict[str, Any]] | None = None,
     series: list[dict[str, Any]] | None = None,
@@ -2776,8 +3273,25 @@ def _prompt(
     realtime_block = live_block + series_block + logs_block
     has_realtime = bool(live_points or series or logs)
 
+    # 图片转写块。它和原图**同时**给模型：图是原始事实，转写是为了让模型能引用
+    # 与检索证据对应的字面内容。**必须标明是自动识别**——OCR 会出错字漏字，
+    # 而模型倾向于把白纸黑字当权威。不点破，它会拿 OCR 去跟检索证据打对台，
+    # 问题就从「没检索」变成「检索了但被 OCR 带偏」。
+    image_text_clean = str(image_text or "").strip()
+    image_block = (
+        f"\n\n图片文字（自动识别，可能有错字或漏字）：\n{image_text_clean}"
+        if image_text_clean
+        else ""
+    )
+    image_rule = (
+        "图片文字是自动识别结果，只用来理解用户问的是什么，"
+        "**不要把它当作证据引用**；它与检索证据冲突时以检索证据为准。"
+        if image_text_clean
+        else ""
+    )
+
     if skip_retrieval:
-        user = f"问题：{question}{realtime_block}"
+        user = f"问题：{question}{image_block}{realtime_block}"
         system_body = (
             "本轮未检索文档知识库。"
             + (
@@ -2789,10 +3303,11 @@ def _prompt(
             # 比「证据中没有」更糟。
             + "涉及本系统的具体配置数值（上下文长度、端口、模型参数等）时，"
             "不确知就直说无法确认，不要给出估计值、示例值或常见默认值。"
+            + image_rule
         )
     else:
         user = (
-            f"问题：{question}{realtime_block}"
+            f"问题：{question}{image_block}{realtime_block}"
             f"\n\n检索证据：\n{evidence}\n\n知识图谱上下文：\n{graph}"
         )
         system_body = (
@@ -2803,6 +3318,7 @@ def _prompt(
             "必须逐条阅读并综合所有列出的证据和图谱上下文，不能只依据第一条；"
             "按主题合并重复内容，区分正常运行、启停检查和异常处理，"
             "根据资料量输出完整、可执行、层次清楚的回答。"
+            + image_rule
         )
 
     prompt = [
@@ -2863,6 +3379,7 @@ async def _llm_answer(
     existing_kept_from: int = 0,
     previous_inference_mode: str | None = None,
     image_attachments: list[dict[str, str]] | None = None,
+    image_text: str | None = None,
     allow_online: bool = True,
     skip_retrieval: bool = False,
     live_points: list[dict[str, Any]] | None = None,
@@ -2917,6 +3434,7 @@ async def _llm_answer(
                 graph_rows,
                 model_name=client.model,
                 image_attachments=image_attachments,
+                image_text=image_text,
                 skip_retrieval=skip_retrieval,
                 live_points=live_points,
                 series=series,
@@ -3057,14 +3575,16 @@ async def _answer(
     user_code: str | None = None,
     conversation_data: dict[str, Any] | None = None,
     image_attachments: list[dict[str, str]] | None = None,
+    image_text: str | None = None,
     allow_online: bool = True,
     skip_retrieval: bool = False,
     live_points: list[dict[str, Any]] | None = None,
     series: list[dict[str, Any]] | None = None,
     logs: dict[str, Any] | None = None,
+    evidence_budget: int | None = None,
 ) -> dict[str, Any]:
     selected_mode = _resolve_inference_mode(inference_mode)
-    llm_contexts = _llm_contexts(selected_mode, contexts)
+    llm_contexts = _llm_contexts(selected_mode, contexts, evidence_budget)
     graph_rows = await _graph_context(llm_contexts)
     data = conversation_data or {}
     answer, selected_mode, preparation, compression_provider, llm_info = await _llm_answer(
@@ -3078,6 +3598,7 @@ async def _answer(
         existing_kept_from=int(data.get("context_kept_from") or 0),
         previous_inference_mode=str(data.get("last_inference_mode") or "") or None,
         image_attachments=image_attachments,
+        image_text=image_text,
         allow_online=allow_online,
         skip_retrieval=skip_retrieval,
         live_points=live_points,
@@ -3163,7 +3684,12 @@ async def get_model_config(x_hdw_session: str | None = Header(default=None)) -> 
         "permissions": _permissions_for_user(user),
         "runtime": {
             "online_model_applies_immediately": True,
-            "local_engine_and_model_apply": "saved and applied by restarting the local inference service",
+            # 文案要点名 mmproj：它和模型/引擎一样是**启动参数**，改了不重启不生效，
+            # 而用户看到「已保存」就会以为已经生效了。
+            "local_engine_and_model_apply": (
+                "模型、引擎、上下文、MTP 与视觉投影器（mmproj）："
+                "保存后会重启本地推理服务并立即生效"
+            ),
             "local": {
                 "available": bool(local_runtime["available"]),
                 "engine": str(local_runtime.get("engine") or ""),
@@ -3195,8 +3721,12 @@ async def patch_model_config(
         current["vision_priority"] = incoming["vision_priority"]
 
     local_update = incoming.get("local")
-    # mtp_enabled 是 llama-server 的启动参数（--spec-type draft-mtp），改动它必须重启本地推理。
-    local_runtime_fields = {"model", "engine", "context_window", "mtp_enabled"}
+    # 这几个都是 llama-server 的**启动参数**，改了不重启就不生效：
+    #   mtp_enabled  → --spec-type draft-mtp
+    #   mmproj       → --mmproj（视觉投影器）
+    # 漏掉 mmproj 会得到一个纯静默失效：配置写了、界面报「已保存」、
+    # llama 没重启、视觉永远不生效，而且没有任何报错指向这件事。
+    local_runtime_fields = {"model", "engine", "context_window", "mtp_enabled", "mmproj"}
     needs_local_restart = (
         isinstance(local_update, dict)
         and bool(local_runtime_fields.intersection(local_update))
@@ -3214,6 +3744,11 @@ async def patch_model_config(
             )
             if runtime["context_window"]:
                 rollback_config["local"]["context_window"] = runtime["context_window"]
+            # **mmproj 有意不从运行态覆写**：llama 的 /props 不报它，无从得知
+            # 当前实际加载的是哪个投影器。所以回滚用的是 previous 里的值——
+            # 若那一次部署本身就带着坏的 mmproj，回滚会二次失败。低概率，
+            # 但比「回滚时静默清空 mmproj、把原本可用的本地视觉关掉」要好：
+            # 后者会让一次失败的切换**永久**改变系统能力，且无人察觉。
 
     _write_model_config(current)
     apply_result: dict[str, Any] | None = None
@@ -3445,7 +3980,28 @@ async def qa_query(
             status_code=403,
             detail="在线推理仅管理员可用，请联系管理员开放在线推理",
         )
-    contexts, rag_info = await _retrieve_planned(question, selected_mode, req.top_k)
+    # 先转写再检索：检索链（规划器／分组／RAG）只吃文本，图片到不了那一层。
+    # 失败返回 None 而不是抛异常——检索退回现状，但答题照常。
+    vision_info = (
+        await _transcribe_images(
+            image_attachments, allow_online=_online_inference_allowed(user)
+        )
+        if image_attachments
+        else None
+    )
+    # **question 必须保持原样**：下面用 `history[-1]["content"] == question` 摘掉
+    # 重复的最后一轮用户消息。把 question 改写成带转写正文的版本，这个等值判断
+    # 必然失败，用户消息会被原样送进模型两遍。所以另开一条文本走检索。
+    retrieval_text = _compose_retrieval_question(question, vision_info)
+    # 没有 chat 类候选时不把原图发给答题模型：那样 `_vision_candidates` 会找不到
+    # 候选而抛 503。题面已经在转写文本里，纯文本作答一样能答——
+    # 这顺带修掉了「只配了 MinerU 的用户传图必 503」。
+    answer_images = image_attachments if _has_chat_vision_candidate() else []
+
+    contexts, rag_info = await _retrieve_planned(
+        retrieval_text, selected_mode, req.top_k, has_images=bool(image_attachments)
+    )
+    rag_info["vision"] = _vision_diagnostics(vision_info)
     history, conversation_data = _conversation_messages(user["code"], req.conversation_id, req.messages)
     if history and history[-1]["role"] == "user" and history[-1]["content"] == question:
         history = history[:-1]
@@ -3458,12 +4014,18 @@ async def qa_query(
         conversation_id=req.conversation_id,
         user_code=user["code"],
         conversation_data=conversation_data,
-        image_attachments=image_attachments,
+        image_attachments=answer_images,
+        image_text=(vision_info or {}).get("text"),
         allow_online=_online_inference_allowed(user),
         skip_retrieval=bool(rag_info.get("no_retrieval")),
         live_points=rag_info.get("live_points") or [],
         series=rag_info.get("series") or [],
         logs=rag_info.get("logs"),
+        # 证据预算随检索路数增长。单路时等于原来的默认值，所以这里不必
+        # 判断「是不是多轮」——见 _retrieval_evidence_budget。
+        evidence_budget=_retrieval_evidence_budget(
+            selected_mode, len((rag_info.get("plan") or {}).get("queries") or []) or 1
+        ),
     )
     result["rag"] = rag_info
     return result
@@ -3531,10 +4093,118 @@ def _self_check() -> None:
     # 规划器失败重试的判据。真实故障：LLM 侧偶发 HTTP 400 空响应体，被
     # `except Exception` 吞成默认计划——不取实时数据，用户问趋势却得到
     # 「缺少实时数据」。重试要能识别「这次结果不像话」。
-    assert _wants_realtime("轴封供气压力最近的趋势怎么样？"), "「趋势」是数据类提问"
-    assert _wants_realtime("主蒸汽温度现在多少"), "「现在/多少」是数据类提问"
-    assert not _wants_realtime("轴封系统的作用"), "问原理不该触发重试，否则白调一次模型"
-    assert not _wants_realtime("轴封系统投运前要检查什么")
+    # 规划器重试的判据：只看**结构完整性**，不看内容像不像某个意图。
+    # 内容判断是那次模型调用本身该干的事，外面再拿词表猜一遍只会覆盖它的结论。
+    assert _plan_is_complete("检索: yes\n测点: 无\n历史: 无\n趋势: 无\n日志: 无")
+    assert _plan_is_complete("检索: no\n测点: x\n历史: y\n趋势: z\n日志: w")
+    assert not _plan_is_complete("检索: yes\n测点: 无"), "少了三行说明这次没读全"
+    assert not _plan_is_complete("")
+    assert not _plan_is_complete(None)
+
+    # 检索闸门只向「要检索」单向生效，唯一依据是**本轮带了图片**。
+    # 这里没有「什么算该检索的提问」的词表——判断提问类型是模型的事
+    # （见 _plan_rag 上方）。没有词表就不会随题面内容漂移，
+    # 也不会把「趋势」这类实时取数的线索误判成文档检索。
+
+    # ── 图片转写：候选排序与可用性判据 ──
+    # 转写视图接受 mineru，答题视图只接受 chat。这条界线错了的后果很具体：
+    # 答题视图收进一个 mineru 项，`_vision_candidates` 就会拿它当对话模型去调用，
+    # 必然失败，而用户看到的是「多模态不可用」。
+    _vp = {"vision_priority": [
+        {"priority": 2, "kind": "chat", "mode": "offline", "model": "m.gguf"},
+        {"priority": 1, "kind": "chat", "mode": "online", "model": "deepseek-flash"},
+    ]}
+    assert [c["model"] for c in _ordered_vision_candidates(_vp, {"chat"})] == \
+        ["deepseek-flash", "m.gguf"], "应按 priority 升序"
+    _mineru_only = {"vision_priority": [
+        {"priority": 1, "kind": "mineru", "mode": "offline", "model": ""},
+    ]}
+    _transcribe_view = _ordered_vision_candidates(_mineru_only, {"chat", "mineru"})
+    assert len(_transcribe_view) == 1 and _transcribe_view[0]["kind"] == "mineru"
+    assert _transcribe_view[0]["model"] == "mineru", "mineru 项缺 model 时应补成标签"
+    assert _ordered_vision_candidates(_mineru_only, {"chat"}) == [], "答题视图必须排除 mineru"
+    # kind 缺省为 chat：老配置里没有 kind 字段，必须当 chat 用，否则升级后视觉整体失效
+    _legacy = {"vision_priority": [{"priority": 1, "mode": "online", "model": "deepseek-flash"}]}
+    assert _ordered_vision_candidates(_legacy, {"chat"})[0]["kind"] == "chat"
+    # enabled=false 不参与；mode 非法的 chat 项要被跳过而不是拿去调用
+    assert _ordered_vision_candidates(
+        {"vision_priority": [{"priority": 1, "kind": "chat", "mode": "online", "model": "x", "enabled": False}]},
+        {"chat"}) == []
+    assert _ordered_vision_candidates(
+        {"vision_priority": [{"priority": 1, "kind": "chat", "mode": "", "model": "x"}]}, {"chat"}) == []
+
+    # 坏转写比没转写更糟——它会把检索引到无关文档上，而下游看不出区别。
+    assert _usable_transcript("一、填空题\n1. 汽轮机额定转速为 3000 r/min")
+    assert not _usable_transcript("")
+    assert not _usable_transcript("短")
+    assert not _usable_transcript("抱歉，我无法识别这张图片里的文字")
+    assert not _usable_transcript("图片不清晰，请重新上传一张")
+    # 但「看不清」出现在正文里是正常的（题目本身可能就在说这个词），只在开头算推脱
+    assert _usable_transcript("1. 当发现仪表看不清时，应先核对照明与镜面，再联系热工。")
+
+    # 原指令必须保留：它带着用户意图（「只给答案」「按题号给」），规划器要靠它判类别
+    assert _compose_retrieval_question("做卷子", None) == "做卷子"
+    assert _compose_retrieval_question("做卷子", {"text": "   "}) == "做卷子"
+    _cq = _compose_retrieval_question("做卷子", {"text": "1. 主蒸汽温度"})
+    assert _cq.startswith("做卷子") and "1. 主蒸汽温度" in _cq
+
+    assert _truncate_for_planner("短问题") == "短问题"
+    _long = _truncate_for_planner("题" * (_PLANNER_INPUT_MAX_CHARS + 500))
+    assert len(_long) <= _PLANNER_INPUT_MAX_CHARS + 10 and _long.endswith("（已截断）")
+
+    # 提示词：转写块与「别把 OCR 当证据」的规则必须同时出现或同时不出现。
+    # 少了规则，模型会拿 OCR 去跟检索证据打对台，比不转写还糟。
+    _ip = _prompt("q", [], image_text="一、填空题 1. 额定转速 3000 r/min")
+    assert "图片文字" in _ip[-1]["content"] and "额定转速" in _ip[-1]["content"]
+    assert "不要把它当作证据引用" in _ip[0]["content"], "缺了这条会拿 OCR 跟证据打对台"
+    _np = _prompt("q", [])
+    assert "图片文字" not in _np[-1]["content"], "没有转写时不该出现空的图片块"
+    assert "不要把它当作证据引用" not in _np[0]["content"], "没有转写时不该出现那条规则"
+
+    # ── 检索规划：模型输出 → 查询列表 ──
+    # 由模型决定发几路，取代了原来的关键词表 + 正则切分。这里只锁「输出解析」
+    # 这一段纯逻辑——「拆得对不对」是模型的事，测不了也不该用规则去兜。
+    assert _parse_query_plan("汽轮机超速保护动作转速") == ["汽轮机超速保护动作转速"]
+    assert _parse_query_plan("1. 第一题\n2. 第二题") == ["第一题", "第二题"], "行首编号要剥掉"
+    assert _parse_query_plan("- 甲\n* 乙\n· 丙") == ["甲", "乙", "丙"], "列表符号要剥掉"
+    assert _parse_query_plan("甲\n\n   \n乙") == ["甲", "乙"], "空行要跳过"
+    assert _parse_query_plan("甲\n甲") == ["甲"], "重复的查询只留一条"
+    assert _parse_query_plan("`甲`") == ["甲"], "反引号要剥掉"
+    assert _parse_query_plan("") == [] and _parse_query_plan(None) == []
+    assert len(_parse_query_plan("\n".join(f"查询{i}" for i in range(200)))) <= _RAG_MAX_QUERIES, \
+        "查询数必须有上限，否则一份畸形输出会发出上百路检索"
+
+    # 证据预算随路数增长：**不涨的话后面几路检索到了也进不了提示词**，等于白发。
+    # 单路时必须等于原来的默认预算，否则单问一答的行为会被顺带改掉。
+    assert _retrieval_evidence_budget("offline", 1) == settings.local_graph_top_k
+    assert _retrieval_evidence_budget("online", 1) == settings.online_graph_top_k
+    assert _retrieval_evidence_budget("offline", 20) > _retrieval_evidence_budget("offline", 1)
+    assert _retrieval_evidence_budget("offline", 10_000) <= _RAG_LOCAL_EVIDENCE_CAP, "预算要有上限"
+    assert _retrieval_evidence_budget("online", 10_000) <= _RAG_ONLINE_EVIDENCE_CAP
+    assert _retrieval_evidence_budget("online", 20) > _retrieval_evidence_budget("offline", 20)
+
+    # 组间轮转：高分小组不能吃光窗口。这条是「分组到底有没有用」的直接判据。
+    _rr = _round_robin_by_round([
+        {"id": "a1", "_rag_round": 1}, {"id": "a2", "_rag_round": 1}, {"id": "a3", "_rag_round": 1},
+        {"id": "b1", "_rag_round": 2},
+        {"id": "c1", "_rag_round": 3}, {"id": "c2", "_rag_round": 3},
+    ])
+    assert [i["id"] for i in _rr] == ["a1", "b1", "c1", "a2", "c2", "a3"], _rr
+    assert sorted(i["id"] for i in _rr) == ["a1", "a2", "a3", "b1", "c1", "c2"], "轮转不能丢项"
+    assert _round_robin_by_round([]) == []
+    # 头 3 条必须覆盖全部 3 组——这才是配额生效的样子
+    assert len({i["_rag_round"] for i in _rr[:3]}) == 3
+
+    # MinerU 上传名必须可预测且不重复：结果字典按它的 stem 索引，对不上就取空，
+    # 而「取空」在日志里和「解析失败」长得一样，会把排查引向错误方向。
+    assert _mineru_upload_name(0, {"mime_type": "image/png"}) == "image0.png"
+    assert _mineru_upload_name(3, {"mime_type": "image/jpeg"}) == "image3.jpg"
+    assert _mineru_upload_name(1, {"mime_type": "image/webp"}) != _mineru_upload_name(2, {"mime_type": "image/webp"})
+    # 未知 mime 也要给出确定的扩展名，不能抛
+    assert _mineru_upload_name(0, {"mime_type": ""}).endswith(".png")
+
+
+
     assert _plan_has_realtime({"trend": {"keyword": "x"}})
     assert _plan_has_realtime({"points": ["x"]})
     assert not _plan_has_realtime({"points": [], "history": None, "trend": None, "logs": None})
@@ -3726,17 +4396,6 @@ def _self_check() -> None:
     # ── 测点相关性判定：模糊检索的 top-1 不能盲信 ──
     # 实测搜「轴封供汽压力」返回 5 条，正确答案排第 4，top-1 是完全无关的
     # 「高压主蒸汽压力3选1后」。取 top-1 会把错数据当事实喂给模型。
-    assert not _point_matches("轴封供汽压力", "高压主蒸汽压力3选1后")
-    assert not _point_matches("轴封供汽压力", "低压主蒸汽压力3选后")
-    assert _point_matches("轴封供汽压力", "#1机组轴封供气压力1")   # 汽/气 异体字仍应命中
-    # 只命中设备不命中物理量：阀门反馈不是压力测点
-    assert not _point_matches("轴封供汽压力", "轴封供汽管道疏水母管气动关断阀开反馈")
-    # 同义词（水位↔液位）字符级判不出来，**这正是模型兜底存在的理由**：
-    # 这里必须是 False，否则 _resolve_point 就不会走到 _pick_live_point
-    assert not _point_matches("凝汽器水位", "凝汽器液位")
-    assert not _point_matches("凝汽器水位", "主蒸汽温度")
-    assert _point_matches("压力", "主蒸汽压力")                  # 短词只判首部
-    assert not _point_matches("轴封", "")    # 实时块合并：三类数据都要出现在同一条 user 消息里
     _rt = _prompt(
         "q", [],
         series=[{

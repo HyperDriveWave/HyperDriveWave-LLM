@@ -56,7 +56,7 @@ systemctl --user enable --now hyperdrivewave-frpc.service
 systemctl --user disable --now hyperdrivewave-frpc.service
 
 # 看隧道日志
-tail -f /home/xthd/桌面/HyperDriveWave/HDW_Runtime/frp/frpc_hdw_public.log
+tail -f <项目根>/HDW_Runtime/frp/frpc_hdw_public.log
 ```
 
 中转面板（查公网代理是否在线）：`http://<公网中转机IP>:7500` · 账号密码在 frps 自己的配置里，**不要写进任何文档或仓库**
@@ -103,13 +103,13 @@ rm ~/.config/systemd/user/hyperdrivewave-frpc.service
 systemctl --user daemon-reload
 
 # 撤销容器改动
-cd /home/xthd/桌面/HyperDriveWave
+cd <项目根>
 # 从备份恢复 Configs/、Scripts/、HDW_Orchestrator/、HDW_Frontend/
-rsync -a /home/xthd/桌面/backuphdw/<路径>/ <路径>/
+rsync -a <备份目录>/<路径>/ <路径>/
 docker compose --env-file Configs/.env -f Configs/docker-compose.yml --profile base --profile knowledge --profile web up -d --build
 ```
 
-完整项目备份在 `/home/xthd/桌面/backuphdw/`，见其 `_BACKUP_MANIFEST.md`。
+完整项目备份在 `<备份目录>/`，见其 `_BACKUP_MANIFEST.md`。
 
 ## 注意事项
 

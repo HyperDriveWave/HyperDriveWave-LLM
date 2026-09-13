@@ -16,8 +16,9 @@ CONFIG_ENGINE=""
 CONFIG_MODEL=""
 CONFIG_CTX=""
 CONFIG_MTP=""
+CONFIG_MMPROJ=""
 if [ -f "$MODEL_CONFIG" ] && command -v python3 >/dev/null 2>&1; then
-  IFS=$'\t' read -r CONFIG_ENGINE CONFIG_MODEL CONFIG_CTX CONFIG_MTP < <(
+  IFS=$'\t' read -r CONFIG_ENGINE CONFIG_MODEL CONFIG_CTX CONFIG_MTP CONFIG_MMPROJ < <(
     MODEL_CONFIG="$MODEL_CONFIG" python3 - <<'PY'
 import json
 import os
@@ -32,7 +33,7 @@ local = local if isinstance(local, dict) else {}
 print(
     "\t".join(
         str(local.get(key) or "")
-        for key in ("engine", "model", "context_window", "mtp_enabled")
+        for key in ("engine", "model", "context_window", "mtp_enabled", "mmproj")
     )
 )
 PY
@@ -47,7 +48,9 @@ DEVICE="${HDW_LLAMA_DEVICE:-Vulkan0}"
 CTX="${HDW_LLAMA_CTX:-${CONFIG_CTX:-262144}}"
 GPU_LAYERS="${HDW_LLAMA_GPU_LAYERS:-}"
 SERVER_TIMEOUT="${HDW_LLAMA_TIMEOUT:-0}"
-MMPROJ="${HDW_LLAMA_MMPROJ:-}"
+# 视觉投影器。来源优先级与 MODEL/CTX/MTP 同构：环境变量 > 模型配置 > 自动发现。
+# 配置里可以写绝对路径，也可以只写文件名——下面的解析会去模型目录找它。
+MMPROJ="${HDW_LLAMA_MMPROJ:-${CONFIG_MMPROJ:-}}"
 # MTP（Multi-Token Prediction）投机解码。来源优先级：环境变量 > 模型配置的 mtp_enabled。
 MTP_ENABLED="${HDW_LLAMA_MTP:-${CONFIG_MTP:-}}"
 MTP_ENABLED="$(printf '%s' "$MTP_ENABLED" | tr '[:upper:]' '[:lower:]')"

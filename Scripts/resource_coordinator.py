@@ -158,6 +158,26 @@ def _resolve_model_path(model: str) -> Path:
     raise RuntimeError(f"模型不存在：{model}")
 
 
+def _resolve_mmproj_path(mmproj: str) -> Path:
+    """按 **start.sh 的解析顺序**校验视觉投影器路径。
+
+    刻意不复用 `_resolve_model_path` 的 glob 兜底：start.sh 对 mmproj 只认
+    两种形态——原样路径，或相对 `HDW_Engines/LLM_Models` 的路径。这里要是比它
+    宽松，就会「放行 → 停掉 llama → start.sh exit 1」，以「本地推理挂了」收场，
+    比在这里拦住难查得多。
+    """
+    candidate = Path(mmproj).expanduser()
+    if candidate.is_file():
+        return candidate
+    candidate = ROOT / "HDW_Engines/LLM_Models" / mmproj
+    if candidate.is_file():
+        return candidate
+    raise RuntimeError(
+        f"视觉投影器不存在：{mmproj}"
+        "（只认原样路径，或相对 HDW_Engines/LLM_Models 的路径）"
+    )
+
+
 def _configured_llm_target() -> dict[str, object]:
     local = _read_model_config().get("local")
     if not isinstance(local, dict):
@@ -181,6 +201,8 @@ def _configured_llm_target() -> dict[str, object]:
             "FreeToken 未安装为宿主机 ft 命令，当前不能切换；"
             "请先安装 FreeToken CLI，或选择 llama.cpp"
         )
+    mmproj = str(local.get("mmproj") or "").strip()
+    mmproj_path = ""
     if normalized in {"llama.cpp", "llama-cpp", "llama"}:
         binary = ROOT / "HDW_Inference/llama/build/bin/llama-server"
         if not binary.is_file():
@@ -189,11 +211,18 @@ def _configured_llm_target() -> dict[str, object]:
             raise RuntimeError(
                 f"llama.cpp 需要 GGUF 文件，当前模型不是文件：{model_path}"
             )
+        # 提前校验投影器：start.sh 也会校验并在缺失时 exit 1，但那是在**停掉
+        # llama 之后**——那时服务已经中断了。在这里拦住，配置回滚就不会以
+        # 「本地推理挂了」收场。留空是合法的（表示不要视觉）。
+        if mmproj:
+            mmproj_path = str(_resolve_mmproj_path(mmproj))
     return {
         "engine": engine,
         "model": model,
         "model_path": str(model_path),
         "context_window": context_window,
+        "mmproj": mmproj,
+        "mmproj_path": mmproj_path,
     }
 
 

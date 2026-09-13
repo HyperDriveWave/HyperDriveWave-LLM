@@ -1,5 +1,4 @@
 import argparse
-import math
 import os
 import re
 import sys
@@ -57,7 +56,6 @@ mcp = MCPServer(
         "LSTM model tools should be used to search setpoint tracking controller models and call a matched model with a target control value."
         "Log query tools should be used to fetch and summarize LIEMS duty notes, important handovers, grounding records, and major events. "
         "Hydrogen leak tools should be used to calculate #1/#2 generator hydrogen leakage from SIS pressure and temperature history. "
-        "rag_query_plan should be used before RAG retrieval to split complex multi-question requests into focused rounds. "
         "Use log_query_fetch_range only when fresh LIEMS fetching is explicitly needed; normal log query tools first read local exported logs."
     ),
 )
@@ -91,73 +89,6 @@ def mcp_service_status() -> dict:
     }
 
 
-@mcp.tool()
-def rag_query_plan(
-    question: str,
-    inference_mode: str = "offline",
-    base_top_k: int = 10,
-) -> dict:
-    """Plan one or more focused RAG rounds for a complex industrial question."""
-    text = " ".join(str(question or "").split())
-    if not text:
-        return {
-            "rounds": 1,
-            "queries": [""],
-            "top_k": max(5, int(base_top_k or 10)),
-            "base_top_k": max(5, int(base_top_k or 10)),
-            "reason": "empty question",
-        }
-
-    numbered = [
-        item.strip(" \t\r\n;；")
-        for item in re.split(
-            r"(?:^|[\n;；])\s*(?=(?:\d{1,2}|[一二三四五六七八九十]+)[、.)．）])",
-            str(question),
-        )
-        if item.strip(" \t\r\n;；")
-    ]
-    complex_markers = (
-        "试卷",
-        "题目",
-        "逐题",
-        "每题",
-        "分别",
-        "全部",
-        "多道",
-        "多项",
-        "清单",
-        "逐条",
-        "完整分析",
-        "详细说明",
-    )
-    if len(numbered) >= 2:
-        queries = numbered[:8]
-        reason = "检测到编号或分号分隔的多个子问题"
-    elif any(marker in text for marker in complex_markers):
-        queries = [
-            text,
-            f"{text} 相关定义、范围和判断依据",
-            f"{text} 操作步骤、参数和适用条件",
-            f"{text} 异常处理、限制和安全要求",
-        ]
-        reason = "检测到多问题或完整分析意图，拆分为主题检索"
-    else:
-        queries = [text]
-        reason = "单一问题，使用一次检索"
-
-    rounds = max(1, min(8, len(queries)))
-    queries = queries[:rounds]
-    configured = max(1, min(40, int(base_top_k or 10)))
-    per_round = max(5, math.ceil(configured / rounds))
-    return {
-        "rounds": rounds,
-        "queries": queries,
-        "top_k": per_round,
-        "base_top_k": configured,
-        "inference_mode": inference_mode if inference_mode in {"online", "offline"} else "offline",
-        "reason": reason,
-        "minimum_top_k": 5,
-    }
 @mcp.tool()
 def point_query_search_points(query_text: str, limit: int = 10) -> dict:
     """Search KKS points by KKS code, SIS tag name, or Chinese point description."""

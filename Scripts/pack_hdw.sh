@@ -5,10 +5,10 @@
 # 另有 34G 是之前下载残留的碎块。直接 rsync 整个文件夹会白搬 270G。
 #
 # 用法：
-#   bash Scripts/pack_hdw.sh --out /media/usb/hdw          # 拷到目录（推荐，可续传）
+#   bash Scripts/pack_hdw.sh --out DIR                     # 拷到目录（推荐，可续传）
 #   bash Scripts/pack_hdw.sh --tar /tmp/hdw.tar.gz         # 打成单个压缩包
-#   bash Scripts/pack_hdw.sh --app-only --out /media/usb/hdw   # 不带模型（目标机自己下）
-#   bash Scripts/pack_hdw.sh --remote-rag --out /media/usb/rag # 只打远端 RAG 节点要的
+#   bash Scripts/pack_hdw.sh --app-only --out DIR          # 不带模型（目标机自己下）
+#   bash Scripts/pack_hdw.sh --remote-rag --out DIR        # 只打远端 RAG 节点要的
 #   bash Scripts/pack_hdw.sh --from-manifest need.tsv --out DIR # 按目标机的缺失清单打
 #
 # 默认包含：全部代码与配置 + 当前在用的 3 个模型（约 26G）。

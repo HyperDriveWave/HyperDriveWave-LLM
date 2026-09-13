@@ -300,7 +300,7 @@ class HydrogenLeakService:
             "query_mode": "hydrogen_leak",
             "unit": unit_no,
             "unit_label": f"{unit_no}号机组",
-            "formula_source": "/home/xthd/桌面/发电机漏氢计算 .xlsx",
+            "formula_source": "发电机漏氢计算.xlsx",
             "formula_note": "按Excel主表公式：使用氢压+大气压、冷热氢平均温度、标准温度20C、标准压力0.101325MPa、发电机容积计算Nm3/d。",
             "generator_volume_m3": float(generator_volume_m3 or 125.0),
             "rated_pressure_mpa": float(rated_pressure_mpa or 0.5),
@@ -864,7 +864,7 @@ class HydrogenLeakService:
                 "qualified": False,
                 "grade": "无法评定",
                 "reason": "漏氢量计算结果为空。",
-                "standard_source": "/home/xthd/桌面/发电机漏氢计算 .xlsx",
+                "standard_source": "发电机漏氢计算.xlsx",
                 "standard": standard,
             }
         if computed.get("window_quality") != "pressure_drop" or leak_value < 0:
@@ -875,7 +875,7 @@ class HydrogenLeakService:
                 "reason": "所选窗口压力未自然下降，可能存在补氢、排氢或测点异常，不适合按自然泄漏判断合格性。",
                 "leak_nm3_per_day": leak_value,
                 "leak_rate_percent_per_day": leak_rate_percent,
-                "standard_source": "/home/xthd/桌面/发电机漏氢计算 .xlsx",
+                "standard_source": "发电机漏氢计算.xlsx",
                 "standard": standard,
             }
 
@@ -904,7 +904,7 @@ class HydrogenLeakService:
             "good_limit_nm3_per_day": good_limit,
             "excellent_limit_nm3_per_day": excellent_limit,
             "margin_to_qualified_limit_nm3_per_day": margin,
-            "standard_source": "/home/xthd/桌面/发电机漏氢计算 .xlsx",
+            "standard_source": "发电机漏氢计算.xlsx",
             "standard": standard,
             "plain_explanation": self._plain_assessment_text(leak_value, leak_rate_percent, grade, qualified, standard, margin),
         }

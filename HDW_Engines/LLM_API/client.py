@@ -16,6 +16,13 @@ _PRESENCE_PENALTY = float(os.getenv("HDW_LLM_PRESENCE_PENALTY", "0.3"))
 class LLMResult:
     content: str
     reasoning_content: str = ""
+    # 上游的 finish_reason（"stop" / "length" / ...）。默认空串保持向后兼容——
+    # 这个字段是后加的，任何按位置构造 LLMResult 的调用方都不该因此坏掉。
+    #
+    # 为什么需要它：**被 max_tokens 截断的输出看起来和正常输出一模一样**，
+    # 只是短了。图片转写场景下这意味着「整张卷子后半部分的题全丢了」却毫无征兆，
+    # 下游拿着半份题面去检索、去作答，谁都不知道少了东西。
+    finish_reason: str = ""
 
 
 class OpenAICompatibleClient:
@@ -94,7 +101,8 @@ class OpenAICompatibleClient:
                 raise RuntimeError(f"LLM HTTP {response.status_code}: {response.text[:500]}")
 
         try:
-            message = response.json()["choices"][0]["message"]
+            choice = response.json()["choices"][0]
+            message = choice["message"]
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise RuntimeError("LLM response does not contain a message") from exc
         reasoning_content = str(message.get("reasoning_content") or "").strip()
@@ -105,6 +113,8 @@ class OpenAICompatibleClient:
         return LLMResult(
             content=content,
             reasoning_content=reasoning_content,
+            # 上游不给这个字段时留空串（不是 None），调用方按「未知」处理。
+            finish_reason=str(choice.get("finish_reason") or "").strip(),
         )
 
     async def health(self) -> dict[str, Any]:

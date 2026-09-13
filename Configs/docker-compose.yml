@@ -172,6 +172,13 @@ services:
       HDW_LIVE_TIME_OFFSET_HOURS: ${HDW_LIVE_TIME_OFFSET_HOURS:-8}
       HDW_MODEL_CONFIG_PATH: /data/model-config/config.json
       HDW_MINERU_BASE_URL: http://hdw-mineru:8002
+      # 图片转写走 MinerU 时的超时与队列上限。**必须在 environment 里显式透传**，
+      # 否则 .env 里怎么改都进不了容器（同 167-172 行那批）。
+      # 与摄取侧刻意不同：ETL 不设超时（批处理没人等），问答路径有用户等。
+      HDW_MINERU_TIMEOUT: ${HDW_MINERU_TIMEOUT:-180}
+      HDW_VISION_MINERU_MAX_QUEUE: ${HDW_VISION_MINERU_MAX_QUEUE:-1}
+      HDW_MINERU_BACKEND: ${HDW_MINERU_BACKEND:-pipeline}
+      HDW_MINERU_LANG: ${HDW_MINERU_LANG:-ch}
       HDW_FRP_PUBLIC_HOST: ${HDW_FRP_PUBLIC_HOST:-}
       HDW_LLM_PRESENCE_PENALTY: ${HDW_LLM_PRESENCE_PENALTY:-0.3}
       HDW_INTERNAL_API_KEY: ${HDW_INTERNAL_API_KEY:-local-dev-key}
