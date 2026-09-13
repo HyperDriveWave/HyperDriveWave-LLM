@@ -3509,6 +3509,21 @@
                      行数与后端 vision_priority 的 1~4 上限必须一致，写死在两处必然漂移，
                      而漂移的后果是静默的——界面行数少于配置项数时，保存会把多出来的项删掉。 -->
                 <div class="vision-priority-list" id="visionPriorityList"></div>
+                <!-- 上传权限放在这一块：它管的就是图片，和视觉来源同属一件事。
+                     语义与「在线推理权限」一致——管理员始终不受限。 -->
+                <label class="model-switch-row">
+                  <span>图片上传权限</span>
+                  <span class="model-switch">
+                    <input
+                      id="modelImageUploadForUsers"
+                      type="checkbox"
+                      role="switch"
+                      aria-label="开放图片上传给普通用户"
+                    />
+                    <span id="modelImageUploadSlider" class="model-switch-slider" aria-hidden="true"></span>
+                  </span>
+                  <span id="modelImageUploadState" class="model-switch-state">普通用户可用</span>
+                </label>
                 <p class="model-help">
                   「模型对话」走在线或本地大模型识别图片，快（约 2~3 秒）但本地需要视觉投影器；
                   「MinerU 解析」走本机文档解析，完全不出网，但慢约一个量级（约 5~20 秒），
@@ -3813,6 +3828,8 @@
     const modelOnlineMultimodal = document.querySelector("#modelOnlineMultimodal");
     const modelOnlineThinking = document.querySelector("#modelOnlineThinking");
     const modelOnlineEnabledForUsers = document.querySelector("#modelOnlineEnabledForUsers");
+    const modelImageUploadForUsers = document.querySelector("#modelImageUploadForUsers");
+    const modelImageUploadState = document.querySelector("#modelImageUploadState");
     const modelOnlineAccessState = document.querySelector("#modelOnlineAccessState");
     const modelOnlineCapability = document.querySelector("#modelOnlineCapability");
     const modelEmbedding = document.querySelector("#modelEmbedding");
@@ -3896,6 +3913,7 @@
     let contextWindows = { online: 1000000, offline: 262144 };
     let inferenceMode = "offline";
     let onlineInferenceForUsers = true;
+    let imageUploadForUsers = true;
     const thinkingEnabledByMode = { online: true, offline: true };
 
     const modes = {
@@ -4160,9 +4178,22 @@
       return Boolean(authUser) && (isAdmin() || onlineInferenceForUsers);
     }
 
+    // 图片上传。与在线推理同一套：管理员不受限，普通用户由配置开关决定。
+    // **这只是 UI 层的置灰**，真正的拦截在服务端 qa_query（接口是公开的，
+    // 藏按钮挡不住直接 POST）。
+    function imageUploadAllowed() {
+      return Boolean(authUser) && (isAdmin() || imageUploadForUsers);
+    }
+
     function updateOnlineAccessState() {
       const enabled = modelOnlineEnabledForUsers.checked;
       modelOnlineAccessState.textContent = enabled ? "普通用户可用" : "仅管理员可用";
+    }
+
+    function updateImageUploadState() {
+      modelImageUploadState.textContent = modelImageUploadForUsers.checked
+        ? "普通用户可用"
+        : "仅管理员可用";
     }
 
     function applyUserPermissions() {
@@ -4189,6 +4220,12 @@
           ? unavailable ? "当前运行模型不支持该能力" : ""
           : "请联系管理员操作";
       });
+      const canUploadImage = imageUploadAllowed();
+      uploadImageButton.disabled = !canUploadImage;
+      uploadImageButton.title = canUploadImage ? "" : "当前未开放图片上传，请联系管理员";
+      uploadImageButton.classList.toggle("is-disabled", !canUploadImage);
+      imageFileInput.disabled = !canUploadImage;
+
       const canUseOnline = onlineInferenceAllowed();
       if (!canUseOnline && inferenceMode === "online") {
         inferenceMode = "offline";
@@ -4210,6 +4247,7 @@
       loginPending = false;
       inferenceMode = "offline";
       onlineInferenceForUsers = true;
+      imageUploadForUsers = true;
       pendingImages = [];
       renderImagePreview();
       appStarted = false;
@@ -4234,6 +4272,7 @@
       authUser = user;
       authSession = session || authSession;
       onlineInferenceForUsers = permissions?.online_inference_for_users !== false;
+      imageUploadForUsers = permissions?.image_upload_for_users !== false;
       inferenceMode = inferenceModes.includes(user?.default_inference_mode)
         ? user.default_inference_mode
         : "offline";
@@ -4614,6 +4653,10 @@
       thinkingEnabledByMode.online = online.thinking_enabled !== false;
       modelOnlineEnabledForUsers.checked = online.enabled_for_users !== false;
       onlineInferenceForUsers = modelOnlineEnabledForUsers.checked;
+      const permissionSection = config.permissions || {};
+      modelImageUploadForUsers.checked = permissionSection.image_upload_for_users !== false;
+      imageUploadForUsers = modelImageUploadForUsers.checked;
+      updateImageUploadState();
       updateOnlineAccessState();
       setModelCapability(
         modelOnlineCapability,
@@ -4728,6 +4771,9 @@
             multimodal_enabled: modelOnlineMultimodal.checked,
             thinking_enabled: modelOnlineThinking.checked,
             enabled_for_users: modelOnlineEnabledForUsers.checked,
+          },
+          permissions: {
+            image_upload_for_users: modelImageUploadForUsers.checked,
           },
           retrieval: {
             embedding_model: modelEmbedding.value.trim(),
@@ -4876,6 +4922,12 @@
     }
 
     async function addImageFiles(files) {
+      // 这里是图片进入待发队列的**唯一**汇聚点，守卫放这儿比只守按钮稳：
+      // 按钮置灰挡不住别的调用路径。
+      if (!imageUploadAllowed()) {
+        showNotice("当前未开放图片上传，请联系管理员");
+        return;
+      }
       const allowed = ["image/jpeg", "image/png", "image/webp", "image/gif"];
       for (const file of Array.from(files).slice(0, 4 - pendingImages.length)) {
         if (!allowed.includes(file.type)) {
@@ -5335,6 +5387,44 @@
         empty.textContent = `读取失败：${error.message}`;
         knowledgeDocuments.appendChild(empty);
       }
+    }
+
+    // 读取 /api/qa/query 的 SSE 流。
+    // 用 fetch + ReadableStream 而不是 EventSource：EventSource 只支持 GET，
+    // 而这里要 POST 一个可能带图片的 body。
+    async function readQAStream(response, onStage) {
+      if (!response.ok) {
+        // 校验类错误（403/422）在流开始前就返回了，仍是普通 JSON——
+        // 这是把校验留在生成器外面的收益，前端不必为它写第二套处理。
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.detail || response.statusText);
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          const chunk = buffer.slice(0, boundary).trim();
+          buffer = buffer.slice(boundary + 2);
+          if (!chunk.startsWith("data:")) continue;
+          let event;
+          try {
+            event = JSON.parse(chunk.slice(5).trim());
+          } catch (error) {
+            continue;   // 半截帧，丢掉即可——后面的数据仍会到
+          }
+          if (event.error) throw new Error(event.error);
+          if (event.result) return event.result;
+          // heartbeat 只用来保持连接活跃，没有可显示的内容
+          if (event.stage && typeof onStage === "function") onStage(event);
+        }
+      }
+      // 流结束了却没拿到 result：连接被中途掐断
+      throw new Error("连接中断，未收到完整回答");
     }
 
     async function readResponse(response) {
@@ -6824,9 +6914,18 @@
               mime_type,
               data_url,
             })),
+            // 流式：一次问答可能要几十秒（逐题检索 + 长回答），阻塞式请求
+            // 会在这期间一个字节都不发，被浏览器或中间代理当死连接掐掉——
+            // 实测发生过一次「请求失败：Load failed」，而服务端其实返回了 200。
+            stream: true,
           }),
         });
-        const data = await readResponse(response);
+        const data = await readQAStream(response, (event) => {
+          const label = event.evidence
+            ? `${event.label}（${event.evidence} 条证据）`
+            : event.label;
+          setPendingText(pending, `${label}…`);
+        });
         stopThinking(pending);
         const answer = data.answer || "没有返回回答。";
         const citations = data.citations || [];
@@ -6919,6 +7018,12 @@
 
     uploadImageButton.addEventListener("click", () => {
       closeAttachmentMenu();
+      // 再判一次：按钮的 disabled 由 applyUserPermissions 设置，
+      // 而权限可能刚在别处变过（例如管理员在模型管理页改了开关）。
+      if (!imageUploadAllowed()) {
+        showNotice("当前未开放图片上传，请联系管理员");
+        return;
+      }
       imageFileInput.click();
     });
 
@@ -7244,6 +7349,13 @@
     modelOnlineEnabledForUsers.addEventListener("change", () => {
       onlineInferenceForUsers = modelOnlineEnabledForUsers.checked;
       updateOnlineAccessState();
+    });
+    modelImageUploadForUsers.addEventListener("change", () => {
+      // 同步到本地权限并**立刻刷新发送框**——否则管理员关掉开关后，
+      // 自己的界面要等下次加载才变（虽说管理员本就不受限，但按钮态会显示错）。
+      imageUploadForUsers = modelImageUploadForUsers.checked;
+      updateImageUploadState();
+      applyUserPermissions();
     });
     logoutButton.addEventListener("click", clearAuthAndShowLogin);
     loginCodeInput.addEventListener("keydown", (event) => {

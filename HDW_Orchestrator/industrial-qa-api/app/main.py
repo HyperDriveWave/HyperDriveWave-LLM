@@ -11,7 +11,7 @@ import time
 import asyncio
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -56,6 +56,8 @@ class QARequest(BaseModel):
     conversation_id: str | None = None
     messages: list[ChatMessage] = Field(default_factory=list)
     images: list[ImageAttachment] = Field(default_factory=list, max_length=4)
+    # 默认 False：老的调用方（含 /v1/chat/completions 的内部转发）行为不变。
+    stream: bool = False
 
 
 class ChatCompletionRequest(BaseModel):
@@ -104,6 +106,7 @@ class ModelConfigPatch(BaseModel):
     local: dict[str, Any] | None = None
     online: dict[str, Any] | None = None
     retrieval: dict[str, Any] | None = None
+    permissions: dict[str, Any] | None = None
     vision_priority: list[dict[str, Any]] | None = None
 
 
@@ -164,6 +167,11 @@ def _default_model_config() -> dict[str, Any]:
                 },
             ],
         },
+        "permissions": {
+            # 普通用户能不能在提问时上传图片。**管理员始终可以**，
+            # 与 online.enabled_for_users 同一套语义。
+            "image_upload_for_users": True,
+        },
         "retrieval": {
             "embedding_model": "bge-m3",
             "reranker_model": "bge-reranker-v2-m3",
@@ -189,7 +197,7 @@ def _merge_model_config(value: dict[str, Any] | None) -> dict[str, Any]:
     merged = copy.deepcopy(_default_model_config())
     if not isinstance(value, dict):
         return merged
-    for section in ("local", "online", "retrieval"):
+    for section in ("local", "online", "retrieval", "permissions"):
         incoming = value.get(section)
         if isinstance(incoming, dict):
             merged[section].update(incoming)
@@ -252,6 +260,7 @@ def _validate_model_config_patch(patch: ModelConfigPatch) -> None:
             "enabled_for_users",
         },
         "retrieval": {"embedding_model", "reranker_model"},
+        "permissions": {"image_upload_for_users"},
     }
     values = patch.model_dump(exclude_none=True)
     for section, allowed in sections.items():
@@ -285,6 +294,7 @@ def _validate_model_config_patch(patch: ModelConfigPatch) -> None:
                 "mtp_enabled",
                 "thinking_enabled",
                 "enabled_for_users",
+                "image_upload_for_users",
             } and not isinstance(value, bool):
                 raise HTTPException(status_code=422, detail=f"invalid {section}.{key}")
 
@@ -567,12 +577,25 @@ def _online_inference_allowed(user: dict[str, str]) -> bool:
     return user.get("role") == "admin" or _online_inference_enabled_for_users()
 
 
+def _image_upload_enabled_for_users() -> bool:
+    section = _read_model_config().get("permissions", {})
+    value = section.get("image_upload_for_users", True) if isinstance(section, dict) else True
+    return value if isinstance(value, bool) else True
+
+
+def _image_upload_allowed(user: dict[str, str]) -> bool:
+    """提问时能不能上传图片。**管理员始终可以**，与在线推理同一套语义。"""
+    return user.get("role") == "admin" or _image_upload_enabled_for_users()
+
+
 def _permissions_for_user(user: dict[str, str]) -> dict[str, bool]:
     return {
         "model_management": user.get("role") == "admin",
         "frp_management": user.get("role") == "admin",
         "online_inference": _online_inference_allowed(user),
         "online_inference_for_users": _online_inference_enabled_for_users(),
+        "image_upload": _image_upload_allowed(user),
+        "image_upload_for_users": _image_upload_enabled_for_users(),
     }
 
 
@@ -1388,6 +1411,37 @@ def _plan_has_realtime(plan: dict[str, Any]) -> bool:
     return bool(plan.get("points") or plan.get("history") or plan.get("trend") or plan.get("logs"))
 
 
+# ── 数字核对：答案里的数在证据里找得到吗 ──
+#
+# 填空类问题最容易出错的地方是数字，而「这个数在证据里有没有」**是可以直接查的**
+# ——不需要模型自我评估，也不需要语义判断。
+#
+# 只作提示，**不删改答案**。查出无出处的数不代表它一定错（可能是单位换算、
+# 可能是常识性数字），但它是最值得人工核对的地方。
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+# 单个数字（0-9）在中文行文里多半是序号或量词，查它只会制造噪声。
+_NUMBER_MIN_DIGITS = 2
+
+
+def _unsupported_numbers(answer: str, evidence_text: str) -> list[str]:
+    """答案里出现、但检索证据里找不到的数字。
+
+    机械校验。判据就是「这个字符串在证据里出现过没有」，含尾零的写法
+    （`11.80` 与 `11.8`）按归一化后的值再比一次。
+    """
+    haystack = str(evidence_text or "")
+    missing: list[str] = []
+    for raw in _NUMBER_RE.findall(str(answer or "")):
+        if len(raw.replace(".", "")) < _NUMBER_MIN_DIGITS:
+            continue
+        normalized = raw.rstrip("0").rstrip(".") if "." in raw else raw
+        if raw in haystack or normalized in haystack:
+            continue
+        if raw not in missing:
+            missing.append(raw)
+    return missing
+
+
 # ── 检索闸门：带图必须走知识库 ──
 #
 # 实测：用户传一张试卷照片问「做一下这张卷子」，规划器只看到这句纯文本，
@@ -2146,8 +2200,24 @@ async def _retrieve_planned(
 
     merged: dict[str, dict[str, Any]] = {}
     round_infos: list[dict[str, Any]] = []
-    for round_index, query in enumerate(plan["queries"], 1):
-        contexts, info = await _retrieve(query, int(plan["top_k"]))
+    # **并发检索**。逐题检索后轮次可以到几十，串行会把这些延迟直接叠加
+    # （实测 24 路串行 10.2 s、并发 5.5 s）。检索彼此不依赖，没有串行的理由。
+    # 注意结果要按下标回填——`gather` 保序，但仍显式带上 round_index，
+    # 免得以后有人改了写法把轮次对应关系弄错。
+    outcomes = await asyncio.gather(
+        *(_retrieve(query, int(plan["top_k"])) for query in plan["queries"]),
+        return_exceptions=True,
+    )
+    for round_index, (query, outcome) in enumerate(zip(plan["queries"], outcomes), 1):
+        if isinstance(outcome, BaseException):
+            # 单路失败不该毁掉整轮：其它路仍有证据可答。这与原来的串行版本
+            # 行为不同（那时一路抛异常会直接冒到调用方），是有意放宽的。
+            round_infos.append(
+                {"round": round_index, "query": query, "count": 0,
+                 "backend": "", "url": "", "error": f"{type(outcome).__name__}: {outcome}"}
+            )
+            continue
+        contexts, info = outcome
         round_infos.append({"round": round_index, "query": query, **info, "count": len(contexts)})
         for position, item in enumerate(contexts):
             identity = str(item.get("id") or item.get("chunk_id") or item.get("text", ""))
@@ -3057,6 +3127,43 @@ def _entity_summary(row: dict[str, Any]) -> str:
     return "，".join(items) or "无"
 
 
+def _evidence_block(contexts: list[dict[str, Any]]) -> str:
+    """模型实际看到的证据文本（含 `[证据 N] 来源=… 片段=…` 头部）。
+
+    **数字核对必须拿它当比对基准**：答案会引用「片段 616」这类头部里的编号，
+    只比 `text` 字段会把这些引用全误报成「证据里没有的数」。
+    与 `_prompt` 共用同一份，就不会各写各的而漂移。
+    """
+    if not contexts:
+        return "无"
+    return "\n\n".join(
+        (
+            f"[证据 {idx}] "
+            f"来源={Path(str((item.get('metadata') or {}).get('source_file', ''))).name or '未知'} "
+            f"片段={(item.get('metadata') or {}).get('chunk_index', '未知')}\n"
+            f"{str(item.get('text', ''))}"
+        )
+        for idx, item in enumerate(contexts, 1)
+    )
+
+
+def _graph_block(graph_rows: list[dict[str, Any]]) -> str:
+    """模型实际看到的图谱文本（含 `[图谱 N] … chunk=…` 头部）。理由同上。"""
+    if not graph_rows:
+        return "无"
+    return "\n".join(
+        (
+            f"[图谱 {idx}] 文档={row.get('document_title') or row.get('document_id')}; "
+            f"章节={'/'.join(row.get('section_path') or []) or row.get('section_title') or '无'}; "
+            f"chunk={row.get('chunk_id')}; "
+            f"实体={_entity_summary(row)}; "
+            f"前文={((row.get('previous_texts') or [''])[0]) or '无'}; "
+            f"后文={((row.get('next_texts') or [''])[0]) or '无'}"
+        )
+        for idx, row in enumerate(graph_rows, 1)
+    )
+
+
 def _prompt(
     question: str,
     contexts: list[dict[str, Any]],
@@ -3070,35 +3177,8 @@ def _prompt(
     series: list[dict[str, Any]] | None = None,
     logs: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    if contexts:
-        evidence_items = contexts
-        evidence = "\n\n".join(
-            (
-                f"[证据 {idx}] "
-                f"来源={Path(str((item.get('metadata') or {}).get('source_file', ''))).name or '未知'} "
-                f"片段={(item.get('metadata') or {}).get('chunk_index', '未知')}\n"
-                f"{str(item.get('text', ''))}"
-            )
-            for idx, item in enumerate(evidence_items, 1)
-        )
-    else:
-        evidence = "无"
-
-    if graph_rows:
-        graph_items = graph_rows
-        graph = "\n".join(
-            (
-                f"[图谱 {idx}] 文档={row.get('document_title') or row.get('document_id')}; "
-                f"章节={'/'.join(row.get('section_path') or []) or row.get('section_title') or '无'}; "
-                f"chunk={row.get('chunk_id')}; "
-                f"实体={_entity_summary(row)}; "
-                f"前文={((row.get('previous_texts') or [''])[0]) or '无'}; "
-                f"后文={((row.get('next_texts') or [''])[0]) or '无'}"
-            )
-            for idx, row in enumerate(graph_items, 1)
-        )
-    else:
-        graph = "无"
+    evidence = _evidence_block(contexts)
+    graph = _graph_block(graph_rows)
 
     # 实时测点单独成块：它是实时数据，不是文档证据，两者在回答里要分开对待。
     # 采集时间在后端已经换算成北京时间，这里直接给结果：标出「北京时间」是为了
@@ -3314,6 +3394,15 @@ def _prompt(
             "回答时先看检索证据和知识图谱上下文；有证据就基于证据和文档结构归纳，不编造来源。"
             "无证据时，可以回答模型身份、系统能力、通用操作类问题；"
             "涉及工业规程、安全边界、设备参数时必须说明缺少证据，不能臆造。"
+            # ↓ 这两条是针对**实际观测到的失效**写的，不是泛泛的「不要编造」。
+            # 实测：问「凝汽器水位正常值」，证据里只有「冷态启动建议水位 800」，
+            # 模型把它说成了「正常值约 800mm」——数值是真的，含义是错的。
+            # 这类错误比「说没有」危险得多，因为它看起来像答案。
+            "**某个具体定值在证据里没有时**，直接写「证据中未给出该定值」，"
+            "不要用其它章节里数值相近的参数代替，也不要按经验估一个——"
+            "替代值看起来和真值一模一样，读的人分辨不出来。"
+            "**证据之间数值不一致时**，把分歧原样列出来（各自的值与出处），"
+            "不要自行挑一个当成唯一答案。"
             "这是工业场景，不要为了简短省略证据中的职责、步骤、条件、例外、参数或安全后果。"
             "必须逐条阅读并综合所有列出的证据和图谱上下文，不能只依据第一条；"
             "按主题合并重复内容，区分正常运行、启停检查和异常处理，"
@@ -3605,6 +3694,24 @@ async def _answer(
         series=series,
         logs=logs,
     )
+    # 数字核对：把答案里的数与送进提示词的那批证据对一遍。
+    # **只作提示**——无出处的数不一定错（单位换算、常识数字都可能），
+    # 但它是这份答案里最值得人工核对的地方，比让人通篇自查有用得多。
+    unsupported = (
+        _unsupported_numbers(
+            answer,
+            # **必须与提示词里的同一份**（含证据头/图谱头），否则答案里的
+            # 「片段 616」这类引用编号会被误报。问题本身也算出处——答案常复述
+            # 问题里的值（「低 30kPa」）。
+            _evidence_block(llm_contexts)
+            + "\n"
+            + _graph_block(graph_rows)
+            + "\n"
+            + str(question or ""),
+        )
+        if answer and not skip_retrieval
+        else []
+    )
     context_meta = {
         "compressed": preparation.compressed,
         "tokens_before": preparation.tokens_before,
@@ -3645,25 +3752,21 @@ async def _answer(
                 stored["context_compressed_at"] = _now_iso()
             stored["last_inference_mode"] = selected_mode
             _write_conversation(user_code, conversation_id, stored)
-    if contexts:
-        return {
-            "answer": answer,
-            "question": question,
-            "citations": llm_contexts,
-            "graph_context": graph_rows,
-            "status": "answered_by_llm_with_retrieval",
-            "llm": llm_info,
-            "context": context_meta,
-        }
-
     return {
         "answer": answer,
         "question": question,
-        "citations": contexts,
+        # 始终是**真正进了提示词**的那批证据。原来这里分成两个 return 写
+        # （有证据给 llm_contexts、没证据给 contexts），空列表时两者等价，
+        # 分成两处只是给了「只改一处」的机会——事实上刚才就踩到了：
+        # unsupported_numbers 只加在其中一个 return 上，而常见路径走的是另一个。
+        "citations": llm_contexts,
         "graph_context": graph_rows,
-        "status": "answered_by_llm",
+        "status": "answered_by_llm_with_retrieval" if contexts else "answered_by_llm",
         "llm": llm_info,
         "context": context_meta,
+        # 答案里在证据中找不到出处的数字。**空列表是正确的常态**——
+        # 只有非空时才值得用户留意。
+        "unsupported_numbers": unsupported,
     }
 
 
@@ -3714,7 +3817,7 @@ async def patch_model_config(
     previous = _read_model_config()
     current = copy.deepcopy(previous)
     incoming = patch.model_dump(exclude_none=True)
-    for section in ("local", "online", "retrieval"):
+    for section in ("local", "online", "retrieval", "permissions"):
         if isinstance(incoming.get(section), dict):
             current[section].update(incoming[section])
     if isinstance(incoming.get("vision_priority"), list):
@@ -3960,27 +4063,33 @@ async def list_models(
     }
 
 
-@app.post("/qa/query")
-async def qa_query(
-    req: QARequest,
-    authorization: str | None = Header(default=None),
-    x_hdw_session: str | None = Header(default=None),
-) -> dict[str, Any]:
-    _check_auth(authorization)
-    user = _current_user(x_hdw_session)
-    image_attachments = _validate_image_attachments(req.images)
-    question = req.question.strip() or ("请分析这张图片。" if image_attachments else "")
-    if not question:
-        raise HTTPException(status_code=422, detail="question is required unless an image is attached")
-    selected_mode = _resolve_inference_mode(
-        req.inference_mode or _user_default_inference_mode(user)
-    )
-    if selected_mode == "online" and not _online_inference_allowed(user):
-        raise HTTPException(
-            status_code=403,
-            detail="在线推理仅管理员可用，请联系管理员开放在线推理",
-        )
-    # 先转写再检索：检索链（规划器／分组／RAG）只吃文本，图片到不了那一层。
+# 流式返回的心跳间隔。生成阶段一次要几十秒且中间没有字节流动，
+# 定期发一个事件让连接保持活跃——浏览器与中间代理都会把长时间无数据的
+# 连接当死连接掐掉。实测就发生过一次：服务端返回 200，前端的 fetch
+# 却在 77 秒时被拒（"Load failed"）。
+_SSE_HEARTBEAT = float(os.getenv("HDW_SSE_HEARTBEAT", "5"))
+
+
+def _sse_event(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _qa_pipeline(
+    *,
+    question: str,
+    user: dict[str, str],
+    req: "QARequest",
+    image_attachments: list[dict[str, str]],
+    selected_mode: Literal["online", "offline"],
+) -> AsyncIterator[dict[str, Any]]:
+    """跑完整条链路，途中 yield 进度事件，最后 yield `{"result": ...}`。
+
+    进度事件存在的唯一理由：**这次请求可能要几十秒**（逐题检索 + 长回答），
+    中间没有任何字节流动。
+    """
+    if image_attachments:
+        yield {"stage": "vision", "label": "识别图片文字"}
+    # 先转写再检索：检索链（规划器／规划、RAG）只吃文本，图片到不了那一层。
     # 失败返回 None 而不是抛异常——检索退回现状，但答题照常。
     vision_info = (
         await _transcribe_images(
@@ -3998,6 +4107,7 @@ async def qa_query(
     # 这顺带修掉了「只配了 MinerU 的用户传图必 503」。
     answer_images = image_attachments if _has_chat_vision_candidate() else []
 
+    yield {"stage": "retrieve", "label": "检索知识库"}
     contexts, rag_info = await _retrieve_planned(
         retrieval_text, selected_mode, req.top_k, has_images=bool(image_attachments)
     )
@@ -4005,30 +4115,104 @@ async def qa_query(
     history, conversation_data = _conversation_messages(user["code"], req.conversation_id, req.messages)
     if history and history[-1]["role"] == "user" and history[-1]["content"] == question:
         history = history[:-1]
-    result = await _answer(
-        question,
-        contexts,
-        req.reasoning_effort,
-        inference_mode=selected_mode,
-        history_messages=history,
-        conversation_id=req.conversation_id,
-        user_code=user["code"],
-        conversation_data=conversation_data,
-        image_attachments=answer_images,
-        image_text=(vision_info or {}).get("text"),
-        allow_online=_online_inference_allowed(user),
-        skip_retrieval=bool(rag_info.get("no_retrieval")),
-        live_points=rag_info.get("live_points") or [],
-        series=rag_info.get("series") or [],
-        logs=rag_info.get("logs"),
-        # 证据预算随检索路数增长。单路时等于原来的默认值，所以这里不必
-        # 判断「是不是多轮」——见 _retrieval_evidence_budget。
-        evidence_budget=_retrieval_evidence_budget(
-            selected_mode, len((rag_info.get("plan") or {}).get("queries") or []) or 1
-        ),
+
+    yield {"stage": "generate", "label": "生成回答", "evidence": len(contexts)}
+    answer_task = asyncio.create_task(
+        _answer(
+            question,
+            contexts,
+            req.reasoning_effort,
+            inference_mode=selected_mode,
+            history_messages=history,
+            conversation_id=req.conversation_id,
+            user_code=user["code"],
+            conversation_data=conversation_data,
+            image_attachments=answer_images,
+            image_text=(vision_info or {}).get("text"),
+            allow_online=_online_inference_allowed(user),
+            skip_retrieval=bool(rag_info.get("no_retrieval")),
+            live_points=rag_info.get("live_points") or [],
+            series=rag_info.get("series") or [],
+            logs=rag_info.get("logs"),
+            # 证据预算随检索路数增长。单路时等于原来的默认值，所以这里不必
+            # 判断「是不是多轮」——见 _retrieval_evidence_budget。
+            evidence_budget=_retrieval_evidence_budget(
+                selected_mode, len((rag_info.get("plan") or {}).get("queries") or []) or 1
+            ),
+        )
     )
+    # 生成阶段没有中间产物可发，只能发心跳。用 shield 保证超时不会取消任务本身。
+    while True:
+        try:
+            result = await asyncio.wait_for(asyncio.shield(answer_task), timeout=_SSE_HEARTBEAT)
+            break
+        except asyncio.TimeoutError:
+            yield {"heartbeat": True}
     result["rag"] = rag_info
-    return result
+    yield {"result": result}
+
+
+@app.post("/qa/query")
+async def qa_query(
+    req: QARequest,
+    authorization: str | None = Header(default=None),
+    x_hdw_session: str | None = Header(default=None),
+) -> Any:
+    _check_auth(authorization)
+    user = _current_user(x_hdw_session)
+    image_attachments = _validate_image_attachments(req.images)
+    # **服务端强制**。只在前端置灰按钮不算鉴权——接口是公开的，
+    # 任何人都能直接 POST。与在线推理的 403 同一套写法。
+    if image_attachments and not _image_upload_allowed(user):
+        raise HTTPException(
+            status_code=403,
+            detail="当前未开放图片上传，请联系管理员",
+        )
+    question = req.question.strip() or ("请分析这张图片。" if image_attachments else "")
+    if not question:
+        raise HTTPException(status_code=422, detail="question is required unless an image is attached")
+    selected_mode = _resolve_inference_mode(
+        req.inference_mode or _user_default_inference_mode(user)
+    )
+    if selected_mode == "online" and not _online_inference_allowed(user):
+        raise HTTPException(
+            status_code=403,
+            detail="在线推理仅管理员可用，请联系管理员开放在线推理",
+        )
+    # 校验全部留在生成器**外面**：这样 403/422 仍是真实的 HTTP 状态码，
+    # 而不会变成流里的一个错误事件（前端处理前者要简单得多）。
+    pipeline = _qa_pipeline(
+        question=question,
+        user=user,
+        req=req,
+        image_attachments=image_attachments,
+        selected_mode=selected_mode,
+    )
+
+    if not req.stream:
+        async for event in pipeline:
+            if "result" in event:
+                return event["result"]
+        raise HTTPException(status_code=500, detail="pipeline produced no result")
+
+    async def events():
+        try:
+            async for event in pipeline:
+                yield _sse_event(event)
+        except Exception as exc:  # noqa: BLE001
+            # 流已经开始就改不了状态码了，只能把错误当作一个事件发出去。
+            yield _sse_event({"error": f"{type(exc).__name__}: {exc}"})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # 明确告诉 nginx 不要缓冲。不写这条，nginx 会把整段响应攒齐再发，
+            # 那就完全失去了流式的意义（而且长请求照样会被掐）。
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/v1/chat/completions", response_model=None)
@@ -4160,6 +4344,20 @@ def _self_check() -> None:
     _np = _prompt("q", [])
     assert "图片文字" not in _np[-1]["content"], "没有转写时不该出现空的图片块"
     assert "不要把它当作证据引用" not in _np[0]["content"], "没有转写时不该出现那条规则"
+
+    # ── 数字核对 ──
+    # 机械校验，不判语义：只问「这个数在证据里出现过没有」。
+    _ev = "轴承温度>95℃，跳机值130℃，润滑油压0.25MPa"
+    assert _unsupported_numbers("轴承温度95℃，跳机130℃", _ev) == [], "证据里有的不该报"
+    assert _unsupported_numbers("报警值为 999℃", _ev) == ["999"], "证据里没有的要报出来"
+    # 尾零写法要归一化后再比：证据写 95，答案写 95.0 不算无出处
+    assert _unsupported_numbers("轴承温度 95.0℃", _ev) == []
+    # 单个数字（序号、量词）不报——中文行文里全是「1」「2」，报它们只有噪声
+    assert _unsupported_numbers("1. 第一条\n2. 第二条", _ev) == []
+    # 重复出现只报一次
+    assert _unsupported_numbers("999 和 999", _ev) == ["999"]
+    assert _unsupported_numbers("", _ev) == []
+    assert _unsupported_numbers(None, _ev) == []
 
     # ── 检索规划：模型输出 → 查询列表 ──
     # 由模型决定发几路，取代了原来的关键词表 + 正则切分。这里只锁「输出解析」
