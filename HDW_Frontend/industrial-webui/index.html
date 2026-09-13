@@ -1090,6 +1090,42 @@
     }
     .message-text.is-markdown a { color: var(--accent, #1769aa); }
 
+    /* 趋势图卡片。指标行在上、SVG 图在下——读者先看到数字，需要时再看曲线。
+       配色沿用 SmartGasTurbine 的 main.css 变量，两个系统看起来是一套东西。 */
+    .trend-card {
+      margin: 10px 0 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .trend-card-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 6px 14px;
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-soft);
+    }
+    .trend-card-title {
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--ink);
+    }
+    .trend-card-metrics {
+      font-size: 12px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .trend-chart-wrap { padding: 6px 8px 2px; }
+    .trend-chart { display: block; width: 100%; height: auto; }
+    .trend-chart-empty {
+      padding: 14px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
     .message-row.user .message-body {
       max-width: min(650px, calc(100% - 42px));
       padding: 11px 14px;
@@ -3621,6 +3657,7 @@
   <script src="/ball/rings.js"></script>
   <script src="/ball/emotions.js"></script>
   <script src="/lib/markdown.js"></script>
+  <script src="/lib/trend-chart.js"></script>
   <script src="/ball/ball.js"></script>
   <script src="/ball/engine.js"></script>
   <script>
@@ -6339,6 +6376,48 @@
       node.innerHTML = window.HDWMarkdown.render(text);
     }
 
+    // 趋势图卡片。移植自 SmartGasTurbine 的 appendTrendCard：
+    // 上方一行指标（当前/最大/最小/变化量），下方一张内联 SVG。
+    // 数据在回答正文之后追加，不打断文字阅读。
+    function appendTrendCards(container, charts) {
+      if (!Array.isArray(charts) || !charts.length) return;
+      if (typeof window.HDWTrendChart === "undefined") return;
+      charts.forEach((chart) => {
+        const card = document.createElement("div");
+        card.className = "trend-card";
+
+        const head = document.createElement("div");
+        head.className = "trend-card-head";
+        const title = document.createElement("span");
+        title.className = "trend-card-title";
+        title.textContent = (chart.point && chart.point.description) || "趋势";
+        head.appendChild(title);
+
+        const unit = (chart.point && chart.point.unit) || "";
+        const summary = chart.summary || {};
+        const metrics = document.createElement("span");
+        metrics.className = "trend-card-metrics";
+        const items = [
+          ["当前", summary.latest_value],
+          ["最大", summary.max_value],
+          ["最小", summary.min_value],
+          ["变化量", summary.delta_value],
+        ]
+          .filter(([, value]) => value !== null && value !== undefined)
+          .map(([label, value]) => `${label} ${Number(value).toPrecision(6)}${unit}`);
+        metrics.textContent = items.join(" · ");
+        head.appendChild(metrics);
+        card.appendChild(head);
+
+        const wrap = document.createElement("div");
+        wrap.className = "trend-chart-wrap";
+        // 渲染器内部对所有文本做了 SVG 转义，见 lib/trend-chart.js
+        wrap.innerHTML = window.HDWTrendChart.render(chart);
+        card.appendChild(wrap);
+        container.appendChild(card);
+      });
+    }
+
     function setPendingText(message, text, compressing = false) {
       message.content.textContent = text;
       message.content.classList.toggle("context-compressing", compressing);
@@ -6455,7 +6534,8 @@
         badge.textContent = "AI";
       }
       scrollMessagesToBottom();
-      return { row, content, ball: ballRecord?.ball || null, ballRecord };
+      // 带上 body：回答里的趋势图卡片要挂在它下面，而不是塞进文字段落里
+      return { row, body, content, ball: ballRecord?.ball || null, ballRecord };
     }
 
     function scrollMessagesToBottom() {
@@ -6625,6 +6705,7 @@
         const livePoints = data.rag?.live_points || [];
         const emotionId = chooseAnswerEmotion(text, answer, citations, graphContext);
         setMessageText(pending.content, answer, "assistant");
+        appendTrendCards(pending.body || pending.content.parentElement, (data.rag && data.rag.charts) || []);
         if (data.llm?.vision) {
           const route = data.llm.vision_fallback
             ? `${data.llm.requested_mode === "offline" ? "本地文字" : "在线文字"} + 视觉回退`

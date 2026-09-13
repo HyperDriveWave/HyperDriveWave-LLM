@@ -770,9 +770,9 @@ _DRIFT_REL_PERCENT = float(os.getenv("HDW_DRIFT_REL_PERCENT", "5.0"))
 _DRIFT_SIGMA = float(os.getenv("HDW_DRIFT_SIGMA", "2.0"))
 # 当前值对比取多长时间的历史做基准
 _DRIFT_WINDOW_MINUTES = int(os.getenv("HDW_DRIFT_WINDOW_MINUTES", "60"))
-# 曲线图输出尺寸与 DPI（前端按宽度自适应，这里只定比例）
-_CHART_FIGSIZE = (7.2, 2.6)
-_CHART_DPI = 130
+# 前端内联 SVG 图的点数上限。原始采样可达上万点，SVG 画不完也不需要。
+# 极值点与斜率变号点在降采样**之前**算出并单独保留，不受此上限影响。
+_CHART_MAX_POINTS = int(os.getenv("HDW_CHART_MAX_POINTS", "320"))
 # SIS 返回的是 UTC；现场看的是本地时间，统一按 UTC+8 展示且不带时区后缀
 _LIVE_TIME_OFFSET_HOURS = float(os.getenv("HDW_LIVE_TIME_OFFSET_HOURS", "8"))
 
@@ -843,101 +843,86 @@ def _local_today() -> date:
     return (datetime.now(timezone.utc) + timedelta(hours=_LIVE_TIME_OFFSET_HOURS)).date()
 
 
-def _render_trend_png(item: dict[str, Any], features: dict[str, Any]) -> str:
-    """把趋势渲染成 PNG，返回 base64。失败返回空串——**出图失败不能影响回答**。
+def _fit_series(points: list[tuple[float, float]]) -> list[dict[str, Any]]:
+    """对采样序列做最小二乘直线拟合，返回拟合曲线的**首尾两点**。
 
-    样式对齐 SmartGasTurbine 前端（echarts 配置）：
-      · 折线 smooth、不显示数据点标记（点数多时标记会糊成一片）
-      · 只保留左/下轴线，去掉上/右框
-      · 网格浅色虚线
-    配色取它 `styles/main.css` 的变量：主色 #1769aa、警示 #b54708、危险 #b42318。
+    直线由两点即可完全确定，返回上百个共线点只会让 SVG 路径白白多出上万字符。
+    拟合值**只用于画那条虚线**，不作为事实下发给模型——模型引用数值时必须用真实采样值。
     """
-    try:
-        import base64
-        import io
+    if len(points) < 3:
+        return []
+    base = points[0][0]
+    xs = [moment - base for moment, _ in points]
+    ys = [value for _, value in points]
+    n = len(xs)
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+    den = sum((x - mean_x) ** 2 for x in xs)
+    if den <= 0:
+        return []
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / den
+    intercept = mean_y - slope * mean_x
+    return [
+        {
+            "time": datetime.fromtimestamp(moment, tz=timezone.utc).isoformat(),
+            "value": intercept + slope * (moment - base),
+        }
+        for moment, _ in (points[0], points[-1])
+    ]
 
-        import matplotlib
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+def _special_points(points: list[tuple[float, float]]) -> list[dict[str, Any]]:
+    """标出值得在图上看到的点：极值、最新值、斜率变号点。
 
-        # 中文字体：镜像里装了 fonts-noto-cjk。缺字体时图上中文会变方框，
-        # 这时退化成不写中文，也不至于出一张看不懂的图。
-        from matplotlib import font_manager
+    照 SmartGasTurbine 的 `_build_trend_special_points`：
+      · value 一律取**真实采样值**，不是拟合值——模型要引用的是实测数字
+      · 斜率变号点按变化强度排序取前若干个，弱的抖动不值得标
+      · 任一侧斜率为 0 说明是平段，**平段边界不叫「变号」**，要跳过
+    """
+    if len(points) < 2:
+        return []
+    ys = [value for _, value in points]
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
 
-        available = {f.name for f in font_manager.fontManager.ttflist}
-        cjk = next(
-            (n for n in ("Noto Sans CJK SC", "Noto Sans CJK JP", "WenQuanYi Zen Hei") if n in available),
-            None,
+    def add(index: int, point_type: str, detail: str) -> None:
+        index = max(0, min(len(points) - 1, index))
+        if (point_type, index) in seen:
+            return
+        seen.add((point_type, index))
+        moment, value = points[index]
+        output.append(
+            {
+                "time": datetime.fromtimestamp(moment, tz=timezone.utc).isoformat(),
+                "value": value,
+                "type": point_type,
+                "detail": detail,
+            }
         )
-        if cjk:
-            plt.rcParams["font.sans-serif"] = [cjk, "DejaVu Sans"]
-        plt.rcParams["axes.unicode_minus"] = False
 
-        samples = item.get("samples") or []
-        points = []
-        for sample in samples:
-            value = sample.get("value")
-            if value is None:
-                continue
-            try:
-                moment = datetime.fromisoformat(str(sample.get("time", "")).replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=timezone.utc)
-            points.append(
-                (moment.astimezone(timezone(timedelta(hours=_LIVE_TIME_OFFSET_HOURS))), float(value))
-            )
-        if len(points) < 2:
-            return ""
+    add(min(range(len(ys)), key=lambda i: ys[i]), "global_min", "窗口内真实采样最小值")
+    add(max(range(len(ys)), key=lambda i: ys[i]), "global_max", "窗口内真实采样最大值")
+    add(len(points) - 1, "latest", "窗口内最新采样值")
 
-        xs = [moment for moment, _ in points]
-        ys = [value for _, value in points]
-        unit = str(item.get("unit") or "")
-        title = str(item.get("description") or item.get("query") or "")
+    slopes: list[float] = []
+    for index in range(1, len(points)):
+        dx = points[index][0] - points[index - 1][0]
+        slopes.append(0.0 if abs(dx) < 1e-12 else (points[index][1] - points[index - 1][1]) / dx)
 
-        fig, ax = plt.subplots(figsize=_CHART_FIGSIZE, dpi=_CHART_DPI)
-        ax.plot(xs, ys, color="#1769aa", linewidth=1.4, solid_capstyle="round")
-        ax.set_facecolor("#ffffff")
-        fig.patch.set_facecolor("#ffffff")
-
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        for side in ("left", "bottom"):
-            ax.spines[side].set_color("#d7dde5")
-            ax.spines[side].set_linewidth(0.8)
-        ax.grid(True, color="#eef1f5", linewidth=0.7, linestyle="--")
-        ax.tick_params(colors="#667085", labelsize=8, length=3, width=0.8)
-
-        # 极值点单独标注：图上最该被一眼看到的就是「最低/最高出现在哪」
-        if ys:
-            for idx, color, label in (
-                (ys.index(min(ys)), "#b54708", "min"),
-                (ys.index(max(ys)), "#b42318", "max"),
-            ):
-                ax.scatter([xs[idx]], [ys[idx]], s=16, color=color, zorder=3)
-                ax.annotate(
-                    f"{ys[idx]:.6g}",
-                    (xs[idx], ys[idx]),
-                    textcoords="offset points",
-                    xytext=(0, 6 if label == "max" else -12),
-                    ha="center",
-                    fontsize=7.5,
-                    color=color,
-                )
-
-        ax.set_ylabel(f"{title} / {unit}" if unit else title, fontsize=8.5, color="#17202a")
-        fig.autofmt_xdate(rotation=0, ha="center")
-        fig.tight_layout(pad=0.6)
-
-        buffer = io.BytesIO()
-        fig.savefig(buffer, format="png", bbox_inches="tight", facecolor="#ffffff")
-        plt.close(fig)
-        return base64.b64encode(buffer.getvalue()).decode("ascii")
-    except Exception:
-        # 出图是锦上添花，任何异常都不该让整条问答失败
-        return ""
+    candidates: list[tuple[float, int, float, float]] = []
+    for index in range(1, len(slopes)):
+        previous, current = slopes[index - 1], slopes[index]
+        if abs(previous) < 1e-12 or abs(current) < 1e-12:
+            continue
+        if previous * current < 0:
+            candidates.append((abs(current - previous), index, previous, current))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for _, index, previous, current in candidates[:6]:
+        add(
+            index,
+            "slope_sign_change",
+            f"相邻采样斜率变号，前段 {previous * 60.0:+.6g}/min，后段 {current * 60.0:+.6g}/min",
+        )
+    return output
 
 
 def _percentile(values: list[float], ratio: float) -> float:
@@ -1345,11 +1330,38 @@ def _empty_capabilities() -> dict[str, Any]:
     return {"needs_rag": True, "points": [], "history": None, "trend": None, "logs": None}
 
 
+# 规划器调用实测约 2~12% 的概率失败（LLM 侧偶发 HTTP 400 空响应体）。
+# **必须重试**，因为失败的后果不是「答得糙一点」，而是把「能答」变成「答不了」：
+# 兜底计划不取任何实时数据，用户问「轴封供气压力的趋势」，模型只能回
+# 「缺少实时数据」——而数据明明在。LLM 客户端内部已重试过一次，
+# 那一次是紧挨着重放的；这里隔开再试，覆盖的是稍纵即逝的那类抖动。
+_PLANNER_ATTEMPTS = 2
+
+# 问题里出现这些词，说明用户要的是「某测点的数据」。
+# 只在**规划结果一项实时数据都没要**时用它判断是否重试——正常解析出「无」
+# 的计划（例如「轴封系统的作用」）不会命中这些词，不会白白多调一次。
+_REALTIME_CUES = (
+    "趋势", "走势", "曲线", "变化", "历史", "当前", "现在", "此刻", "目前",
+    "多少", "数值", "读数", "参数是", "日志", "记录", "一直", "最近", "这几天",
+    "涨", "跌", "上升", "下降",
+)
+
+
+def _wants_realtime(question: str) -> bool:
+    return any(cue in question for cue in _REALTIME_CUES)
+
+
+def _plan_has_realtime(plan: dict[str, Any]) -> bool:
+    return bool(plan.get("points") or plan.get("history") or plan.get("trend") or plan.get("logs"))
+
+
 async def _plan_retrieval(question: str, mode: Literal["online", "offline"]) -> dict[str, Any]:
     """一次调用同时决定「要不要查文档」和「要取哪些实时数据」，判断发生在检索之前。
 
     极小调用：无证据、只出五行，实测约 200-400ms。
-    任何异常或无法解析都退回保守默认：照常检索、不取实时数据。
+    失败时重试一次；仍失败才退回保守默认（照常检索、不取实时数据），
+    并在返回值里带上 `degraded` 说明原因——静默退化会让下游把「取数失败」
+    当成「没有数据」来讲。
     """
     if not _ROUTER_ENABLED:
         return _empty_capabilities()
@@ -1358,24 +1370,34 @@ async def _plan_retrieval(question: str, mode: Literal["online", "offline"]) -> 
         today=today.isoformat(),
         yesterday=(today - timedelta(days=1)).isoformat(),
     )
-    try:
-        _, client = _llm_client(mode)
-        result = await client.complete(
-            [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": question},
-            ],
-            # 从两行扩到五行后 32 个令牌不够，会出现「日志: 」被截断的半行。
-            # 五行实测约 40-60 个令牌，留一倍余量。
-            max_tokens=160,
-            temperature=0.0,
-            chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
-        )
-    except Exception:
-        return _empty_capabilities()
-    plan = _parse_plan(result.content)
-    if plan["needs_rag"] is None:
-        plan["needs_rag"] = True
+    failure: str | None = None
+    for attempt in range(1, _PLANNER_ATTEMPTS + 1):
+        try:
+            _, client = _llm_client(mode)
+            result = await client.complete(
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": question},
+                ],
+                # 从两行扩到五行后 32 个令牌不够，会出现「日志: 」被截断的半行。
+                # 五行实测约 40-60 个令牌，留一倍余量。
+                max_tokens=160,
+                temperature=0.0,
+                chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
+            )
+        except Exception as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+            continue
+        plan = _parse_plan(result.content)
+        if plan["needs_rag"] is None:
+            plan["needs_rag"] = True
+        # 解析成功但一项实时数据都没要，而问题明显在问数据——也当这次没问对，再试。
+        # 最后一次不再重试，直接采用（它是模型真实的判断，只是不合预期）。
+        if _plan_has_realtime(plan) or not _wants_realtime(question) or attempt == _PLANNER_ATTEMPTS:
+            return plan
+        failure = "规划结果未包含任何实时数据项"
+    plan = _empty_capabilities()
+    plan["degraded"] = failure or "未知原因"
     return plan
 
 
@@ -1721,6 +1743,79 @@ async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
     }, None
 
 
+def _build_chart(item: dict[str, Any], sig: dict[str, Any]) -> dict[str, Any] | None:
+    """组装前端绘图所需的结构。
+
+    结构对齐 SmartGasTurbine 的 metadata.charts：
+      · series          降采样后的真实采样点（画实线）
+      · fit_series      最小二乘拟合曲线（画虚线）——**仅供视觉参考**
+      · special_points  极值点与斜率变号点（画圆点/菱形）
+      · summary/point   卡片上的指标
+
+    序列降采样到 _CHART_MAX_POINTS：原始点可达上万，前端 SVG 画不完也不必画。
+    极值点与变号点**在降采样前**算出并保留，它们是这张图最该被看到的东西。
+    """
+    samples = item.get("samples") or []
+    points: list[tuple[float, float]] = []
+    for sample in samples:
+        value = sample.get("value")
+        if value is None:
+            continue
+        try:
+            moment = datetime.fromisoformat(str(sample.get("time", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        points.append((moment.timestamp(), float(value)))
+    if len(points) < 2:
+        return None
+
+    special = _special_points(points)
+    fit = _fit_series(points)
+
+    step = max(1, len(points) // _CHART_MAX_POINTS)
+
+    def to_iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    # 显著性档位决定「这张图给到什么程度」（阈值见 _series_significance）：
+    #   level 2（≥3%）   曲线 + 拟合线 + 关键点。关键点才是这张图值得看的地方。
+    #   level 1（1~3%）  曲线 + 拟合线，**不给关键点**——低位波动里的「极值/变号」
+    #                    多是采集噪声，标出来等于在图上替用户断言一件没发生的事。
+    #   level 0（<1%）   只给曲线。拟合线也是一种「趋势」断言，整段没有趋势时
+    #                    画一条斜线会误导人读出根本不存在的走势。
+    #   level -1（判不了）按 level 2 处理：判不了时保守给全，宁可多报。
+    # 注意裁剪的只是**图元**。喂给模型的材料由 _prompt 单独按 level 裁，两者
+    # 口径一致但互相独立——人看到的和模型看到的本来就不必相同。
+    level = sig.get("level")
+    show_fit = level != 0
+    show_special = level not in (0, 1)
+
+    return {
+        "kind": item.get("kind") or "history",
+        "point": {
+            "kks": item.get("kks") or "",
+            "description": item.get("description") or item.get("query") or "",
+            "unit": item.get("unit") or "",
+        },
+        "series": [{"time": to_iso(ms), "value": val} for ms, val in points[::step]],
+        "fit_series": fit if show_fit else [],
+        "special_points": special if show_special else [],
+        # 指标直接从点算。**不要从 sig 取**——`_series_significance` 返回的是
+        # 分位数与显著性判据，没有 min/max/delta，取了就是三个 None。
+        "summary": {
+            "latest_value": points[-1][1],
+            "min_value": min(value for _, value in points),
+            "max_value": max(value for _, value in points),
+            "delta_value": points[-1][1] - points[0][1],
+            "samples": len(points),
+            "level": sig.get("level"),
+            "discrete": sig.get("discrete"),
+        },
+    }
+
+
 async def _current_drift(point: dict[str, Any], mode: str = "offline") -> dict[str, Any] | None:
     """当前值与近期均值的对比。**宁可少报**：两个判据都超标才提示偏离。
 
@@ -1802,7 +1897,7 @@ async def _fetch_realtime(
     if plan.get("logs"):
         tasks["logs"] = _fetch_logs(plan["logs"])
 
-    result: dict[str, Any] = {"live_points": [], "series": [], "logs": None}
+    result: dict[str, Any] = {"live_points": [], "series": [], "logs": None, "charts": []}
     errors: list[str] = []
     if not tasks:
         return result, errors
@@ -1833,12 +1928,18 @@ async def _fetch_realtime(
                 if name == "logs":
                     result["logs"] = item
                 else:
-                    # 出图放在取数之后、注入之前。失败不影响任何环节——
-                    # 图是锦上添花，数据才是主体。
+                    # 组装图表对象供前端内联绘制 SVG。
+                    # **不出 PNG**：矢量图能自适应宽度、可交互，且不必把
+                    # base64 图片塞进 JSON（一张 53KB 的图会让响应体大一个量级）。
+                    # SmartGasTurbine 也是这个做法（见其 llm_inference.html 的
+                    # renderTrendChartSvg）。
                     _vals = [s.get("value") for s in (item.get("samples") or []) if s.get("value") is not None]
                     _sig = _series_significance(_vals, item.get("limits"))
-                    # level 0（<1%）连图都不给：整段无变化时，图只会让模型去找细节
-                    item["chart_png"] = "" if _sig.get("level") == 0 else _render_trend_png(item, {})
+                    chart = _build_chart(item, _sig)
+                    # 低波动也要出图——图是给人看的，人有权看到真实曲线；
+                    # 「别去解读」是靠裁掉图元与提示词材料实现的，不是靠不给图。
+                    if chart:
+                        result["charts"].append(chart)
                     result["series"].append(item)
     return result, errors
 
@@ -1868,7 +1969,7 @@ async def _retrieve_planned(
             "rounds": [],
             "deduplicated_count": 0,
             "no_retrieval": True,
-            "live_errors": rt_errors,
+            "live_errors": _live_errors(intent, rt_errors),
             **realtime,
         }
     plan, planning_error = await _plan_rag(question, mode, top_k)
@@ -1881,7 +1982,7 @@ async def _retrieve_planned(
             "rounds": [],
             "deduplicated_count": 0,
             "no_retrieval": True,
-            "live_errors": rt_errors,
+            "live_errors": _live_errors(intent, rt_errors),
             **realtime,
         }
 
@@ -1922,7 +2023,7 @@ async def _retrieve_planned(
         "plan": plan,
         "rounds": round_infos,
         "deduplicated_count": len(contexts),
-        "live_errors": rt_errors,
+        "live_errors": _live_errors(intent, rt_errors),
         **realtime,
     }
     if planning_error:
@@ -1937,6 +2038,17 @@ def _retrieval_score(item: dict[str, Any]) -> float:
         return float(item.get("score", float("-inf")))
     except (TypeError, ValueError):
         return float("-inf")
+
+
+def _live_errors(intent: dict[str, Any], rt_errors: list[str]) -> list[str]:
+    """把规划器降级的原因并进实时数据错误里。
+
+    降级时「没有实时数据」和「取数失败」在下游长得一样，但应对方式完全不同：
+    前者要换个问法，后者重试一次可能就好了。不点明的话，用户只会看到一句
+    「缺少实时数据」——听上去像数据本来就不存在。
+    """
+    degraded = intent.get("degraded")
+    return ([f"规划器降级（本次未取实时数据）：{degraded}"] if degraded else []) + list(rt_errors)
 
 
 def _needs_cross_mode_compression(
@@ -3415,6 +3527,21 @@ def _self_check() -> None:
     _p = _parse_plan("检索: yes\n测点: 闭式冷却水泵、凝结水压力")
     assert _p["points"] == ["闭式冷却水泵", "凝结水压力"]
     assert _parse_plan("检索: yes\n测点: a、b、c、d")["points"] == ["a", "b", "c"]  # 上限 3 个
+
+    # 规划器失败重试的判据。真实故障：LLM 侧偶发 HTTP 400 空响应体，被
+    # `except Exception` 吞成默认计划——不取实时数据，用户问趋势却得到
+    # 「缺少实时数据」。重试要能识别「这次结果不像话」。
+    assert _wants_realtime("轴封供气压力最近的趋势怎么样？"), "「趋势」是数据类提问"
+    assert _wants_realtime("主蒸汽温度现在多少"), "「现在/多少」是数据类提问"
+    assert not _wants_realtime("轴封系统的作用"), "问原理不该触发重试，否则白调一次模型"
+    assert not _wants_realtime("轴封系统投运前要检查什么")
+    assert _plan_has_realtime({"trend": {"keyword": "x"}})
+    assert _plan_has_realtime({"points": ["x"]})
+    assert not _plan_has_realtime({"points": [], "history": None, "trend": None, "logs": None})
+    # 降级原因要能从 plan 传到 live_errors，否则「取数失败」会被讲成「没有数据」
+    assert _live_errors({"degraded": "boom"}, []) == ["规划器降级（本次未取实时数据）：boom"]
+    assert _live_errors({}, ["a"]) == ["a"]
+    assert _live_errors({}, []) == []
     assert _parse_plan("检索：否\n测点：None")["points"] == []
     _p = _parse_plan("随便说点什么")
     assert _p["needs_rag"] is None and _p["points"] == []
@@ -3543,6 +3670,39 @@ def _self_check() -> None:
     # 样本不足时不判级别（-1），避免拿两三个点下结论
     assert _series_significance([1.0, 2.0])["level"] == -1
     assert not _series_significance([])["comparable"]
+
+    # 图表：指标必须从点算，且直线拟合只需两个端点
+    # （踩过：读了 _series_significance 的键，那里没有 min/max/delta，结果是三个 None）
+    _pts = [(1000.0 + i * 60, float(i)) for i in range(50)]
+    _ch = _build_chart({"samples": [{"time": datetime.fromtimestamp(m, tz=timezone.utc).isoformat(), "value": v} for m, v in _pts],
+                        "kind": "trend", "kks": "K", "description": "D", "unit": "U"}, _series_significance([v for _, v in _pts]))
+    assert _ch["summary"]["min_value"] == 0.0, _ch["summary"]
+    assert _ch["summary"]["max_value"] == 49.0, _ch["summary"]
+    assert _ch["summary"]["delta_value"] == 49.0, _ch["summary"]
+    assert _ch["summary"]["latest_value"] == 49.0, _ch["summary"]
+    assert len(_ch["fit_series"]) == 2, "直线拟合只需首尾两点"
+    assert _ch["special_points"], "极值点必须被标出"
+
+    # 图元随显著性档位裁剪：低波动依然出图（人有权看到真实曲线），
+    # 但裁掉一切「趋势断言」——拟合线与关键点都是断言，图还在，结论不替人下。
+    def _chart_of(spread_step: float) -> dict[str, Any]:
+        seq = [(1000.0 + i * 60, 100.0 + (i % 5) * spread_step) for i in range(60)]
+        return _build_chart(
+            {"samples": [{"time": datetime.fromtimestamp(m, tz=timezone.utc).isoformat(), "value": v} for m, v in seq],
+             "kind": "trend", "kks": "K", "description": "D", "unit": "U"},
+            _series_significance([v for _, v in seq]),
+        )
+
+    _ch0 = _chart_of(0.2)          # 占读数约 0.8% → level 0
+    assert _series_significance([v for _, v in [(0.0, 100.0 + (i % 5) * 0.2) for i in range(60)]])["level"] == 0
+    assert _ch0["series"], "最低档也要出图——不给图等于把人挡在真实数据外面"
+    assert _ch0["fit_series"] == [], "最低档不给拟合线：整段没趋势时画斜线会误导人读出走势"
+    assert _ch0["special_points"] == [], "最低档不给关键点"
+
+    _ch1 = _chart_of(0.5)          # 占读数约 2.0% → level 1
+    assert _series_significance([v for _, v in [(0.0, 100.0 + (i % 5) * 0.5) for i in range(60)]])["level"] == 1
+    assert _ch1["fit_series"], "中档仍给拟合线"
+    assert _ch1["special_points"] == [], "中档不给关键点"
 
     # 极值与变化量
     _f = _series_features(_mk([1.0, 5.0, 2.0, 9.0, 3.0]))

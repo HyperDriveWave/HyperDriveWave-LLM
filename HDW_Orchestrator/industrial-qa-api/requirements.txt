@@ -3,6 +3,6 @@ uvicorn[standard]>=0.30
 pydantic>=2
 httpx>=0.27
 
-# 趋势曲线出图（后端渲染 PNG）。体积约 +50MB；
-# **必须配中文字体**，否则图上中文全是方框——见 Dockerfile 的 fonts-noto-cjk。
-matplotlib>=3.9
+# 趋势图不在后端出图：前端用内联 SVG 绘制（见 industrial-webui/lib/trend-chart.js）。
+# 这样矢量自适应、可交互，也不必把 base64 图片塞进 JSON——
+# 一张 PNG 会让响应体大一个量级（实测 71KB vs SVG 5KB）。
