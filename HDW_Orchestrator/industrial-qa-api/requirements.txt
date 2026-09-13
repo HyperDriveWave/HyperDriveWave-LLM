@@ -3,3 +3,6 @@ uvicorn[standard]>=0.30
 pydantic>=2
 httpx>=0.27
 
+# 趋势曲线出图（后端渲染 PNG）。体积约 +50MB；
+# **必须配中文字体**，否则图上中文全是方框——见 Dockerfile 的 fonts-noto-cjk。
+matplotlib>=3.9

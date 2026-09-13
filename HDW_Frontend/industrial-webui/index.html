@@ -1012,6 +1012,84 @@
       line-height: 1.75;
     }
 
+    /* Markdown 渲染后的元素。回答改走 innerHTML 渲染，浏览器会按标准
+       排版规则处理：段落间不再保留源码里的空行，标题/列表也不再是裸文本。
+       所以这里必须补一套紧凑的样式，否则渲染结果比纯文本还难读。 */
+    .message-text.is-markdown {
+      white-space: normal;
+    }
+    .message-text.is-markdown > *:first-child { margin-top: 0; }
+    .message-text.is-markdown > *:last-child { margin-bottom: 0; }
+    .message-text.is-markdown p { margin: 0 0 10px; }
+    .message-text.is-markdown h1,
+    .message-text.is-markdown h2,
+    .message-text.is-markdown h3,
+    .message-text.is-markdown h4 {
+      margin: 16px 0 8px;
+      line-height: 1.45;
+      font-weight: 600;
+    }
+    .message-text.is-markdown h1 { font-size: 17px; }
+    .message-text.is-markdown h2 { font-size: 15.5px; }
+    .message-text.is-markdown h3 { font-size: 14.5px; }
+    .message-text.is-markdown h4 { font-size: 13.5px; }
+    .message-text.is-markdown ul,
+    .message-text.is-markdown ol { margin: 0 0 10px; padding-left: 22px; }
+    .message-text.is-markdown li { margin: 3px 0; }
+    .message-text.is-markdown li > ul,
+    .message-text.is-markdown li > ol { margin: 3px 0 0; }
+    .message-text.is-markdown strong { font-weight: 600; }
+    .message-text.is-markdown code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      font-size: 0.92em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .message-text.is-markdown pre {
+      margin: 0 0 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      overflow-x: auto;
+    }
+    .message-text.is-markdown pre code {
+      padding: 0;
+      border: 0;
+      background: none;
+      white-space: pre;
+    }
+    .message-text.is-markdown blockquote {
+      margin: 0 0 10px;
+      padding: 2px 0 2px 12px;
+      border-left: 3px solid var(--line-strong, var(--line));
+      color: var(--muted);
+    }
+    .message-text.is-markdown hr {
+      margin: 14px 0;
+      border: 0;
+      border-top: 1px solid var(--line);
+    }
+    .message-text.is-markdown table {
+      margin: 0 0 10px;
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.94em;
+    }
+    .message-text.is-markdown th,
+    .message-text.is-markdown td {
+      padding: 5px 9px;
+      border: 1px solid var(--line);
+      text-align: left;
+    }
+    .message-text.is-markdown th {
+      background: var(--surface-soft);
+      font-weight: 600;
+    }
+    .message-text.is-markdown a { color: var(--accent, #1769aa); }
+
     .message-row.user .message-body {
       max-width: min(650px, calc(100% - 42px));
       padding: 11px 14px;
@@ -3542,6 +3620,7 @@
 
   <script src="/ball/rings.js"></script>
   <script src="/ball/emotions.js"></script>
+  <script src="/lib/markdown.js"></script>
   <script src="/ball/ball.js"></script>
   <script src="/ball/engine.js"></script>
   <script>
@@ -6243,6 +6322,23 @@
       return usage.tokens >= usage.limit * 0.75;
     }
 
+    // 助手回答走 Markdown 渲染；用户提问、思考提示、错误提示保持纯文本。
+    // 渲染器的安全前提见 lib/markdown.js：**先把全部 HTML 转义再套 Markdown 规则**，
+    // 所以赋给 innerHTML 的内容只含我们自己生成的标签，无需额外 sanitizer。
+    function setMessageText(node, text, role) {
+      const wantsMarkdown =
+        role !== "user" &&
+        !node.classList.contains("thinking-text") &&
+        typeof window.HDWMarkdown !== "undefined";
+      if (!wantsMarkdown) {
+        node.classList.remove("is-markdown");
+        node.textContent = text;
+        return;
+      }
+      node.classList.add("is-markdown");
+      node.innerHTML = window.HDWMarkdown.render(text);
+    }
+
     function setPendingText(message, text, compressing = false) {
       message.content.textContent = text;
       message.content.classList.toggle("context-compressing", compressing);
@@ -6329,10 +6425,12 @@
       const label = document.createElement("div");
       label.className = "message-label";
       label.textContent = role === "user" ? "你的问题" : "HyperDriveWave";
-      const content = document.createElement("p");
+      // 用 div 而非 p：Markdown 渲染后会产出 <ul>/<h1>/<table> 等块级元素，
+      // 塞进 <p> 里属于非法嵌套，浏览器会提前闭合，结构散架。
+      const content = document.createElement("div");
       content.className = "message-text";
       if (pending) content.classList.add("thinking-text");
-      content.textContent = text;
+      setMessageText(content, text, role);
 
       body.append(label, content);
       if (imageAttachments.length) {
@@ -6526,7 +6624,7 @@
         const graphContext = data.graph_context || [];
         const livePoints = data.rag?.live_points || [];
         const emotionId = chooseAnswerEmotion(text, answer, citations, graphContext);
-        pending.content.textContent = answer;
+        setMessageText(pending.content, answer, "assistant");
         if (data.llm?.vision) {
           const route = data.llm.vision_fallback
             ? `${data.llm.requested_mode === "offline" ? "本地文字" : "在线文字"} + 视觉回退`
@@ -6571,6 +6669,7 @@
       } catch (error) {
         stopThinking(pending);
         const answer = `请求失败：${error.message}`;
+        // 错误信息是任意字符串，可能含反引号或星号，必须保持纯文本
         pending.content.textContent = answer;
         setMessageEmotion(pending, "34", "回答失败");
         showNotice(answer);

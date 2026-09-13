@@ -85,7 +85,7 @@ def _tokenize(text: str) -> List[str]:
 
 class RTSPQueryService:
     def __init__(self, probe_timeout_seconds: float = 0.8) -> None:
-        configured_timeout = os.environ.get("SMARTGASTURBINE_RTSP_MCP_PROBE_TIMEOUT_SECONDS", "")
+        configured_timeout = os.environ.get("HDW_RTSP_MCP_PROBE_TIMEOUT_SECONDS", "")
         try:
             timeout_value = float(configured_timeout) if configured_timeout else float(probe_timeout_seconds or 0.8)
         except (TypeError, ValueError):
@@ -190,7 +190,7 @@ class RTSPQueryService:
         try:
             max_probes = max(
                 1,
-                min(100, int(os.environ.get("SMARTGASTURBINE_RTSP_MCP_MAX_PROBES", "20") or "20")),
+                min(100, int(os.environ.get("HDW_RTSP_MCP_MAX_PROBES", "20") or "20")),
             )
         except (TypeError, ValueError):
             max_probes = 20

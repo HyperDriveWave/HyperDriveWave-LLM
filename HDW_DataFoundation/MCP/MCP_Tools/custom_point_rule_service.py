@@ -111,7 +111,7 @@ def tokenize(text: str) -> List[str]:
 
 class CustomPointRuleService:
     def __init__(self) -> None:
-        module = load_module("smartgasturbine_mcp_sis_custom_alarm_service", SIS_CUSTOM_ALARM_PATH)
+        module = load_module("hdw_mcp_sis_custom_alarm_service", SIS_CUSTOM_ALARM_PATH)
         self.sis_rule_service = module.SISCustomPointAlarmService()
         self.point_query_service = PointQueryService()
         self.thermal_query_service = ThermalQueryService()

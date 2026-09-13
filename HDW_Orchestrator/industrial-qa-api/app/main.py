@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -663,26 +663,116 @@ async def _mcp_call_tool(name: str, arguments: dict[str, Any]) -> Any:
 
 
 _PLANNER_PROMPT = (
-    "你是检索规划器。针对用户问题输出两行，不要解释、不要多余文字：\n"
+    "你是检索规划器。今天是 {today}（北京时间）。\n"
+    "针对用户问题输出五行，不要解释、不要多余文字。用不到的写「无」：\n"
     "检索: yes 或 no   —— 是否需要查工业文档知识库（规程、参数、故障、操作、标准）\n"
-    "测点: <定位实时测点的关键词> 或 无   —— 是否需要读实时测点数值\n"
-    # 关键词必须短：测点表的命名和用户的说法常对不上（表里叫「凝汽器液位」，
-    # 用户说「凝汽器水位」），而且带机组号之类的修饰语会让测点检索的排序跑偏。
-    "测点关键词要短（2-6 个字），只描述物理量本身，不要带机组号、设备全称或修饰语。\n"
-    "多个测点用、分隔，最多 3 个。\n"
+    "测点: <关键词>[、<关键词>] 或 无   —— 是否需要读测点**当前值**\n"
+    "历史: <关键词>|<起始日期>|<结束日期> 或 无   —— 是否需要测点**历史序列**\n"
+    "趋势: <关键词>|<起始日期>|<结束日期>|<采样间隔秒> 或 无   —— 是否需要测点**变化趋势**\n"
+    "日志: <起始日期>|<结束日期>[|重大] 或 无   —— 是否需要查**运行日志**\n"
+    "\n"
+    "判断依据（按语意，不要按关键词硬匹配）：\n"
+    "· 「现在多少」「当前值」→ 测点；「昨天/过去三天/这段时间的变化」→ 历史；\n"
+    "  「趋势」「走势」「一直涨吗」「画个曲线」→ 趋势；\n"
+    "  「有什么操作」「值班日志」「重大事件」「交接班记录」→ 日志。\n"
+    "· 一个问句可以同时命中多项（例如「看看汽包水位的趋势，再结合规程说说」）。\n"
+    "· 只要当前值就不要填历史或趋势，它们会各自触发一次数据查询。\n"
+    "· 日期一律写成 YYYY-MM-DD，相对时间按上面的今天换算；不确定结束日期就用今天。\n"
+    "· 趋势的采样间隔按问题的时间跨度选：一天用 300，三天用 900，一周用 1800。\n"
+    "· 日志只在对方明确问运行记录时填；问规程、原理、参数含义时填「无」。\n"
+    "· 只说「重大」「重要」时在日志第三段写「重大」。\n"
+    # 关键词要短，但**不能丢掉区分性限定词**。
+    # 踩过的坑：早先写的是「只描述物理量本身，不要带修饰语」，模型据此把
+    # 「轴封供气压力」简化成「轴封压力」——而「供气」不是修饰语，是区分
+    # 「轴封供气压力」和「低压轴封压力」两个不同测点的关键。简化后检索
+    # 只匹配到后者，而且是唯一命中，相关性判定也拦不住。
+    "· 测点关键词控制在 2-8 个字：去掉机组号（一号机／#1）和设备全称，\n"
+    "  但**必须保留区分性限定词**——「供气／供汽」「高压／低压」「A 侧／B 侧」\n"
+    "  「给水／凝结水」「进口／出口」这类词决定了是哪一个测点，去掉就串号了。\n"
+    "· 测点最多 3 个，其余各项最多 1 个。\n"
     "示例：\n"
     "  问：一号机凝汽器水位多少，然后结合知识库回答\n"
     "  检索: yes\n"
     "  测点: 凝汽器液位\n"
+    "  历史: 无\n"
+    "  趋势: 无\n"
+    "  日志: 无\n"
     "  问：轴封系统的作用\n"
     "  检索: yes\n"
     "  测点: 无\n"
+    "  历史: 无\n"
+    "  趋势: 无\n"
+    "  日志: 无\n"
+    "  问：看看今天汽包水位的趋势，结合规程说说有没有问题\n"
+    "  检索: yes\n"
+    "  测点: 无\n"
+    "  历史: 无\n"
+    "  趋势: 汽包水位|{today}|{today}|300\n"
+    "  日志: 无\n"
+    "  问：昨天有什么重大操作吗\n"
+    "  检索: no\n"
+    "  测点: 无\n"
+    "  历史: 无\n"
+    "  趋势: 无\n"
+    "  日志: {yesterday}|{yesterday}|重大\n"
 )
 # 规划开关：模型判错时可不重建镜像直接关掉，退回「一律检索、不读测点」
 _ROUTER_ENABLED = os.getenv("HDW_RETRIEVAL_ROUTER", "true").lower() != "false"
 _LIVE_POINTS_MAX = int(os.getenv("HDW_LIVE_POINTS_MAX", "3"))
 # 关键词匹配偏了时，最多回退试几个候选测点
 _LIVE_POINT_CANDIDATES = int(os.getenv("HDW_LIVE_POINT_CANDIDATES", "5"))
+# 日志注入上限：一次抓取实测 118 条，全塞进上下文会挤占文档证据。
+# 按严重程度排序后取前 N 条，重大事件优先。
+_LOGS_MAX = int(os.getenv("HDW_LOGS_MAX", "40"))
+# 单次查询的时间跨度上限，防止规划器给出离谱区间导致 LIEMS 端长时间抓取
+_QUERY_MAX_DAYS = int(os.getenv("HDW_QUERY_MAX_DAYS", "7"))
+# 历史/趋势注入上下文时的压缩点数上限。实测单次可达 11063 点，
+# 全量下发会挤占文档证据；压缩时优先保留关键形状点。
+_SERIES_MAX_POINTS = int(os.getenv("HDW_SERIES_MAX_POINTS", "24"))
+# ── 趋势特征提取阈值，参照 SmartGasTurbine 的 Trend_Prior 配置 ──
+# 斜率绝对值低于此值视为「基本平稳」（单位/分钟）
+_TREND_FLAT_SLOPE = float(os.getenv("HDW_TREND_FLAT_SLOPE", "0.01"))
+# 整体 r² 低于此值才值得报拐点：单条直线已能代表整段时，报拐点只是噪声
+_TREND_TURNING_R2 = float(os.getenv("HDW_TREND_TURNING_R2", "0.6"))
+# 导数死区：变化率低于此值视为平直（单位/秒），对应 Trend_Prior 的 0.0001
+_TREND_DEADBAND = float(os.getenv("HDW_TREND_DEADBAND", "0.0001"))
+# 拐点确认延迟（秒）：距序列末尾太近的「拐」多半是噪声
+_TREND_TURNING_DELAY = float(os.getenv("HDW_TREND_TURNING_DELAY", "10"))
+# 拐点后回归所需的最少点数，对应 Trend_Prior 的 short_min_points=6
+_TREND_TURNING_MIN_POINTS = int(os.getenv("HDW_TREND_TURNING_MIN_POINTS", "6"))
+# 拐点前后两段的电平差要达到全程量程的这个比例才算「真事件」。
+# 实测经验：轴封供气压力从 0.018 掉到 0 这种跃迁，电平差占比接近 1；
+# 而噪声抖动只有千分之几。取 0.15 能把两者分开。
+_TREND_LEVEL_RATIO = float(os.getenv("HDW_TREND_LEVEL_RATIO", "0.15"))
+# 最多报几个拐点。按电平变化量排序取前几个，位置先后不重要。
+_TREND_TURNING_MAX = int(os.getenv("HDW_TREND_TURNING_MAX", "3"))
+# 相对变化率下限（%）。**两个尺度都要达标才算突变**：
+# 只看向对量程占比，会把「0.0181727→0.01829」这种 0.6% 的微动当成事件
+# ——它占比高只是因为当时量程本身就极小。取 5% 能滤掉这类抖动，
+# 同时保留「压力从有到无」(100%) 和 V 形转折(约 9%)。
+_TREND_LEVEL_PERCENT = float(os.getenv("HDW_TREND_LEVEL_PERCENT", "5.0"))
+# ── 整段显著性判据。趋势分析用，**宁可多报**：任一判据超标就展开分析 ──
+# ── 整段波动的三级判定（相对读数口径）──
+#   < 1%      完全隐掉：只回一句「基本无变动」
+#   1% ~ 3%   只给曲线图 + 均值/极值，不给斜率、突变点、关键点
+#   ≥ 3%      完整展开
+# 中间档是为实测的轴封供气压力（全天波动占读数 2.8%）设的：
+# 它既不该像真变化那样被逐点解读，也不该像完全静止那样一言蔽之。
+_FLAT_LEVEL_MINOR = float(os.getenv("HDW_FLAT_LEVEL_MINOR", "0.01"))
+_FLAT_LEVEL_SIGNIF = float(os.getenv("HDW_FLAT_LEVEL_SIGNIF", "0.03"))
+# 离散跳变判据：不同取值数 / 样本数 低于此比例时，判为采集噪声（丢包或取整）。
+# 实测轴封供气压力全天只在两个固定值间跳，distinct/总 = 2/88 ≈ 2%。
+_DISCRETE_LEVEL_RATIO = float(os.getenv("HDW_DISCRETE_LEVEL_RATIO", "0.05"))
+# ── 当前值对比。**宁可少报**：两个判据都超标才提示偏离 ──
+# 当前值是随口一问，天天提示「偏离 0.5%」只会让提示失去意义。
+_DRIFT_REL_PERCENT = float(os.getenv("HDW_DRIFT_REL_PERCENT", "5.0"))
+# 偏离要达到几个标准差才算异常。低于 2σ 基本都在正常波动内。
+_DRIFT_SIGMA = float(os.getenv("HDW_DRIFT_SIGMA", "2.0"))
+# 当前值对比取多长时间的历史做基准
+_DRIFT_WINDOW_MINUTES = int(os.getenv("HDW_DRIFT_WINDOW_MINUTES", "60"))
+# 曲线图输出尺寸与 DPI（前端按宽度自适应，这里只定比例）
+_CHART_FIGSIZE = (7.2, 2.6)
+_CHART_DPI = 130
 # SIS 返回的是 UTC；现场看的是本地时间，统一按 UTC+8 展示且不带时区后缀
 _LIVE_TIME_OFFSET_HOURS = float(os.getenv("HDW_LIVE_TIME_OFFSET_HOURS", "8"))
 
@@ -706,53 +796,587 @@ def _format_live_time(value: Any) -> str:
     return local.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _parse_plan(text: str) -> tuple[bool | None, list[str]]:
-    """解析规划输出。检索无法判定返回 None，测点无法判定返回空列表。"""
-    needs_rag: bool | None = None
-    points: list[str] = []
+# 规划器输出里的「空值」写法。模型有时会写 none/null/- 而不是「无」。
+_PLAN_EMPTY = ("无", "none", "null", "-", "n/a", "")
+
+
+def _plan_field(line: str, label: str) -> str | None:
+    """取 `标签: 值` 里的值；该行不存在返回 None，值为空返回 ""。"""
+    match = re.match(rf"^{label}\s*[:：]\s*(.*)$", line)
+    return match.group(1).strip() if match else None
+
+
+def _plan_date(text: str) -> str:
+    """把模型给的日期规整成 YYYY-MM-DD；解析不了返回空串。"""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    if not match:
+        return ""
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return ""
+
+
+def _clamp_range(start: str, end: str) -> tuple[str, str]:
+    """把时间区间收进允许范围，并保证 start <= end。
+
+    规划器是模型，它给出的日期不能直接信：跨度太大时抓取会长时间占用
+    LIEMS 连接（该模块文档明确要求避免触发服务端异常访问判定）。
+    """
+    today = _local_today()
+    end_date = date.fromisoformat(end) if end else today
+    start_date = date.fromisoformat(start) if start else end_date
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    if end_date > today:
+        end_date = today
+    if (end_date - start_date).days >= _QUERY_MAX_DAYS:
+        start_date = end_date - timedelta(days=_QUERY_MAX_DAYS - 1)
+    return start_date.isoformat(), end_date.isoformat()
+
+
+def _local_today() -> date:
+    return (datetime.now(timezone.utc) + timedelta(hours=_LIVE_TIME_OFFSET_HOURS)).date()
+
+
+def _render_trend_png(item: dict[str, Any], features: dict[str, Any]) -> str:
+    """把趋势渲染成 PNG，返回 base64。失败返回空串——**出图失败不能影响回答**。
+
+    样式对齐 SmartGasTurbine 前端（echarts 配置）：
+      · 折线 smooth、不显示数据点标记（点数多时标记会糊成一片）
+      · 只保留左/下轴线，去掉上/右框
+      · 网格浅色虚线
+    配色取它 `styles/main.css` 的变量：主色 #1769aa、警示 #b54708、危险 #b42318。
+    """
+    try:
+        import base64
+        import io
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        # 中文字体：镜像里装了 fonts-noto-cjk。缺字体时图上中文会变方框，
+        # 这时退化成不写中文，也不至于出一张看不懂的图。
+        from matplotlib import font_manager
+
+        available = {f.name for f in font_manager.fontManager.ttflist}
+        cjk = next(
+            (n for n in ("Noto Sans CJK SC", "Noto Sans CJK JP", "WenQuanYi Zen Hei") if n in available),
+            None,
+        )
+        if cjk:
+            plt.rcParams["font.sans-serif"] = [cjk, "DejaVu Sans"]
+        plt.rcParams["axes.unicode_minus"] = False
+
+        samples = item.get("samples") or []
+        points = []
+        for sample in samples:
+            value = sample.get("value")
+            if value is None:
+                continue
+            try:
+                moment = datetime.fromisoformat(str(sample.get("time", "")).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            points.append(
+                (moment.astimezone(timezone(timedelta(hours=_LIVE_TIME_OFFSET_HOURS))), float(value))
+            )
+        if len(points) < 2:
+            return ""
+
+        xs = [moment for moment, _ in points]
+        ys = [value for _, value in points]
+        unit = str(item.get("unit") or "")
+        title = str(item.get("description") or item.get("query") or "")
+
+        fig, ax = plt.subplots(figsize=_CHART_FIGSIZE, dpi=_CHART_DPI)
+        ax.plot(xs, ys, color="#1769aa", linewidth=1.4, solid_capstyle="round")
+        ax.set_facecolor("#ffffff")
+        fig.patch.set_facecolor("#ffffff")
+
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color("#d7dde5")
+            ax.spines[side].set_linewidth(0.8)
+        ax.grid(True, color="#eef1f5", linewidth=0.7, linestyle="--")
+        ax.tick_params(colors="#667085", labelsize=8, length=3, width=0.8)
+
+        # 极值点单独标注：图上最该被一眼看到的就是「最低/最高出现在哪」
+        if ys:
+            for idx, color, label in (
+                (ys.index(min(ys)), "#b54708", "min"),
+                (ys.index(max(ys)), "#b42318", "max"),
+            ):
+                ax.scatter([xs[idx]], [ys[idx]], s=16, color=color, zorder=3)
+                ax.annotate(
+                    f"{ys[idx]:.6g}",
+                    (xs[idx], ys[idx]),
+                    textcoords="offset points",
+                    xytext=(0, 6 if label == "max" else -12),
+                    ha="center",
+                    fontsize=7.5,
+                    color=color,
+                )
+
+        ax.set_ylabel(f"{title} / {unit}" if unit else title, fontsize=8.5, color="#17202a")
+        fig.autofmt_xdate(rotation=0, ha="center")
+        fig.tight_layout(pad=0.6)
+
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png", bbox_inches="tight", facecolor="#ffffff")
+        plt.close(fig)
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception:
+        # 出图是锦上添花，任何异常都不该让整条问答失败
+        return ""
+
+
+def _percentile(values: list[float], ratio: float) -> float:
+    """线性插值分位数。标准库够用，不必为这一个函数引入 numpy。"""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, ratio)) * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def _series_significance(
+    values: list[float], limits: dict[str, float] | None = None
+) -> dict[str, Any]:
+    """判断整段序列是否有「显著变化」。**趋势分析用，宁可多报。**
+
+    两路判据，任一超标就判为「有变化」：
+
+      判据A 相对读数 = (P95-P5) / max(|P5|, |P95|)
+            无需任何配置，现在就能用。基准取分位数而不是均值：序列趋零或
+            含尖峰时均值会被拉偏。
+
+      判据B 工程量程 = (P95-P5) / (high_limit - low_limit)
+            有测点上下限时最符合工程直觉——「占了量程的多少」。
+            **没有量程时该路跳过**，不参与判定。
+
+    **为什么用 P95-P5 而不是 max-min**：单个毛刺能把极差撑大好几倍，
+    而分位数描述的是「大部分时间在什么范围」。实测轴封供气压力
+    全天在 0.017842~0.018338 之间，占了它自身量程的 100%，
+    但只占读数的 2.8%——只看前者，任何抖动都会「占量程 100%」。
+    """
+    usable = [float(v) for v in values if v is not None]
+    if len(usable) < 3:
+        # level = -1 表示「判不了」，调用方按「完整展开」的保守方向处理
+        return {"comparable": False, "level": -1, "flat": False, "reason": "样本不足"}
+
+    p5 = _percentile(usable, 0.05)
+    p95 = _percentile(usable, 0.95)
+    spread = p95 - p5
+
+    base_reading = max(abs(p5), abs(p95))
+    rel_reading = spread / base_reading if base_reading > 1e-12 else float("inf")
+
+    rel_range: float | None = None
+    if limits:
+        high, low = limits.get("high"), limits.get("low")
+        if high is not None and low is not None and abs(high - low) > 1e-12:
+            rel_range = spread / abs(high - low)
+
+    # 三级判定，而不是简单二值。实测轴封供气压力全天波动占读数 2.8%——
+    # 这个量级既不该像真变化那样展开斜率与突变点，也不该像完全无变化那样一言蔽之，
+    # 它需要的是「图给你，数给你，但别去解读」。
+    def level_of(ratio: float | None) -> int:
+        if ratio is None:
+            return -1
+        if ratio < _FLAT_LEVEL_MINOR:
+            return 0          # 完全隐掉
+        if ratio < _FLAT_LEVEL_SIGNIF:
+            return 1          # 只给图与统计
+        return 2              # 完整展开
+
+    levels = [level_of(rel_reading)]
+    if rel_range is not None:
+        levels.append(level_of(rel_range))
+    # 两路取**更高**等级（更敏感的那路说了算）——趋势场景宁可多报
+    level = max(levels)
+
+    # 离散跳变检测：取值只集中在少数几个固定值上，是采集丢包/取整的典型特征，
+    # 而不是物理量的真实变化。图上看得最清楚（两个固定值之间规律跳动），
+    # 但纯看统计量会被当成「有波动」。
+    distinct = len({round(v, 9) for v in usable})
+    discrete = len(usable) >= 10 and distinct / len(usable) < _DISCRETE_LEVEL_RATIO
+
+    return {
+        "comparable": True,
+        "level": level,
+        "flat": level == 0,
+        "p5": p5,
+        "p95": p95,
+        "median": _percentile(usable, 0.5),
+        "spread": spread,
+        "rel_reading": rel_reading,
+        "rel_range": rel_range,
+        "samples": len(usable),
+        "distinct_values": distinct,
+        "discrete": discrete,
+    }
+
+
+def _series_features(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """从采样序列里提取趋势特征。**这是给模型看的核心信息，比原始点更重要。**
+
+    做法参照 SmartGasTurbine 的 Trend_Prior：逐点有限差分求导，用
+    「导数过零（极值）或落入死区（平直）」定位拐点，再对区间做最小二乘
+    线性回归给出斜率与决定系数 r²。
+
+    为什么不用等距抽稀：工业趋势大量是「长期平直 + 突然跳变」，
+    等距取样会把跳变整个漏掉，而那恰恰是最该被看到的地方。特征提取不丢这个信息。
+
+    全部用标准库实现，不引入 numpy —— qa-api 的运行环境里没有它。
+    """
+    points: list[tuple[float, float]] = []   # (epoch 秒, 值)
+    for item in samples:
+        value = item.get("value")
+        if value is None:
+            continue
+        try:
+            moment = datetime.fromisoformat(str(item.get("time", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        points.append((moment.timestamp(), float(value)))
+    if len(points) < 3:
+        return {}
+
+    features: dict[str, Any] = {"samples": len(points)}
+
+    # ── 整体线性回归：斜率 + r² ──
+    # r² 是判断「这个趋势能不能用一条直线代表」的关键：r² 低说明曲线在转折，
+    # 单看斜率会得出错误结论（先降后升的曲线整体斜率可能接近 0）。
+    def regress(seq: list[tuple[float, float]]) -> dict[str, float]:
+        base = seq[0][0]
+        xs = [moment - base for moment, _ in seq]
+        ys = [value for _, value in seq]
+        n = len(xs)
+        mean_x, mean_y = sum(xs) / n, sum(ys) / n
+        den = sum((x - mean_x) ** 2 for x in xs)
+        if den <= 0:
+            return {"slope_per_minute": 0.0, "r2": 0.0}
+        slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / den
+        intercept = mean_y - slope * mean_x
+        ss_tot = sum((y - mean_y) ** 2 for y in ys)
+        ss_res = sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys))
+        r2 = 1.0 if ss_tot <= 0 else max(0.0, min(1.0, 1.0 - ss_res / ss_tot))
+        return {"slope_per_minute": slope * 60.0, "r2": r2}
+
+    overall = regress(points)
+    features["slope_per_minute"] = overall["slope_per_minute"]
+    features["r2"] = overall["r2"]
+    if abs(overall["slope_per_minute"]) < _TREND_FLAT_SLOPE:
+        features["direction"] = "基本平稳"
+    else:
+        features["direction"] = "上升" if overall["slope_per_minute"] > 0 else "下降"
+
+    # 极值要先算出来：下面挑突变点要用它作为「全程量程」的基准
+    extremes = [value for _, value in points]
+    features["min"] = min(extremes)
+    features["max"] = max(extremes)
+    features["latest"] = extremes[-1]
+    features["delta"] = extremes[-1] - extremes[0]
+
+    # ── 逐点导数，找拐点与最大变化率 ──
+    derivatives: list[float] = []
+    for index in range(1, len(points)):
+        seconds = max(1e-9, points[index][0] - points[index - 1][0])
+        derivatives.append((points[index][1] - points[index - 1][1]) / seconds)
+    if derivatives:
+        peak_index = max(range(len(derivatives)), key=lambda i: abs(derivatives[i]))
+        features["max_rate"] = {
+            "time": _format_live_time(
+                datetime.fromtimestamp(points[peak_index][0], tz=timezone.utc).isoformat()
+            ),
+            "per_second": derivatives[peak_index],
+            "per_minute": derivatives[peak_index] * 60.0,
+        }
+        # 拐点按**电平变化量**挑，不按「是不是最后一个」挑。
+        #
+        # 踩过的坑：先前只报最后一个拐点，并用拐点后窗口的 r² 作为「可信度」给模型。
+        # 但压力从有到无之后必然是一段平直，r² 因此接近 0——这个 0 说明的是
+        # **之后是平的**，恰恰是发生了状态跃迁的证据，而不是拐点不可信。
+        # 模型照这个数字把「压力消失」判成了噪声，属于我给错了判据。
+        #
+        # 真正该看的是拐点**前后两段的电平差**：差得越多，越是一次真实的状态变化。
+        span = max(features["max"] - features["min"], 1e-12)
+        turns = []
+        for index in range(1, len(derivatives)):
+            prev, curr = derivatives[index - 1], derivatives[index]
+            crosses = (prev > 0 >= curr) or (prev < 0 <= curr)
+            if not crosses and abs(curr) > _TREND_DEADBAND:
+                continue
+            moment = points[index + 1][0]
+            # 延迟确认：拐点距序列末尾太近时，所谓「拐」可能只是噪声在收尾。
+            # **这是时间判据，不是窗口宽度** —— 曾把它误当前后段的窗口宽度用，
+            # 采样间隔 60 s 而窗口只有 10 s，前后段永远取不到点，真实的 V 形转折
+            # 全被判成噪声。
+            if points[-1][0] - moment < _TREND_TURNING_DELAY:
+                continue
+
+            # 切点精确定位：导数归零的那一步会把「最后一个旧状态的点」也算进后段。
+            # 实测「0.018×30 后接 0×30」时，after_mean 是 0.00058 而不是 0——
+            # 正是混进了一个 0.018。改为在候选点邻域内取导数绝对值最大的那一步之后切。
+            cut = index + 1
+            best = abs(derivatives[index])
+            for probe in (index - 1, index + 1):
+                if 0 <= probe < len(derivatives) and abs(derivatives[probe]) > best:
+                    best = abs(derivatives[probe])
+                    cut = probe + 1
+            before_slice = points[max(0, cut - _TREND_TURNING_MIN_POINTS):cut]
+            after_slice = points[cut:]
+            if len(before_slice) < _TREND_TURNING_MIN_POINTS or len(after_slice) < _TREND_TURNING_MIN_POINTS:
+                continue
+            before_mean = sum(v for _, v in before_slice) / len(before_slice)
+            after_mean = sum(v for _, v in after_slice) / len(after_slice)
+            level_delta = after_mean - before_mean
+            # 两个尺度都达标才算突变。只看占比会放过「量程极小的高占比微动」，
+            # 只看百分比会放过「量程极大时的小百分比跃迁」——两者互补。
+            if abs(level_delta) < span * _TREND_LEVEL_RATIO:
+                continue
+            if abs(before_mean) > 1e-12:
+                if abs(level_delta) / abs(before_mean) * 100.0 < _TREND_LEVEL_PERCENT:
+                    continue
+
+            turns.append(
+                {
+                    "time": _format_live_time(
+                        datetime.fromtimestamp(moment, tz=timezone.utc).isoformat()
+                    ),
+                    "before_mean": before_mean,
+                    "after_mean": after_mean,
+                    "level_delta": level_delta,
+                    # 两个尺度都要给，缺一个模型就会误判：
+                    # · level_ratio  相对全程量程 —— 量程大时能抓出「压力消失」这类跃迁
+                    # · level_percent 相对变化率   —— 量程很小时能识破「0.6% 的抖动」
+                    #   实测真实数据集里 0.0181727→0.01829 只是 0.6% 的微动，
+                    #   但因为它占了当时量程的 24%，只看 level_ratio 会被当回事。
+                    "level_ratio": abs(level_delta) / span,
+                    "level_percent": (
+                        abs(level_delta) / abs(before_mean) * 100.0
+                        if abs(before_mean) > 1e-12 else float("inf")
+                    ),
+                    # 变化率方向，与 level_delta 同号
+                    "rate_sign": "降" if level_delta < 0 else "升",
+                    "after_points": len(after_slice),
+                    "after_flat": regress(after_slice)["r2"] >= _TREND_TURNING_R2,
+                }
+            )
+
+        if turns:
+            # 按电平变化量排序取前几个：变化大的才是真事件，位置先后不重要
+            turns.sort(key=lambda item: item["level_ratio"], reverse=True)
+            features["turning_points"] = turns[:_TREND_TURNING_MAX]
+
+    return features
+
+
+def _compress_series(samples: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """压缩采样序列，**优先保留关键形状点**，其余用等距点补齐。
+
+    关键点 = 首尾 + 极值点 + 导数变化点。这样「平直段 + 突然跳变」的
+    工业曲线在少数点下仍能保持形状；单纯等距取样会漏掉跳变。
+    """
+    if limit <= 0 or len(samples) <= limit:
+        return samples
+
+    keep: set[int] = {0, len(samples) - 1}
+
+    # 极值点（局部最大/最小）
+    for index in range(1, len(samples) - 1):
+        prev = samples[index - 1].get("value")
+        curr = samples[index].get("value")
+        nxt = samples[index + 1].get("value")
+        if None in (prev, curr, nxt):
+            continue
+        if (curr >= prev and curr >= nxt) or (curr <= prev and curr <= nxt):
+            keep.add(index)
+
+    # 导数变化点：前后斜率符号不同，说明这里有折角
+    rates: list[float | None] = [None]
+    for index in range(1, len(samples)):
+        prev, curr = samples[index - 1].get("value"), samples[index].get("value")
+        rates.append(None if None in (prev, curr) else float(curr) - float(prev))
+    for index in range(1, len(rates) - 1):
+        prev, curr = rates[index], rates[index + 1]
+        if None in (prev, curr):
+            continue
+        if (prev > 0 >= curr) or (prev < 0 <= curr):
+            keep.add(index + 1)
+
+    # 关键点已超上限时按原始顺序均匀丢弃，保证首尾与分布
+    ordered = sorted(keep)
+    if len(ordered) > limit:
+        step = (len(ordered) - 1) / (limit - 1) if limit > 1 else 0
+        ordered = sorted({ordered[min(len(ordered) - 1, round(i * step))] for i in range(limit)})
+
+    # 剩余名额用等距点补齐
+    if len(ordered) < limit:
+        remaining = [index for index in range(len(samples)) if index not in keep]
+        need = limit - len(ordered)
+        if remaining:
+            step = (len(remaining) - 1) / (need - 1) if need > 1 else 0
+            for i in range(need):
+                ordered.append(remaining[min(len(remaining) - 1, round(i * step))])
+    return [samples[index] for index in sorted(set(ordered))]
+
+
+def _thin_samples(samples: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """等距抽稀采样序列，始终保留首尾两点。
+
+    模型要判断的是「趋势」而不是复现曲线，等距取样足以表达涨跌与拐点；
+    随机取样会丢掉首尾这两个最能说明「现在处于什么水平」的点。
+    """
+    if limit <= 0 or len(samples) <= limit:
+        return samples
+    if limit == 1:
+        return samples[-1:]
+    step = (len(samples) - 1) / (limit - 1)
+    picked, seen = [], set()
+    for index in range(limit):
+        position = min(len(samples) - 1, round(index * step))
+        if position not in seen:
+            seen.add(position)
+            picked.append(samples[position])
+    return picked
+
+
+def _parse_plan(text: str) -> dict[str, Any]:
+    """解析规划输出为结构化意图。
+
+    **向后兼容**：只认出「检索/测点」两行的旧格式时，其余各项为空，
+    行为与扩展前完全一致——这样即使模型漏输出某一行也不会让整条链路退化。
+    任何一项解析失败都只丢该项，不影响其他项。
+    """
+    plan: dict[str, Any] = {
+        "needs_rag": None, "points": [], "history": None, "trend": None, "logs": None,
+    }
     for raw_line in (text or "").splitlines():
         line = raw_line.strip()
+
         match = re.match(r"^检索\s*[:：]\s*(yes|no|是|否)", line, re.I)
         if match:
-            needs_rag = match.group(1).lower() in ("yes", "是")
+            plan["needs_rag"] = match.group(1).lower() in ("yes", "是")
             continue
-        match = re.match(r"^测点\s*[:：]\s*(.+)$", line)
-        if match:
-            value = match.group(1).strip()
-            if value and value.lower() not in ("无", "none", "-", "null"):
-                points = [
+
+        value = _plan_field(line, "测点")
+        if value is not None:
+            if value.lower() not in _PLAN_EMPTY:
+                plan["points"] = [
                     item.strip()
                     for item in re.split(r"[、,，;；|]", value)
                     if item.strip()
-                ]
-    return needs_rag, points[:_LIVE_POINTS_MAX]
+                ][:_LIVE_POINTS_MAX]
+            continue
+
+        value = _plan_field(line, "历史")
+        if value is not None:
+            if value.lower() not in _PLAN_EMPTY:
+                parts = [part.strip() for part in value.split("|")]
+                if parts and parts[0]:
+                    start, end = _clamp_range(
+                        _plan_date(parts[1] if len(parts) > 1 else ""),
+                        _plan_date(parts[2] if len(parts) > 2 else ""),
+                    )
+                    plan["history"] = {"keyword": parts[0], "start": start, "end": end}
+            continue
+
+        value = _plan_field(line, "趋势")
+        if value is not None:
+            if value.lower() not in _PLAN_EMPTY:
+                parts = [part.strip() for part in value.split("|")]
+                if parts and parts[0]:
+                    start, end = _clamp_range(
+                        _plan_date(parts[1] if len(parts) > 1 else ""),
+                        _plan_date(parts[2] if len(parts) > 2 else ""),
+                    )
+                    interval = 0
+                    if len(parts) > 3:
+                        digits = re.search(r"\d+", parts[3])
+                        interval = int(digits.group()) if digits else 0
+                    # 间隔留 0 交给下游按跨度自动选，避免模型给出 0 或负数
+                    plan["trend"] = {
+                        "keyword": parts[0], "start": start, "end": end,
+                        "interval_seconds": interval if interval >= 30 else 0,
+                    }
+            continue
+
+        value = _plan_field(line, "日志")
+        if value is not None:
+            if value.lower() not in _PLAN_EMPTY:
+                parts = [part.strip() for part in value.split("|")]
+                start, end = _clamp_range(
+                    _plan_date(parts[0] if parts else ""),
+                    _plan_date(parts[1] if len(parts) > 1 else ""),
+                )
+                plan["logs"] = {
+                    "start": start, "end": end,
+                    "major_only": any("重大" in part or "重要" in part for part in parts[2:]),
+                }
+            continue
+
+    return plan
 
 
-async def _plan_retrieval(
-    question: str, mode: Literal["online", "offline"]
-) -> tuple[bool, list[str]]:
-    """一次调用同时决定「要不要查文档」和「要读哪些实时测点」，判断发生在检索之前。
+def _empty_capabilities() -> dict[str, Any]:
+    """保守默认：照常检索、不读任何实时数据。
 
-    极小调用：无证据、只出两行，实测约 200-400ms。
-    任何异常或无法解析都退回保守默认：照常检索、不读测点。
+    规划失败时必须退到这里——多查一次数据只是慢，少查一次却会让模型
+    在缺少事实的情况下作答。
+    """
+    return {"needs_rag": True, "points": [], "history": None, "trend": None, "logs": None}
+
+
+async def _plan_retrieval(question: str, mode: Literal["online", "offline"]) -> dict[str, Any]:
+    """一次调用同时决定「要不要查文档」和「要取哪些实时数据」，判断发生在检索之前。
+
+    极小调用：无证据、只出五行，实测约 200-400ms。
+    任何异常或无法解析都退回保守默认：照常检索、不取实时数据。
     """
     if not _ROUTER_ENABLED:
-        return True, []
+        return _empty_capabilities()
+    today = _local_today()
+    prompt = _PLANNER_PROMPT.format(
+        today=today.isoformat(),
+        yesterday=(today - timedelta(days=1)).isoformat(),
+    )
     try:
         _, client = _llm_client(mode)
         result = await client.complete(
             [
-                {"role": "system", "content": _PLANNER_PROMPT},
+                {"role": "system", "content": prompt},
                 {"role": "user", "content": question},
             ],
-            max_tokens=32,
+            # 从两行扩到五行后 32 个令牌不够，会出现「日志: 」被截断的半行。
+            # 五行实测约 40-60 个令牌，留一倍余量。
+            max_tokens=160,
             temperature=0.0,
             chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
         )
     except Exception:
-        return True, []
-    needs_rag, points = _parse_plan(result.content)
-    return (True if needs_rag is None else needs_rag), points
+        return _empty_capabilities()
+    plan = _parse_plan(result.content)
+    if plan["needs_rag"] is None:
+        plan["needs_rag"] = True
+    return plan
 
 
 _LIVE_POINT_PICK_PROMPT = (
@@ -835,11 +1459,16 @@ async def _fetch_live_points(
                 "value_source": str(data.get("value_source") or ""),
             }
 
-        # 快路径：直接按关键词取。内部按相似度取 top-1，命中时最省。
+        # 快路径：直接按关键词取，命中时最省一次检索。
+        # **但必须校验相关性**：工具内部是按相似度取 top-1，模糊匹配可能返回
+        # 完全无关的测点（实测搜「轴封供汽压力」top-1 是「高压主蒸汽压力3选1后」）。
+        # 值非空就采用，等于把错数据当成事实喂给模型——比不返回更糟。
         try:
             data = await _mcp_call_tool("point_query_current_value", {"query_text": keyword})
             if isinstance(data, dict) and data.get("value") is not None:
-                return shape(data), None
+                point = data.get("point") or {}
+                if _point_matches(keyword, str(point.get("description") or "")):
+                    return shape(data), None
         except Exception:
             pass
 
@@ -863,12 +1492,6 @@ async def _fetch_live_points(
             if candidates:
                 break
 
-        # 关键词整词匹配不上（测点表叫「凝汽器液位」，用户问「凝汽器水位」）时，
-        # 让模型从相近候选里挑最符合意图的那个，再按 KKS 精确取值。
-        # 用模型而不是同义词表：测点表的命名习惯会变，硬编码词表很快就废。
-        candidates = [
-            item for item in (found.get("items") or []) if str(item.get("kks") or "").strip()
-        ]
         if not candidates:
             return None, f"{keyword}: 测点表中无匹配项"
         picked = await _pick_live_point(keyword, candidates, mode)
@@ -930,16 +1553,307 @@ async def _plan_rag(
         }, str(exc)
 
 
+def _point_matches(keyword: str, description: str) -> bool:
+    """关键词与测点描述是否**足够**相关。
+
+    **不能只看检索排序**。实测：搜「轴封供汽压力」返回 5 条，正确答案排第 4，
+    而 top-1 是完全无关的「高压主蒸汽压力3选1后」——SIS 的检索是模糊匹配，
+    取 top-1 会静默用错测点，比报「没找到」更糟。
+
+    判据取关键词的**首二字与尾二字**都必须出现在描述里：
+    首二字是设备标识（「轴封」），尾二字是物理量（「压力」）。
+    两者同时命中才算相关——只命中设备会把「轴封供汽管道疏水母管气动关断阀
+    开反馈」这种阀门反馈误当成压力测点。
+    """
+    text = (description or "").strip()
+    if not text:
+        return False
+    probe = (keyword or "").strip()
+    if len(probe) < 2:
+        return probe in text
+    if probe[:2] not in text:
+        return False
+    # 关键词太短（如「压力」）时尾部就是首部，不重复判定
+    if len(probe) < 4:
+        return True
+    if probe[-2:] not in text:
+        return False
+    # 中间那段限定词至少要见一个。「轴封供气压力」的中间是「供气」——
+    # 实测它被规划器简化成「轴封压力」后，唯一命中是「低压轴封压力测点1」，
+    # 首尾都合、只有「供气」对不上，结果串到了另一个测点。
+    # 只要求**命中一个**而不是全中：汽／气 这类异体字差异不该被拦下。
+    middle = probe[2:-2]
+    if not middle:
+        return True
+    return any(ch in text for ch in middle)
+
+
+async def _resolve_point(
+    keyword: str, mode: Literal["online", "offline"] = "offline"
+) -> tuple[dict[str, Any] | None, str | None]:
+    """中文关键词 → 具体测点。返回 (点, 错误)。
+
+    三步：原词精确 → 放宽变体 → 模型从候选里选。
+    任何一步都不接受「相关性不达标」的测点——宁可报没找到，也不能给错数据。
+    """
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for variant in _keyword_variants(keyword):
+        try:
+            data = await _mcp_call_tool(
+                "point_query_search_points",
+                {"query_text": variant, "limit": _LIVE_POINT_CANDIDATES},
+            )
+        except Exception as exc:
+            return None, f"{keyword}: {exc}"
+        for item in (data or {}).get("items") or []:
+            kks = str(item.get("kks") or "").strip()
+            if not kks or kks in seen:
+                continue
+            seen.add(kks)
+            candidates.append(item)
+        if candidates:
+            break
+
+    if not candidates:
+        return None, f"{keyword}: 测点表中无匹配项"
+
+    # 字符级判定优先：够相关就直接用，不必再花一次模型调用
+    for item in candidates:
+        if _point_matches(keyword, str(item.get("description") or "")):
+            return item, None
+
+    # 字符判定全不中（测点表叫「凝汽器液位」而用户问「凝汽器水位」）：
+    # 让模型从真实候选里挑。选出来的 KKS 必须确实在候选集合内。
+    picked = await _pick_live_point(keyword, candidates, mode)
+    for item in candidates:
+        if str(item.get("kks")) == picked:
+            return item, None
+    return None, f"{keyword}: 候选中无相关测点"
+
+
+def _shape_series(data: dict[str, Any], keyword: str, kind: str) -> dict[str, Any]:
+    samples = data.get("samples") or []
+    summary = data.get("summary") or {}
+    return {
+        "kind": kind,
+        "query": keyword,
+        "kks": str((data.get("point") or {}).get("kks") or ""),
+        "description": (data.get("point") or {}).get("description") or keyword,
+        "unit": data.get("unit") or "",
+        "start": str(data.get("start_time") or ""),
+        "end": str(data.get("end_time") or ""),
+        "interval_seconds": data.get("interval_seconds") or 0,
+        "summary": summary,
+        "samples": samples,
+    }
+
+
+async def _fetch_series(
+    spec: dict[str, Any], kind: Literal["history", "trend"], mode: str = "offline"
+) -> tuple[dict[str, Any] | None, str | None]:
+    """取测点历史序列或趋势。趋势即带采样间隔的历史序列，用的是同一个 MCP 工具。"""
+    keyword = str(spec.get("keyword") or "").strip()
+    if not keyword:
+        return None, None
+    point, error = await _resolve_point(keyword, mode)  # type: ignore[arg-type]
+    if error or not point:
+        return None, error or f"{keyword}: 未匹配到测点"
+    arguments: dict[str, Any] = {
+        "kks": str(point.get("kks") or ""),
+        # SIS 侧按 UTC 存时间，这里把本地日期补成当天 00:00:00 ~ 23:59:59
+        "start_time": f"{spec.get('start')}T00:00:00",
+        "end_time": f"{spec.get('end')}T23:59:59",
+    }
+    if kind == "trend" and spec.get("interval_seconds"):
+        arguments["interval_seconds"] = int(spec["interval_seconds"])
+    try:
+        data = await _mcp_call_tool("point_query_history_series", arguments)
+    except Exception as exc:
+        return None, f"{keyword}: {exc}"
+    if not isinstance(data, dict) or not data.get("samples"):
+        return None, f"{keyword}: 该时段无采样数据"
+    return _shape_series(data, keyword, kind), None
+
+
+async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """取运行日志。按规划给出的区间选择工具，只取重大事件时走 major_events。"""
+    start, end = str(spec.get("start") or ""), str(spec.get("end") or "")
+    major_only = bool(spec.get("major_only"))
+    # 区间内天数决定用哪个工具：单日走 recent，跨日走 range。
+    # **不给 fetch_if_missing 以外的参数**——该参数默认已是 True，
+    # 日志模块不缓存，每次都是真实抓取（实测约 5.8 s）。
+    try:
+        today = _local_today().isoformat()
+        if major_only:
+            # major_events 只接受天数，不接受区间，按区间长度折算
+            span = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+            data = await _mcp_call_tool(
+                "log_query_major_events", {"days": max(1, min(_QUERY_MAX_DAYS, span))}
+            )
+        elif start == end and end == today:
+            data = await _mcp_call_tool("log_query_recent", {"days": 1})
+        else:
+            span = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+            data = await _mcp_call_tool(
+                "log_query_range", {"days": max(1, min(_QUERY_MAX_DAYS, span))}
+            )
+    except Exception as exc:
+        return None, f"日志: {exc}"
+    if not isinstance(data, dict):
+        return None, "日志: 返回格式异常"
+    if str(data.get("status")) == "unavailable":
+        return None, f"日志: {data.get('message') or '数据源未配置'}"
+    events = data.get("events") or []
+    if not events:
+        return None, "日志: 该时段无记录"
+    return {
+        "kind": "logs",
+        "start": start,
+        "end": end,
+        "major_only": major_only,
+        "summary": data.get("summary") or {},
+        # 118 条全量注入会挤占文档证据，按严重程度排序后截断
+        "events": sorted(
+            events,
+            key=lambda item: {"major": 0, "important": 1}.get(str(item.get("severity")), 2),
+        )[:_LOGS_MAX],
+    }, None
+
+
+async def _current_drift(point: dict[str, Any], mode: str = "offline") -> dict[str, Any] | None:
+    """当前值与近期均值的对比。**宁可少报**：两个判据都超标才提示偏离。
+
+    当前值是随口一问。若只要有差异就提示「偏离 0.5%」，提示会多到没人看，
+    等于没有提示。所以这里方向与趋势相反——趋势宁可多报，当前值宁可少报。
+
+    两个判据：
+      · 相对偏离 = |当前 - 均值| / |均值|      —— 物理量级上的偏离
+      · σ 倍率   = |当前 - 均值| / 标准差      —— 相对近期自身波动幅度的偏离
+    只用一个不够：均值很小而波动很大时，相对偏离会虚高；
+    而序列本身很平稳时，σ 又会过小。
+    """
+    kks = str(point.get("kks") or "").strip()
+    current = point.get("value")
+    if not kks or current is None:
+        return None
+    try:
+        current_value = float(current)
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        data = await _mcp_call_tool(
+            "point_query_history_series",
+            {"kks": kks, "interval_seconds": max(60, _DRIFT_WINDOW_MINUTES * 60 // 60)},
+        )
+    except Exception:
+        return None
+    samples = (data or {}).get("samples") or []
+    values = [float(s["value"]) for s in samples if s.get("value") is not None]
+    if len(values) < 5:
+        return None
+
+    # 当前值本身也在历史里，算均值时把它排除，否则会把基准往自己身上拉
+    history = values[:-1] or values
+    mean = sum(history) / len(history)
+    if len(history) > 1:
+        variance = sum((v - mean) ** 2 for v in history) / (len(history) - 1)
+        std = variance ** 0.5
+    else:
+        std = 0.0
+
+    delta = current_value - mean
+    rel = abs(delta) / abs(mean) * 100.0 if abs(mean) > 1e-12 else float("inf")
+    sigma = abs(delta) / std if std > 1e-12 else float("inf")
+
+    # 宁可少报：**两个都超标**才提示偏离
+    drifted = rel >= _DRIFT_REL_PERCENT and sigma >= _DRIFT_SIGMA
+    return {
+        "mean": mean,
+        "std": std,
+        "delta": delta,
+        "rel_percent": rel,
+        "sigma": sigma,
+        "drifted": drifted,
+        "window_minutes": _DRIFT_WINDOW_MINUTES,
+        "samples": len(history),
+    }
+
+
+async def _fetch_realtime(
+    plan: dict[str, Any], mode: Literal["online", "offline"]
+) -> tuple[dict[str, Any], list[str]]:
+    """并行取齐规划要求的全部实时数据。
+
+    三类查询互不依赖，且都远慢于本地计算（日志实测约 5.8 s），
+    串行执行会让时延叠加；并发后总耗时取决于最慢的一项。
+
+    **单项失败只记录不抛出**：实时数据缺失不能拖垮文档问答，这与
+    `_fetch_live_points` 的既有约定一致。
+    """
+    tasks: dict[str, Any] = {}
+    if plan.get("points"):
+        tasks["live"] = _fetch_live_points(plan["points"], mode)
+    if plan.get("history"):
+        tasks["history"] = _fetch_series(plan["history"], "history", mode)
+    if plan.get("trend"):
+        tasks["trend"] = _fetch_series(plan["trend"], "trend", mode)
+    if plan.get("logs"):
+        tasks["logs"] = _fetch_logs(plan["logs"])
+
+    result: dict[str, Any] = {"live_points": [], "series": [], "logs": None}
+    errors: list[str] = []
+    if not tasks:
+        return result, errors
+
+    done = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    for name, outcome in zip(tasks.keys(), done):
+        if isinstance(outcome, BaseException):
+            errors.append(f"{name}: {outcome}")
+            continue
+        if name == "live":
+            points, point_errors = outcome
+            result["live_points"] = points
+            errors.extend(point_errors)
+            # 给每个当前值配一段「与近期均值的对比」。并发取，不逐点串行。
+            if points:
+                drifts = await asyncio.gather(
+                    *(_current_drift(point, mode) for point in points),
+                    return_exceptions=True,
+                )
+                for point, drift in zip(points, drifts):
+                    if isinstance(drift, dict):
+                        point["drift"] = drift
+        else:
+            item, error = outcome
+            if error:
+                errors.append(error)
+            elif item:
+                if name == "logs":
+                    result["logs"] = item
+                else:
+                    # 出图放在取数之后、注入之前。失败不影响任何环节——
+                    # 图是锦上添花，数据才是主体。
+                    _vals = [s.get("value") for s in (item.get("samples") or []) if s.get("value") is not None]
+                    _sig = _series_significance(_vals, item.get("limits"))
+                    # level 0（<1%）连图都不给：整段无变化时，图只会让模型去找细节
+                    item["chart_png"] = "" if _sig.get("level") == 0 else _render_trend_png(item, {})
+                    result["series"].append(item)
+    return result, errors
+
+
 async def _retrieve_planned(
     question: str,
     mode: Literal["online", "offline"],
     top_k: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    # 规划在检索之前：一次调用同时决定「要不要查文档」和「要读哪些实时测点」。
-    needs_rag, point_keywords = await _plan_retrieval(question, mode)
-    live_points, live_errors = await _fetch_live_points(point_keywords, mode)
+    # 规划在检索之前：一次调用同时决定要不要查文档，以及要取哪几类实时数据
+    # （测点当前值／历史序列／趋势／运行日志）。
+    intent = await _plan_retrieval(question, mode)
 
-    if not needs_rag:
+    if not intent["needs_rag"]:
+        realtime, rt_errors = await _fetch_realtime(intent, mode)
         plan = {
             "rounds": 0,
             "queries": [],
@@ -954,19 +1868,28 @@ async def _retrieve_planned(
             "rounds": [],
             "deduplicated_count": 0,
             "no_retrieval": True,
-            "live_points": live_points,
-            "live_errors": live_errors,
+            "live_errors": rt_errors,
+            **realtime,
         }
     plan, planning_error = await _plan_rag(question, mode, top_k)
     if plan.get("no_retrieval"):
         # 不检索也不查图谱：下游拿到空 contexts 会自然产出空 citations / graph_context，
         # 前端 addEvidence() 在两者都空时不渲染依据面板。
+        realtime, rt_errors = await _fetch_realtime(intent, mode)
         return [], {
             "plan": plan,
             "rounds": [],
             "deduplicated_count": 0,
             "no_retrieval": True,
+            "live_errors": rt_errors,
+            **realtime,
         }
+
+    # **实时数据与检索并行**。二者互不依赖，且日志/历史抓取实测约 5.8 s，
+    # 与检索轮次的 6 s 同量级——串行会让时延直接叠加，并发则相互掩盖，
+    # 总耗时取决于较慢的一项而不是两者之和。
+    realtime_task = asyncio.create_task(_fetch_realtime(intent, mode))
+
     merged: dict[str, dict[str, Any]] = {}
     round_infos: list[dict[str, Any]] = []
     for round_index, query in enumerate(plan["queries"], 1):
@@ -984,6 +1907,8 @@ async def _retrieve_planned(
             candidate_score = _retrieval_score(candidate)
             if current is None or candidate_score > current_score:
                 merged[identity] = candidate
+
+    realtime, rt_errors = await realtime_task
     contexts = sorted(
         merged.values(),
         key=lambda item: (
@@ -997,8 +1922,8 @@ async def _retrieve_planned(
         "plan": plan,
         "rounds": round_infos,
         "deduplicated_count": len(contexts),
-        "live_points": live_points,
-        "live_errors": live_errors,
+        "live_errors": rt_errors,
+        **realtime,
     }
     if planning_error:
         info["planning_error"] = planning_error
@@ -1533,6 +2458,8 @@ def _prompt(
     image_attachments: list[dict[str, str]] | None = None,
     skip_retrieval: bool = False,
     live_points: list[dict[str, Any]] | None = None,
+    series: list[dict[str, Any]] | None = None,
+    logs: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if contexts:
         evidence_items = contexts
@@ -1569,22 +2496,181 @@ def _prompt(
     # 堵住模型自己补时区（它会写成 UTC，或者把两者都列一遍）。
     live_block = ""
     if live_points:
-        live_block = "\n\n实时测点数据：\n" + "\n".join(
-            f"[测点 {idx}] {item.get('description') or item.get('query')}"
-            f"（KKS={item.get('kks') or '未知'}） = {item.get('value')} {item.get('unit')}"
-            f"  采集时间 {item.get('time')}（北京时间）"
-            for idx, item in enumerate(live_points, 1)
+        rows = []
+        for idx, item in enumerate(live_points, 1):
+            line = (
+                f"[测点 {idx}] {item.get('description') or item.get('query')}"
+                f"（KKS={item.get('kks') or '未知'}） = {item.get('value')} {item.get('unit')}"
+                f"  采集时间 {item.get('time')}（北京时间）"
+            )
+            drift = item.get("drift") or {}
+            if drift:
+                unit = item.get("unit") or ""
+                line += (
+                    f"\n    近期对比：过去 {drift.get('window_minutes')} 分钟均值 "
+                    f"{drift.get('mean'):.6g} {unit}（{drift.get('samples')} 个采样点），"
+                    f"当前偏离 {drift.get('delta'):+.6g} {unit}"
+                    f"（{drift.get('rel_percent'):.1f}%，{drift.get('sigma'):.1f}σ）"
+                )
+                # 只有两个判据都超标才提示偏离；否则明确说「在正常波动内」，
+                # 免得模型看到数字就自己加戏
+                line += (
+                    "  → **偏离显著，值得关注**"
+                    if drift.get("drifted")
+                    else "  → 在近期正常波动范围内"
+                )
+            rows.append(line)
+        live_block = "\n\n实时测点数据：\n" + "\n".join(rows)
+
+    # 历史序列与趋势单独成块。**不下发全部采样点**——单次实测 644 点，
+    # 全量塞进上下文会把文档证据挤掉，而模型需要的是「变了多少、往哪变」，
+    # 不是每一个采样值本身。这里给统计摘要 + 等距抽稀后的序列。
+    series_block = ""
+    if series:
+        chunks = []
+        for idx, item in enumerate(series, 1):
+            label = "趋势" if item.get("kind") == "trend" else "历史序列"
+            samples = item.get("samples") or []
+            feat = _series_features(samples)
+            # 整段显著性：判为「无显著变化」时**不喂关键点和突变点**，
+            # 从源头上不给模型解读噪声的材料。出图仍照给——图上看得出全貌。
+            values = [s.get("value") for s in samples if s.get("value") is not None]
+            sig = _series_significance(values, item.get("limits"))
+            # 只有 level 2（≥3%）才给关键点。1%~3% 那一档连点都不给——
+            # 给了点，模型就会去逐点解读，那正是要避免的。
+            picks = _compress_series(samples, _SERIES_MAX_POINTS) if sig.get("level") == 2 else []
+            body = "、".join(
+                f"{_format_live_time(sample.get('time'))} {sample.get('value')}"
+                for sample in picks
+                if sample.get("value") is not None
+            ) or "无"
+
+            # 特征摘要放在点序列**之前**：它是结论性信息（斜率、r²、拐点），
+            # 点序列只是佐证。模型先拿到结论，再看点，比反过来更容易用对。
+            lines = [
+                f"[{label} {idx}] {item.get('description') or item.get('query')}"
+                f"（KKS={item.get('kks') or '未知'}，单位 {item.get('unit') or '未知'}）",
+                f"  区间 {_format_live_time(item.get('start'))} ~ {_format_live_time(item.get('end'))}"
+                f"，共 {len(samples)} 个采样点"
+                f"（采集间隔 {item.get('interval_seconds') or '原始'} 秒）",
+            ]
+            if sig.get("comparable"):
+                scale = []
+                if sig.get("rel_reading") is not None and sig["rel_reading"] < float("inf"):
+                    scale.append(f"占读数 {sig['rel_reading']:.2%}")
+                if sig.get("rel_range") is not None:
+                    scale.append(f"占工程量程 {sig['rel_range']:.2%}")
+                lines.append(
+                    f"  波动幅度：P5={sig['p5']:.6g}，P95={sig['p95']:.6g}，"
+                    f"中位 {sig['median']:.6g}"
+                    + (f"（{'，'.join(scale)}）" if scale else "")
+                )
+                if sig.get("discrete"):
+                    # 图上看得最清楚：取值在两个固定值之间规律跳动。
+                    # 不点破的话，模型会把采集问题当成设备异常来解读。
+                    lines.append(
+                        f"  数据质量：**取值只集中在 {sig.get('distinct_values')} 个固定值上**"
+                        f"（{sig.get('samples')} 个采样点），符合采集侧丢包或取整的特征。"
+                        f"（作答要求：据此说明数据质量，说明趋势，并建议核对采集链路；"
+                        f"不要把它写成设备异常、突变或工况变化。）"
+                    )
+
+            level = sig.get("level", 2)
+            if level == 0:
+                # 完全隐掉：不给斜率、不给突变点、不给关键点。
+                # 模型没有材料可解读，自然不会把 0.6% 的抖动写成「短暂下探」。
+                lines.append(
+                    "  波动判定：**低于显著变化阈值**。"
+                    "（作答要求：直接给「基本无变动」的结论即可，不要逐点罗列数值。）"
+                )
+            elif level == 1:
+                # 中间档：图和统计都给，但不给可解读的「事件」。
+                lines.append(
+                    "  波动判定：处于**低位区间**，不构成值得单独分析的变化。"
+                    "（作答要求：概述整体走势并给出统计值即可，"
+                    "不要逐点罗列、不要定性为异常或突变。）"
+                )
+            elif feat:
+                unit = item.get("unit") or ""
+                lines.append(
+                    f"  整体趋势：{feat.get('direction')}，"
+                    f"斜率 {feat.get('slope_per_minute'):+.4f} {unit}/分钟，"
+                    f"线性拟合 R²={feat.get('r2'):.3f}"
+                )
+                turns = feat.get("turning_points") or []
+                for turn in turns:
+                    # 电平差是判断「是否真发生了状态变化」的主依据；
+                    # 段内 r² 只描述那一段平不平，**不是拐点的可信度**——
+                    # 压力从有到无之后必然是平直段，r² 低恰恰是跃迁完成的证据。
+                    lines.append(
+                        f"  突变点：{turn.get('time')}，"
+                        f"均值由 {turn.get('before_mean'):.6g} 变为 {turn.get('after_mean'):.6g}"
+                        f"（{turn.get('rate_sign')} {abs(turn.get('level_delta')):.6g} {unit}，"
+                        f"相对变化 {turn.get('level_percent'):.1f}%，"
+                        f"占全程量程 {turn.get('level_ratio'):.0%}）"
+                        f"；之后 {turn.get('after_points')} 点维持"
+                        f"{'平直' if turn.get('after_flat') else '波动'}"
+                    )
+                if turns:
+                    lines.append(
+                        "  说明：突变点的「占全程量程」比例越高，越是一次真实的状态变化；"
+                        "段内是否平直只描述该段形态，不构成对突变本身的否定。"
+                    )
+                rate = feat.get("max_rate") or {}
+                if rate:
+                    lines.append(
+                        f"  最大变化率：{rate.get('per_minute'):+.4f} {unit}/分钟"
+                        f"（出现在 {rate.get('time')}）"
+                    )
+                lines.append(
+                    f"  数值范围：最小 {feat.get('min')}，最大 {feat.get('max')}，"
+                    f"最新 {feat.get('latest')}，全程变化 {feat.get('delta'):+.4f}"
+                )
+            # flat 时 picks 为空，这一行会写成「0 点：无」——同样是噪声，跳过
+            if picks:
+                lines.append(f"  压缩后的关键点（{len(picks)} 点）：{body}")
+            chunks.append("\n".join(lines))
+        series_block = "\n\n测点序列数据：\n" + "\n".join(chunks)
+
+    # 运行日志单独成块。只有对方明确问运行记录时才会走到这里。
+    logs_block = ""
+    if logs:
+        summary = logs.get("summary") or {}
+        events = logs.get("events") or []
+        categories = "、".join(
+            f"{name} {count} 条" for name, count in (summary.get("categories") or {}).items()
+        ) or "无"
+        lines = []
+        for idx, event in enumerate(events, 1):
+            severity = str(event.get("severity") or "")
+            mark = "【重大】" if severity == "major" else ("【重要】" if severity == "important" else "")
+            lines.append(
+                f"[日志 {idx}] {mark}{event.get('time') or event.get('date') or ''} "
+                f"{event.get('source') or ''}／{event.get('category') or ''}："
+                f"{str(event.get('content') or '').strip()}"
+            )
+        logs_block = (
+            f"\n\n运行日志（{logs.get('start')} ~ {logs.get('end')}"
+            f"{'，仅重大事件' if logs.get('major_only') else ''}）：\n"
+            f"  合计 {summary.get('total_events', len(events))} 条，"
+            f"其中重大 {summary.get('major_events', 0)} 条；分类：{categories}\n"
+            + "\n".join(lines)
         )
 
     # 未检索时不拼证据段落：一旦出现「检索证据：无」这类框架，模型会顺着去说
     # 「证据中没有」，而不是直接依据自身设定回答。
+    # 实时数据块合并：测点当前值、历史/趋势序列、运行日志三者并列。
+    # 它们都是「当前系统的事实」而非文档证据，拼在同一段里便于模型对照。
+    realtime_block = live_block + series_block + logs_block
+    has_realtime = bool(live_points or series or logs)
+
     if skip_retrieval:
-        user = f"问题：{question}{live_block}"
+        user = f"问题：{question}{realtime_block}"
         system_body = (
             "本轮未检索文档知识库。"
             + (
-                "请基于下面给出的实时测点数据回答，并说明数据采集时间。"
-                if live_points
+                "请基于下面给出的实时数据回答，并说明数据采集时间。"
+                if has_realtime
                 else "请直接依据自身设定回答，不要提及检索、证据或知识库。"
             )
             # 不加这句模型会为了「答得完整」编造上下文长度之类的配置数值，
@@ -1594,7 +2680,7 @@ def _prompt(
         )
     else:
         user = (
-            f"问题：{question}{live_block}"
+            f"问题：{question}{realtime_block}"
             f"\n\n检索证据：\n{evidence}\n\n知识图谱上下文：\n{graph}"
         )
         system_body = (
@@ -1620,8 +2706,20 @@ def _prompt(
                     else ""
                 )
                 + "禁止使用表情符号或 emoji。"
-                "使用方便阅读的短段落、分级标题和编号列表；禁止长难句。"
-                "长内容必须按主题、步骤、条件和例外分段，禁止把大量内容堆在一个长段落中。"
+                # 前端已接入 Markdown 渲染（见 industrial-webui/lib/markdown.js），
+                # 所以标题、列表、加粗都会正确排版，不再是字面的符号。
+                # 这里的取舍是「结构跟着内容走」，不是一刀切地禁或放。
+                "\n\n【作答形态】按内容决定形态，结构跟着内容走，不要一刀切。\n"
+                "· 一问一答能说清的（某个值是多少、某件事有没有发生）：直接一段话讲完，"
+                "不要分节也不要加标题。\n"
+                "· 内容确实并列时（操作步骤、参数清单、多个独立事项、逐条对比）："
+                "用有序或无序列表，让每一条独立成行，不要挤在一段里。\n"
+                "· 内容跨越多个主题、篇幅较长时：用二级或三级标题分节（最多三级），"
+                "让读者能跳读。\n"
+                "· 关键数值、结论、风险提示用粗体标出，但不要整句加粗、更不要每行都加粗。\n"
+                "· 需要强调层级时可用表格；纯叙述不要用表格。\n"
+                "总的原则：**结构是为了让读者更快找到信息，不是为了显得整齐**。"
+                "把一句完整的话拆成几个列表项，或者给三行内容加四个标题，都是反面例子。"
             ),
         },
     ]
@@ -1656,6 +2754,8 @@ async def _llm_answer(
     allow_online: bool = True,
     skip_retrieval: bool = False,
     live_points: list[dict[str, Any]] | None = None,
+    series: list[dict[str, Any]] | None = None,
+    logs: dict[str, Any] | None = None,
 ) -> tuple[str, str, Any, str | None, dict[str, Any]]:
     if image_attachments:
         candidates, capability_errors = await _vision_candidates(
@@ -1707,6 +2807,8 @@ async def _llm_answer(
                 image_attachments=image_attachments,
                 skip_retrieval=skip_retrieval,
                 live_points=live_points,
+                series=series,
+                logs=logs,
             )
             target_context_window = int(
                 candidate.get("context_window") or _context_window(selected_mode)
@@ -1846,6 +2948,8 @@ async def _answer(
     allow_online: bool = True,
     skip_retrieval: bool = False,
     live_points: list[dict[str, Any]] | None = None,
+    series: list[dict[str, Any]] | None = None,
+    logs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     selected_mode = _resolve_inference_mode(inference_mode)
     llm_contexts = _llm_contexts(selected_mode, contexts)
@@ -1865,6 +2969,8 @@ async def _answer(
         allow_online=allow_online,
         skip_retrieval=skip_retrieval,
         live_points=live_points,
+        series=series,
+        logs=logs,
     )
     context_meta = {
         "compressed": preparation.compressed,
@@ -2244,6 +3350,8 @@ async def qa_query(
         allow_online=_online_inference_allowed(user),
         skip_retrieval=bool(rag_info.get("no_retrieval")),
         live_points=rag_info.get("live_points") or [],
+        series=rag_info.get("series") or [],
+        logs=rag_info.get("logs"),
     )
     result["rag"] = rag_info
     return result
@@ -2298,15 +3406,203 @@ def _self_check() -> None:
     full_prompt = _prompt("q", [{"text": "a" * 1000}])
     assert "a" * 1000 in full_prompt[-1]["content"]
     # 规划解析：检索无法判定返回 None（调用方保守按「需要检索」），测点无法判定返回空列表
-    assert _parse_plan("检索: yes\n测点: 无") == (True, [])
-    assert _parse_plan("检索: no\n测点: 主蒸汽温度") == (False, ["主蒸汽温度"])
-    assert _parse_plan("检索: yes\n测点: 闭式冷却水泵、凝结水压力") == (
-        True,
-        ["闭式冷却水泵", "凝结水压力"],
+    # 规划解析：返回结构化意图字典。检索无法判定为 None（调用方保守按「需要检索」），
+    # 各项无法判定为 None 或空列表。
+    _p = _parse_plan("检索: yes\n测点: 无")
+    assert _p["needs_rag"] is True and _p["points"] == []
+    _p = _parse_plan("检索: no\n测点: 主蒸汽温度")
+    assert _p["needs_rag"] is False and _p["points"] == ["主蒸汽温度"]
+    _p = _parse_plan("检索: yes\n测点: 闭式冷却水泵、凝结水压力")
+    assert _p["points"] == ["闭式冷却水泵", "凝结水压力"]
+    assert _parse_plan("检索: yes\n测点: a、b、c、d")["points"] == ["a", "b", "c"]  # 上限 3 个
+    assert _parse_plan("检索：否\n测点：None")["points"] == []
+    _p = _parse_plan("随便说点什么")
+    assert _p["needs_rag"] is None and _p["points"] == []
+    # 历史／趋势／日志三项按语意解析，日期写成 ISO，间隔与重大标记可识别
+    _p = _parse_plan(
+        "检索: yes\n测点: 无\n历史: 无\n"
+        "趋势: 汽包水位|2026-09-12|2026-09-13|300\n日志: 2026-09-12|2026-09-12|重大"
     )
-    assert _parse_plan("检索: yes\n测点: a、b、c、d")[1] == ["a", "b", "c"]  # 上限 3 个
-    assert _parse_plan("检索：否\n测点：None") == (False, [])
-    assert _parse_plan("随便说点什么") == (None, [])
+    assert _p["trend"]["keyword"] == "汽包水位"
+    assert _p["trend"]["start"] == "2026-09-12" and _p["trend"]["end"] == "2026-09-13"
+    assert _p["trend"]["interval_seconds"] == 300
+    assert _p["logs"]["major_only"] is True
+    assert _p["history"] is None
+    # 旧的两行格式必须仍然可用：模型漏输出新行时不能让整条链路退化
+    _p = _parse_plan("检索: yes\n测点: 给水流量")
+    assert _p["points"] == ["给水流量"] and _p["history"] is None and _p["logs"] is None
+    # 区间越界与起止颠倒都要被收口，不能让模型给出的日期直接进查询
+    _p = _parse_plan("检索: no\n测点: 无\n历史: 无\n趋势: 无\n日志: 2020-01-01|2026-09-13")
+    assert (
+        date.fromisoformat(_p["logs"]["end"]) - date.fromisoformat(_p["logs"]["start"])
+    ).days < _QUERY_MAX_DAYS
+    _p = _parse_plan("检索: no\n测点: 无\n历史: 无\n趋势: 无\n日志: 2026-09-13|2026-09-10")
+    assert _p["logs"]["start"] <= _p["logs"]["end"]
+    # 序列抽稀必须保留首尾两点——它们最能说明「现在处于什么水平」
+    _samples = [{"time": f"t{i}", "value": i} for i in range(644)]
+    _thin = _thin_samples(_samples, _SERIES_MAX_POINTS)
+    assert len(_thin) == _SERIES_MAX_POINTS
+    assert _thin[0]["value"] == 0 and _thin[-1]["value"] == 643
+
+    # ── 趋势特征提取 ──
+    def _mk(values, step=60):
+        base = datetime(2026, 9, 13, 0, 0, 0, tzinfo=timezone.utc)
+        return [
+            {"time": (base + timedelta(seconds=step * i)).isoformat(), "value": float(v)}
+            for i, v in enumerate(values)
+        ]
+
+    # 单调上升：斜率应为正、r² 接近 1、不报拐点
+    _f = _series_features(_mk([float(i) for i in range(40)]))
+    assert _f["slope_per_minute"] > 0 and _f["r2"] > 0.99, _f
+    assert _f["direction"] == "上升"
+    assert "turning_point" not in _f  # 单调段报拐点只会添噪声
+    assert _f["max_rate"]["per_minute"] > 0
+
+    # 先降后升：整体斜率接近 0 但 r² 很低，必须报出突变点，
+    # 否则模型会只看到「平稳」而漏掉「已经转向」
+    _v = [100.0 - i for i in range(20)] + [80.0 + i for i in range(20)]
+    _f = _series_features(_mk(_v))
+    assert _f["r2"] < _TREND_TURNING_R2, _f
+    assert _f.get("turning_points"), _f
+    _t = _f["turning_points"][0]
+    assert _t["rate_sign"] == "升", _t
+    # V 形回升会把「前后均值差」摊薄，用不到满量程——0.3 已是明确信号
+    assert _t["level_delta"] > 0 and _t["level_ratio"] > 0.3, _t
+
+    # **压力从有到无**：这是本项目最典型的真实跃迁——均值大幅下移、
+    # 之后长期平直。段内 r² 会很低，但那恰恰是跃迁完成的证据，不能据此否定它。
+    _v = [0.018] * 30 + [0.0] * 30
+    _f = _series_features(_mk(_v))
+    assert _f.get("turning_points"), "压力消失这种真实跃迁必须被报出来"
+    _t = _f["turning_points"][0]
+    assert _t["rate_sign"] == "降", _t
+    assert _t["level_ratio"] > 0.9, _t          # 电平差几乎等于全程量程
+    assert _t["after_flat"] is True, _t         # 之后是平直段——这是特征，不是缺陷
+
+    # 完全平直：方向为「基本平稳」，不报突变点
+    _f = _series_features(_mk([5.0] * 30))
+    assert _f["direction"] == "基本平稳", _f
+    assert not _f.get("turning_points"), _f
+
+    # 纯噪声抖动不该被报成突变：电平差达不到量程比例
+    _v = [10.0 + (0.01 if i % 2 else -0.01) for i in range(40)]
+    _f = _series_features(_mk(_v))
+    assert not _f.get("turning_points"), f"噪声被误报为突变: {_f.get('turning_points')}"
+
+    # **高占比但低百分比的微动**：真实数据集里 0.0181727→0.01829 只变了 0.6%，
+    # 但因为当时量程本身就极小，它占了量程的 24%。只看占比会把它当事件，
+    # 模型就会去解读一个物理上不存在的状态变化。
+    _v = [0.018 + (0.0001 if 20 <= i < 40 else 0) for i in range(60)]
+    _f = _series_features(_mk(_v))
+    _turns = _f.get("turning_points") or []
+    assert not _turns, f"0.6% 的微动被误报为突变: {_turns}"
+
+    # 对照：同样占比、但物理量级上确有意义的跃迁，必须报出来
+    _v = [0.018] * 30 + [0.0] * 30
+    _f = _series_features(_mk(_v))
+    assert _f.get("turning_points"), "压力消失这类跃迁不能因为百分比口径而被滤掉"
+    assert _f["turning_points"][0]["level_percent"] > 99.0
+
+    # ── 整段显著性：趋势场景宁可多报 ──
+    # 分位数：单点毛刺不该把 P95-P5 撑大
+    assert _percentile([1, 2, 3, 4, 5], 0.5) == 3.0
+    assert _percentile([1, 2, 3, 4], 0.0) == 1.0 and _percentile([1, 2, 3, 4], 1.0) == 4.0
+    assert _percentile([], 0.5) == 0.0
+
+    # 实测那条的真实幅度：0.017842~0.018338，极差 0.000496，占读数 2.8%
+    # → 落在中间档（1%~3%）：给图和统计，但不展开斜率与突变点
+    _v = [0.018338 if i % 7 else 0.017842 for i in range(60)]
+    _s = _series_significance(_v)
+    assert _s["comparable"] and _s["level"] == 1, _s
+    assert not _s["flat"], "2.8% 不该被完全隐掉"
+    assert _s["rel_reading"] > _FLAT_LEVEL_MINOR, _s
+
+    # 离散跳变：只在两个固定值之间跳，应被判为采集噪声特征
+    assert _s["discrete"] and _s["distinct_values"] == 2, _s
+
+    # 真·平坦：占读数远低于 1%，完全隐掉
+    _s = _series_significance([10.0 + (0.001 if i % 2 else -0.001) for i in range(60)])
+    assert _s["level"] == 0 and _s["flat"], _s
+
+    # 尖峰毛刺：P95-P5 不受影响，仍判平坦（若用 max-min 就会被这一个点撑开）
+    _v = [10.0] * 60
+    _v[30] = 12.0
+    assert _series_significance(_v)["level"] == 0, "单点毛刺不该改变整段判定"
+
+    # 真实大变化：占比远超 3%，完整展开
+    _s = _series_significance([0.018] * 30 + [0.0] * 30)
+    assert _s["level"] == 2 and not _s["flat"], _s
+
+    # 有工程量程时第二路参与，两路取更高等级
+    _v = [50.0 + (i % 3) * 0.8 for i in range(60)]      # 占读数约 3.2%
+    assert _series_significance(_v)["level"] == 2, "占读数 3.2% 应完整展开"
+    _s = _series_significance(_v, {"high": 100.0, "low": 0.0})
+    assert _s["rel_range"] is not None, _s
+
+    # 样本不足时不判级别（-1），避免拿两三个点下结论
+    assert _series_significance([1.0, 2.0])["level"] == -1
+    assert not _series_significance([])["comparable"]
+
+    # 极值与变化量
+    _f = _series_features(_mk([1.0, 5.0, 2.0, 9.0, 3.0]))
+    assert _f["min"] == 1.0 and _f["max"] == 9.0 and _f["latest"] == 3.0
+
+    # 点数不足或时间无法解析时返回空字典，而不是抛异常
+    assert _series_features([]) == {}
+    assert _series_features([{"time": "x", "value": 1}]) == {}
+
+    # ── 保形压缩：跳变点不能被抽掉 ──
+    # 构造「长期平直 + 中段跳变」的曲线，压缩后跳变两侧必须还在
+    _jump = _mk([10.0] * 200 + [50.0] * 200)
+    _c = _compress_series(_jump, 24)
+    assert len(_c) <= 24
+    _vals = [p["value"] for p in _c]
+    assert 10.0 in _vals and 50.0 in _vals, "跳变两侧被抽掉了"
+    assert _vals[0] == 10.0 and _vals[-1] == 50.0, "首尾必须保留"
+    # 点数少于上限时原样返回，不做无谓处理
+    assert _compress_series(_jump[:5], 24) == _jump[:5]
+
+    # ── 测点相关性判定：模糊检索的 top-1 不能盲信 ──
+    # 实测搜「轴封供汽压力」返回 5 条，正确答案排第 4，top-1 是完全无关的
+    # 「高压主蒸汽压力3选1后」。取 top-1 会把错数据当事实喂给模型。
+    assert not _point_matches("轴封供汽压力", "高压主蒸汽压力3选1后")
+    assert not _point_matches("轴封供汽压力", "低压主蒸汽压力3选后")
+    assert _point_matches("轴封供汽压力", "#1机组轴封供气压力1")   # 汽/气 异体字仍应命中
+    # 只命中设备不命中物理量：阀门反馈不是压力测点
+    assert not _point_matches("轴封供汽压力", "轴封供汽管道疏水母管气动关断阀开反馈")
+    # 同义词（水位↔液位）字符级判不出来，**这正是模型兜底存在的理由**：
+    # 这里必须是 False，否则 _resolve_point 就不会走到 _pick_live_point
+    assert not _point_matches("凝汽器水位", "凝汽器液位")
+    assert not _point_matches("凝汽器水位", "主蒸汽温度")
+    assert _point_matches("压力", "主蒸汽压力")                  # 短词只判首部
+    assert not _point_matches("轴封", "")    # 实时块合并：三类数据都要出现在同一条 user 消息里
+    _rt = _prompt(
+        "q", [],
+        series=[{
+            "kind": "trend", "query": "汽包水位", "kks": "01K", "description": "汽包水位",
+            "unit": "mm", "start": "2026-09-12T00:00:00", "end": "2026-09-13T00:00:00",
+            "interval_seconds": 300,
+            "summary": {"latest_value": 1, "min_value": -2, "max_value": 3},
+            "samples": [{"time": "2026-09-12T01:00:00+00:00", "value": 1}],
+        }],
+        logs={
+            "start": "2026-09-12", "end": "2026-09-12", "major_only": False,
+            "summary": {"total_events": 118, "major_events": 71, "categories": {"值班记事": 88}},
+            "events": [{
+                "time": "2026-09-12 22:58:44", "source": "值长日志",
+                "category": "值班记事", "severity": "major", "content": "某事件",
+            }],
+        },
+    )
+    assert "测点序列数据" in _rt[-1]["content"] and "运行日志" in _rt[-1]["content"]
+    assert "【重大】" in _rt[-1]["content"]
+    # 作答形态：必须以段落为默认，且不能残留「鼓励分级标题」的旧指令
+    _sys = _prompt("q", [])[0]["content"]
+    assert "作答形态" in _sys, "缺少作答形态指令"
+    assert "结构跟着内容走" in _sys
+    assert "列表" in _sys and "标题" in _sys, "放开结构后应明确允许列表与标题"
+    assert "使用分级标题和编号列表" not in _sys, "旧的鼓励结构化指令仍在"
     # 实时测点单独成块，不与文档证据混在一起
     live_prompt = _prompt(
         "q",

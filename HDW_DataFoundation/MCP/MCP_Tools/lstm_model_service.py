@@ -214,7 +214,7 @@ def format_number(value: Any) -> str:
 
 
 class LSTMModelMCPService:
-    """MCP adapter for SmartGasTurbine LSTM setpoint tracking controller models."""
+    """MCP adapter for HyperDriveWave LSTM setpoint tracking controller models."""
 
     def __init__(self) -> None:
         self._lstm_app = None
@@ -222,7 +222,7 @@ class LSTMModelMCPService:
 
     def _load_lstm_app(self):
         if self._lstm_app is None:
-            self._lstm_app = load_module("smartgasturbine_mcp_lstm_app", LSTM_APP_PATH)
+            self._lstm_app = load_module("hdw_mcp_lstm_app", LSTM_APP_PATH)
         return self._lstm_app
 
     def _load_mapping(self) -> Dict[str, Dict[str, str]]:

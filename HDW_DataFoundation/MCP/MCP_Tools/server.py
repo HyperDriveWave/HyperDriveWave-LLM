@@ -374,7 +374,7 @@ def lstm_model_predict_control(
 
 
 @mcp.tool()
-def log_query_recent(query_text: str = "", days: int = 1, major_only: bool = False, limit: int = 80, fetch_if_missing: bool = False) -> dict:
+def log_query_recent(query_text: str = "", days: int = 1, major_only: bool = False, limit: int = 80, fetch_if_missing: bool = True) -> dict:
     """Query recent LIEMS logs and summarize what happened."""
     return LOG_QUERY_SERVICE.recent_logs(
         query_text=query_text,
@@ -392,7 +392,7 @@ def log_query_range(
     end_date: str = "",
     major_only: bool = False,
     limit: int = 120,
-    fetch_if_missing: bool = False,
+    fetch_if_missing: bool = True,
 ) -> dict:
     """Query LIEMS logs in a date range and return structured events plus summary."""
     return LOG_QUERY_SERVICE.range_logs(
@@ -406,7 +406,7 @@ def log_query_range(
 
 
 @mcp.tool()
-def log_query_major_events(days: int = 7, query_text: str = "", limit: int = 120, fetch_if_missing: bool = False) -> dict:
+def log_query_major_events(days: int = 7, query_text: str = "", limit: int = 120, fetch_if_missing: bool = True) -> dict:
     """Query major LIEMS events in the recent N days."""
     return LOG_QUERY_SERVICE.major_events(
         days=max(1, min(60, int(days or 7))),
@@ -447,7 +447,7 @@ def hydrogen_leak_calculate(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SmartGasTurbine MCP server.")
+    parser = argparse.ArgumentParser(description="HyperDriveWave industrial MCP server.")
     parser.add_argument(
         "--transport",
         choices=("stdio", "streamable-http"),

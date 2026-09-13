@@ -17,14 +17,14 @@ MCP_FEATURE = {
 
 
 MCP_DIR = Path(__file__).resolve().parent
-LOG_FETCHING_DIR = Path(os.getenv("HDW_MCP_LOG_ROOT", "/data/logs")).resolve()
+LOG_FETCHING_DIR = Path(os.getenv("HDW_MCP_LOG_ROOT", "/data/mapping/Log_Fetching")).resolve()
 LOG_FETCHING_SERVICE_PATH = LOG_FETCHING_DIR / "service.py"
 
 
 def _load_log_fetching_service_class():
     if not LOG_FETCHING_SERVICE_PATH.exists():
         raise FileNotFoundError(f"Log fetching service not found: {LOG_FETCHING_SERVICE_PATH}")
-    spec = importlib.util.spec_from_file_location("smartgasturbine_log_fetching_service", LOG_FETCHING_SERVICE_PATH)
+    spec = importlib.util.spec_from_file_location("hdw_mcp_log_fetching_service", LOG_FETCHING_SERVICE_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError("Cannot load Log_Fetching service module")
     module = importlib.util.module_from_spec(spec)
@@ -43,7 +43,11 @@ class LogQueryService:
         days: int = 1,
         major_only: bool = False,
         limit: int = 0,
-        fetch_if_missing: bool = False,
+        # **默认必须是 True**。下层 LogFetchingService.query() 的同名参数默认就是
+        # True，这里写成 False 会把它覆盖掉：本地缓存没有当天的 JSON 时，
+        # 工具既不抓取、也不报错，直接返回 total_events=0 的"成功"结果。
+        # 对模型调用方来说这等于"看着成功、实际什么都没给"，是最难排查的一类失败。
+        fetch_if_missing: bool = True,
         force_fetch: bool = False,
     ) -> Dict[str, Any]:
         return self.service.query(
@@ -62,7 +66,7 @@ class LogQueryService:
         end_date: str = "",
         major_only: bool = False,
         limit: int = 0,
-        fetch_if_missing: bool = False,
+        fetch_if_missing: bool = True,
         force_fetch: bool = False,
     ) -> Dict[str, Any]:
         return self.service.query(
@@ -80,7 +84,7 @@ class LogQueryService:
         days: int = 7,
         query_text: str = "",
         limit: int = 0,
-        fetch_if_missing: bool = False,
+        fetch_if_missing: bool = True,
         force_fetch: bool = False,
     ) -> Dict[str, Any]:
         return self.service.query(

@@ -19,7 +19,7 @@ if WEBUI_DIR not in sys.path:
 import webui_worker_client  # noqa: E402
 
 
-DISPLAY_TIMEZONE_NAME = os.environ.get("SMARTGASTURBINE_DISPLAY_TZ", "Asia/Shanghai")
+DISPLAY_TIMEZONE_NAME = os.environ.get("HDW_DISPLAY_TZ", "Asia/Shanghai")
 if ZoneInfo is not None:
     try:
         DISPLAY_TIMEZONE = ZoneInfo(DISPLAY_TIMEZONE_NAME)

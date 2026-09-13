@@ -1,6 +1,6 @@
 """Top-level MCP exports.
 
-This local vendored copy is used by SmartGasTurbine primarily for server-side
+This local vendored copy is used by HyperDriveWave primarily for server-side
 MCP integration. Some client transports pull in optional platform-specific
 dependencies at import time on Windows. To keep the server usable without
 forcing those imports, top-level client symbols are exposed lazily.

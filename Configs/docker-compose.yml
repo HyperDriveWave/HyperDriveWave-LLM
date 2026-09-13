@@ -269,7 +269,14 @@ services:
       HDW_MCP_MAPPING_ROOT: /data/mapping
       HDW_MCP_THERMAL_ROOT: /data/thermal
       HDW_MCP_LSTM_ROOT: /data/lstm
-      HDW_MCP_LOG_ROOT: /data/logs
+      # LIEMS 日志抓取模块。载体放在**已挂载**的 Mapping 目录下，
+      # 因此不需要新增挂载点。模块从自身目录读 config.json
+      # （可用 HDW_LOG_FETCHING_CONFIG 覆盖），凭据在部署时从 Configs/.env 生成。
+      # 该目录已被 .gitignore 排除，凭据不会进版本库。
+      HDW_MCP_LOG_ROOT: /data/mapping/Log_Fetching
+      # 抓取过程的临时目录。注意本模块设计为**不保留**日志数据：
+      # 每次 fetch_range 结束都会 cleanup 掉导出文件，所以日志查询每次都是真实抓取。
+      HDW_LOG_FETCHING_DATA_DIR: /data/mapping/Log_Fetching/data
       HDW_SIS_BASE_URL: ${HDW_SIS_BASE_URL:-}
       HDW_SIS_LOGIN_URL: ${HDW_SIS_LOGIN_URL:-}
       HDW_SIS_USERNAME: ${HDW_SIS_USERNAME:-}
@@ -287,6 +294,8 @@ services:
     volumes:
       - ../HDW_Frontend/industrial-webui/index.html:/usr/share/nginx/html/index.html:ro
       - ../HDW_Frontend/industrial-webui/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # 本地 JS 依赖。内网部署，**不能用 CDN**，所以 markdown 渲染器放本地。
+      - ../HDW_Frontend/industrial-webui/lib:/usr/share/nginx/html/lib:ro
       - ../icons:/usr/share/nginx/html/icons:ro
       - ../HDW_Animation/aora-bot/emotion-ball/js:/usr/share/nginx/html/ball:ro
       - ../HDW_Frontend/FRP/certs:/etc/nginx/certs:ro

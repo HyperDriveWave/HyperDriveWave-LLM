@@ -24,7 +24,7 @@ MCP_FEATURE = {
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 POINT_QUERY_SERVICE_PATH = os.path.join(BASE_DIR, "point_query_service.py")
 POINT_QUERY_WORKER_PROXY_PATH = os.path.join(BASE_DIR, "point_query_worker_proxy.py")
-DISPLAY_TIMEZONE_NAME = os.environ.get("SMARTGASTURBINE_DISPLAY_TZ", "Asia/Shanghai")
+DISPLAY_TIMEZONE_NAME = os.environ.get("HDW_DISPLAY_TZ", "Asia/Shanghai")
 if ZoneInfo is not None:
     try:
         DISPLAY_TIMEZONE = ZoneInfo(DISPLAY_TIMEZONE_NAME)
@@ -175,7 +175,7 @@ class HydrogenLeakService:
     def _load_point_query_service(self):
         if self._point_query_service is not None:
             return self._point_query_service
-        point_module = load_module("smartgasturbine_hydrogen_leak_point_query_service", POINT_QUERY_SERVICE_PATH)
+        point_module = load_module("hdw_hydrogen_leak_point_query_service", POINT_QUERY_SERVICE_PATH)
         self._point_query_service = point_module.PointQueryService()
         return self._point_query_service
 

@@ -83,7 +83,7 @@ EXCLUDES=(
   # ── 死文件 / 陈旧备份 ──
   "--exclude=/Configs/.env.before-remote-rag-*"
   "--exclude=/Configs/docker-compose.gpu.yml"      # 全项目零引用的早期方案残留
-  "--exclude=/HDW_Frontend/FRP/control"            # SmartGasTurbine 遗留脚本，路径指向另一个项目
+  "--exclude=/HDW_Frontend/FRP/control"            # 上游遗留脚本，路径指向本机另一个项目
 
   # ── 早期在源码树里编的重复产物 ──
   # 真正在用的是 llama.cpp-upstream/build*；这个是 217M 的重复品。

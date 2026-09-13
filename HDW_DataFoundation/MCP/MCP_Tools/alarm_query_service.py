@@ -102,7 +102,7 @@ def infer_ack_dedup_minutes(text: str, value: Any = None) -> int:
 
 class AlarmQueryService:
     def __init__(self) -> None:
-        module = load_module("smartgasturbine_mcp_alarm_service", ALARM_SERVICE_PATH)
+        module = load_module("hdw_mcp_alarm_service", ALARM_SERVICE_PATH)
         self.alarm_service = module.AlarmManagerService()
 
     def looks_like_alarm_query(self, query_text: str) -> bool:

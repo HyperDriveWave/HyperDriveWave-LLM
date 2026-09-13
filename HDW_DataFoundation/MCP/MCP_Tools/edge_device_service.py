@@ -98,7 +98,7 @@ def infer_power_action(query_text: str) -> str:
 
 class EdgeDeviceMCPService:
     def __init__(self) -> None:
-        self.edge_module = load_module("smartgasturbine_mcp_edge_device_service", EDGE_DEVICE_SERVICE_PATH)
+        self.edge_module = load_module("hdw_mcp_edge_device_service", EDGE_DEVICE_SERVICE_PATH)
 
     def looks_like_edge_device_query(self, query_text: str) -> bool:
         text = str(query_text or "").strip().lower()

@@ -46,7 +46,7 @@ def get_sis_value_format_module():
     global _SIS_VALUE_FORMAT_MODULE
     if _SIS_VALUE_FORMAT_MODULE is not None:
         return _SIS_VALUE_FORMAT_MODULE
-    module = load_module("smartgasturbine_mcp_sis_value_format", SIS_VALUE_FORMAT_PATH)
+    module = load_module("hdw_mcp_sis_value_format", SIS_VALUE_FORMAT_PATH)
     _SIS_VALUE_FORMAT_MODULE = module
     return module
 
@@ -799,7 +799,7 @@ class PointQueryService:
                 "record_count": 0,
                 "message": str(result.message or "SIS returned no mapped KKS records"),
             }
-        storage_module = load_module("smartgasturbine_mcp_sis_live_storage", os.path.join(SIS_LIVE_DIR, "storage.py"))
+        storage_module = load_module("hdw_mcp_sis_live_storage", os.path.join(SIS_LIVE_DIR, "storage.py"))
         runtime_config = self._build_sis_runtime_config()
         storage_cfg = runtime_config.get("storage", {}) if isinstance(runtime_config, dict) else {}
         output_dir = runtime_config.get("storage", {}).get("output_dir", os.path.join(SIS_LIVE_DIR, "data"))
