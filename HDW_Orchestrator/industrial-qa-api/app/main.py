@@ -114,6 +114,11 @@ class FrpPatch(BaseModel):
     enabled: bool
 
 
+class LocalModelPatch(BaseModel):
+    # True = 加载（把配置里的本地模型跑起来），False = 卸载（停进程、释放全部显存）。
+    loaded: bool
+
+
 _IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _MODEL_CONFIG_VERSION = 2
@@ -159,13 +164,10 @@ def _default_model_config() -> dict[str, Any]:
             "multimodal_enabled": True,
             "thinking_enabled": True,
             "enabled_for_users": True,
-            "model_options": [
-                {"value": settings.online_llm_model, "label": settings.online_llm_model},
-                {
-                    "value": "deepseek-flash",
-                    "label": "deepseek-flash",
-                },
-            ],
+            # 这里原来有一份 online.model_options。删掉了：**没有任何消费者**
+            # （前端在线模型名是自由文本框，不像本地那样是下拉），而把供应商的
+            # 模型列表硬编码进配置必然会过期——实测线上那份列的两个模型在
+            # 供应商侧早就没有了。留着只会误导，不如没有。
         },
         "permissions": {
             # 普通用户能不能在提问时上传图片。**管理员始终可以**，
@@ -3403,6 +3405,13 @@ def _prompt(
             "替代值看起来和真值一模一样，读的人分辨不出来。"
             "**证据之间数值不一致时**，把分歧原样列出来（各自的值与出处），"
             "不要自行挑一个当成唯一答案。"
+            # 实测：问「滚动轴承温度最高不允许超过__℃，滑动轴承…__℃」，
+            # 证据里写的是「滑动轴承不高于65℃，滚动轴承不高于80℃」，
+            # 模型答成「95；80」——值都见过，但配错了空。
+            # 同一段话里常并列着几个不同部位的定值，错位后照样是通顺的数字。
+            "**一道题里有多个空时，逐个空与证据里对应的那一项核对**，"
+            "按题干的先后顺序作答，不要把某个空的值挪到另一个空上；"
+            "拿不准某个空对应哪一项就写「证据中未明确对应关系」。"
             "这是工业场景，不要为了简短省略证据中的职责、步骤、条件、例外、参数或安全后果。"
             "必须逐条阅读并综合所有列出的证据和图谱上下文，不能只依据第一条；"
             "按主题合并重复内容，区分正常运行、启停检查和异常处理，"
@@ -3873,6 +3882,34 @@ async def patch_model_config(
     response = await get_model_config(x_hdw_session)
     if apply_result is not None:
         response["apply"] = apply_result
+    return response
+
+
+@app.patch("/local-model")
+async def patch_local_model(
+    patch: LocalModelPatch,
+    x_hdw_session: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """加载 / 卸载本地推理，占回或释放显存。
+
+    卸载只能停进程：llama.cpp 单模型模式没有任何运行期卸载接口
+    （`/models/unload` 只在多模型 router 下注册），协调器的 `/unload-llm`
+    实际就是 `systemctl --user stop hyperdrivewave-llama.service`。
+
+    加载复用协调器的 `/switch-llm`：它的语义本来就是「确保配置里的本地模型
+    在跑」（内部先 stop 再 start），从已卸载状态调用时 stop 是空操作。不再
+    另造一个与它完全重复的端点，避免两处逻辑日后走岔。
+    """
+    user = _current_user(x_hdw_session)
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="admin permission required")
+    action = "加载" if patch.loaded else "卸载"
+    try:
+        apply_result = await _maintenance_request("/switch-llm" if patch.loaded else "/unload-llm")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"本地模型{action}失败：{exc}") from exc
+    response = await get_model_config(x_hdw_session)
+    response["apply"] = apply_result
     return response
 
 

@@ -1179,6 +1179,71 @@ def _run_reset(job_id: str) -> None:
                 )
 
 
+def _run_sync(job_id: str, document_ids: list[str]) -> None:
+    """只把现有的 chunks 推到远端 RAG，并刷新文档上的同步状态。
+
+    为什么单独开这一条：`remote_sync_status` 是**入库那一刻写死的快照**，
+    读取时走的是 `setdefault`（只补缺失字段，从不重算），所以配置晚于入库时，
+    文档会一直显示「未配置」——哪怕数据其实早就同步过去了。而 `_sync_remote_rag`
+    只在 `_run_ingest` 和 `_run_reset` 里被调用，想改这个标签就得重建整个知识库。
+
+    不做解析、不嵌入、也不碰大模型，所以比入库快得多，也不占显存。
+    """
+    remote_urls = _remote_rag_urls()
+    try:
+        _update_documents(document_ids, remote_sync_status="running")
+        _update_job(
+            job_id,
+            status="running",
+            stage="sync",
+            message="同步远端RAG中",
+            progress=_progress(
+                "sync",
+                0,
+                len(remote_urls),
+                unit="remote_rag_nodes",
+                message="等待远端 RAG 节点",
+            ),
+        )
+        remote_sync = _sync_remote_rag(job_id)
+        # 一个远端都没配时 `_sync_remote_rag` 直接返回 skipped——照实写回
+        # not_configured，不把「没配」粉饰成「完成」。
+        completed = remote_sync.get("status") == "completed"
+        _update_documents(
+            document_ids,
+            remote_sync_status="completed" if completed else "not_configured",
+        )
+        _update_job(
+            job_id,
+            status="completed",
+            stage="sync_completed" if completed else "completed",
+            message="远端 RAG 同步完成" if completed else "远端 RAG 未配置",
+            finished_at=_now(),
+            remote_rag=remote_sync,
+            progress=_progress(
+                "sync_completed" if completed else "completed",
+                1,
+                1,
+                unit="remote_rag_nodes",
+                message="远端 RAG 同步完成" if completed else "远端 RAG 未配置",
+            ),
+        )
+    except Exception as exc:
+        _update_documents(document_ids, remote_sync_status="failed")
+        _update_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            message=str(exc),
+            error=str(exc),
+            finished_at=_now(),
+            progress={
+                **_progress("failed", 0, 1, unit="job", message="任务失败"),
+                "error": str(exc),
+            },
+        )
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -1357,6 +1422,57 @@ def ingest(
             target=_run_ingest,
             args=(job_id, document_ids),
             kwargs={"full_rebuild": req.full_rebuild},
+            daemon=True,
+        )
+        thread.start()
+    return {"job": state["jobs"][job_id]}
+
+
+@app.post("/sync")
+def sync_remote_rag(x_hdw_session: str | None = Header(default=None)) -> dict[str, Any]:
+    """把现有 chunks 重新推到远端 RAG，并把文档上的同步状态刷成真实值。
+
+    比 `/ingest` 轻得多：不解析、不嵌入、不占大模型和显存。
+    """
+    require_admin(x_hdw_session)
+    with job_lock:
+        state = _snapshot()
+        active = next(
+            (
+                job
+                for job in state["jobs"].values()
+                if job.get("status") in {"queued", "running"}
+            ),
+            None,
+        )
+        if active:
+            # 入库正在重建 chunks 的时候同步，推过去的就是半成品。
+            raise HTTPException(status_code=409, detail=f"task already running: {active['id']}")
+        # 只标已入库的：chunks 文件里只有这些文档，把没入库的也说成「已同步」
+        # 就是在说谎，而这个标签存在的意义恰恰是别让人对状态产生错觉。
+        document_ids = [
+            doc_id
+            for doc_id, item in state["documents"].items()
+            if item.get("total_status") == "ingested"
+        ]
+        if not document_ids:
+            raise HTTPException(status_code=400, detail="no ingested knowledge documents")
+        job_id = uuid.uuid4().hex
+        state["jobs"][job_id] = {
+            "id": job_id,
+            # 界面靠它区分：同步作业不碰大模型，完成提示不能说「大模型已拉起」。
+            "kind": "remote_sync",
+            "status": "queued",
+            "stage": "queued",
+            "message": "等待远端 RAG 同步",
+            "document_ids": document_ids,
+            "full_rebuild": False,
+            "created_at": _now(),
+        }
+        _write_state(state)
+        thread = threading.Thread(
+            target=_run_sync,
+            args=(job_id, document_ids),
             daemon=True,
         )
         thread.start()

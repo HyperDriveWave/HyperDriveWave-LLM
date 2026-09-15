@@ -475,6 +475,39 @@ def switch_llm() -> dict[str, object]:
             raise
 
 
+def unload_llm() -> dict[str, object]:
+    """停掉本地推理，把显存整个还回去。
+
+    为什么只能停进程：llama.cpp 单模型模式**没有任何运行期卸载接口**。
+    `/models/unload` 确实存在，但只在多模型 router 模式下注册
+    （tools/server/server.cpp:239-243 的 `if (is_router_server)` 里），
+    本项目是单模型启动，那条路由根本没挂上。
+
+    为什么必须走 `systemctl stop` 而不能 kill 进程：单元是 `Restart=always`
+    + `RestartSec=3`，杀掉会在 3 秒后自己回来。显式 stop 属于主动停止，
+    systemd 不会重启它——`_stop_llama()` 在 prepare 流程里依赖的正是这一点。
+    """
+    with operation_lock:
+        current_mode = str(_snapshot()["mode"])
+        if current_mode in {
+            "preparing",
+            "prepared",
+            "restoring",
+            "switching_llm",
+            "unloading_llm",
+            "loading_llm",
+        }:
+            raise RuntimeError(f"当前资源状态为 {current_mode}，暂不能卸载本地模型")
+        _set_state("unloading_llm")
+        try:
+            _stop_llama()
+            _set_state("llm_unloaded")
+            return {"status": "ok", "mode": "llm_unloaded"}
+        except Exception as exc:
+            _set_state("error", str(exc))
+            raise
+
+
 def _frp_status() -> dict[str, object]:
     enabled = subprocess.run(
         ["systemctl", "--user", "is-enabled", "--quiet", FRPC_UNIT],
@@ -547,6 +580,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(200, restore())
             elif path == "/switch-llm":
                 self._reply(200, switch_llm())
+            elif path == "/unload-llm":
+                self._reply(200, unload_llm())
             elif path == "/frp-enable":
                 self._reply(200, {"status": "ok", **frp_enable()})
             elif path == "/frp-disable":

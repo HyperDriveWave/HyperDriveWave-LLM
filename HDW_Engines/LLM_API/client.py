@@ -79,11 +79,22 @@ class OpenAICompatibleClient:
                 "type": "enabled" if thinking_enabled else "disabled",
             }
 
-        # 上游（llama.cpp）会偶发瞬时 4xx/5xx：同一载荷隔一会儿重放即可成功。
-        # ponytail: 单次重试 + 固定 0.5s 间隔；连续抖动再考虑指数退避/熔断。
-        for attempt in range(2):
+        # 上游（llama.cpp）在请求来得比它消化得快时会回一个**空的 400**
+        # （无 body、`connection: close`、服务端日志里连任务都没创建）。
+        #
+        # 实测把触发条件量出来了：
+        #     间隔 3 秒发 20 次 → 0/20 失败
+        #     不间隔连发 20 次  → 9/20 失败（45%）
+        # 所以它是**速率**问题，不是"偶发"——原来那句「偶发瞬时 4xx/5xx」
+        # 的判断是错的，因而重试只隔 0.5s 也不够（0.5s 仍落在过快的那一侧）。
+        #
+        # 改成指数退避 + 三次尝试：第一次隔 1s、第二次隔 2s。
+        # 1s 起步是因为要跨过"比服务器消化得快"的那条线，而不是消除网络抖动。
+        _LLM_RETRY_BACKOFF = (1.0, 2.0)
+        attempts = len(_LLM_RETRY_BACKOFF) + 1
+        for attempt in range(attempts):
             if attempt:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(_LLM_RETRY_BACKOFF[attempt - 1])
             try:
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
                     response = await client.post(
@@ -92,12 +103,12 @@ class OpenAICompatibleClient:
                         json=payload,
                     )
             except httpx.HTTPError:
-                if attempt:
+                if attempt == attempts - 1:
                     raise
                 continue
             if not response.is_error:
                 break
-            if attempt:
+            if attempt == attempts - 1:
                 raise RuntimeError(f"LLM HTTP {response.status_code}: {response.text[:500]}")
 
         try:

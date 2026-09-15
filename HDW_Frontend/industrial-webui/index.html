@@ -1948,6 +1948,9 @@
     .model-page-actions {
       display: flex;
       align-items: center;
+      /* 加载/卸载两个按钮加进来后，窄屏一行放不下四个按钮 + 运行状态文字，
+         不给 wrap 的话会把状态文字挤出容器。 */
+      flex-wrap: wrap;
       gap: 10px;
       min-height: 42px;
       padding: 0 0 14px;
@@ -1962,6 +1965,16 @@
 
     .model-page-actions .text-button {
       border: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    /* 加载 / 卸载互斥时，禁用的那个原本和可用的一模一样，:hover 还照样变色，
+       根本看不出哪个能点。只限本页动作条，不影响别处同样使用 text-button 的按钮
+       （如知识库的「重置」在跑任务时也会 disabled，那里的语义不同）。 */
+    .model-page-actions .text-button:disabled,
+    .model-page-actions .text-button:disabled:hover {
+      cursor: not-allowed;
+      opacity: 0.45;
       background: var(--surface);
     }
 
@@ -3295,6 +3308,9 @@
                 <div class="document-toolbar">
                   <input id="documentSearchInput" type="search" placeholder="搜索文件名" aria-label="搜索知识库文件" />
                   <button id="refreshDocumentsButton" class="text-button" type="button" title="刷新文件列表">↻ 刷新</button>
+                  <button id="syncRemoteButton" class="text-button" type="button" title="把现有 chunks 重新推到远端 RAG，并刷新文档上的同步状态">
+                    同步远端
+                  </button>
                   <button id="resetKnowledgeButton" class="text-button danger-button" type="button" title="删除知识库源文件、解析结果、向量索引和图谱">
                     清空知识库
                   </button>
@@ -3380,6 +3396,8 @@
             </div>
 
             <div class="model-page-actions">
+              <button id="modelLoadButton" class="text-button" type="button" data-admin-only>加载本地模型</button>
+              <button id="modelUnloadButton" class="text-button danger-button" type="button" data-admin-only>卸载本地模型</button>
               <button id="modelSaveButton" class="primary-button" type="button" data-admin-only>保存配置</button>
               <button id="modelRefreshButton" class="text-button" type="button">↻ 刷新</button>
               <span id="modelRuntimeNote" class="model-runtime-note"></span>
@@ -3791,6 +3809,7 @@
     const documentCount = document.querySelector("#documentCount");
     const documentSearchInput = document.querySelector("#documentSearchInput");
     const resetKnowledgeButton = document.querySelector("#resetKnowledgeButton");
+    const syncRemoteButton = document.querySelector("#syncRemoteButton");
     const graphState = document.querySelector("#graphState");
     const graphSummary = document.querySelector("#graphSummary");
     const graphLabelFilter = document.querySelector("#graphLabelFilter");
@@ -3837,6 +3856,11 @@
     const modelSaveButton = document.querySelector("#modelSaveButton");
     const modelRefreshButton = document.querySelector("#modelRefreshButton");
     const modelRuntimeNote = document.querySelector("#modelRuntimeNote");
+    const modelLoadButton = document.querySelector("#modelLoadButton");
+    const modelUnloadButton = document.querySelector("#modelUnloadButton");
+    // 本地模型的加载状态。由 renderModelConfig 从 runtime.local.available 更新，
+    // 用来决定两个按钮哪个可用——不靠按钮文字去猜。
+    let localModelLoaded = true;
     // 视觉来源优先级。行数**必须**与后端 vision_priority 的 1~4 上限一致：
     // 界面行数少于配置项数时，保存会把多出来的项静默删掉（配置里 3 项、
     // 界面只发 2 项，第 3 项就没了），而且没有任何提示。
@@ -4142,6 +4166,7 @@
     let uploadQueueRunning = false;
     let knowledgeResetRunning = false;
     let ingestJobRunning = false;
+    let remoteSyncRunning = false;
     let knowledgeDocumentItems = [];
     let latestFailedIngestJob = null;
     let ingestPollTimer = null;
@@ -4196,6 +4221,19 @@
         : "仅管理员可用";
     }
 
+    // 两个按钮互斥：已加载时只能卸载，已卸载时只能加载。
+    // 必须在 [data-admin-only] 那一轮之后调用——它会重写 disabled，
+    // 若放在前面，非管理员会因为已经处于目标状态而被重新点亮。
+    function updateLocalModelState() {
+      const admin = isAdmin();
+      modelLoadButton.disabled = !admin || localModelLoaded;
+      modelUnloadButton.disabled = !admin || !localModelLoaded;
+      modelLoadButton.title = admin ? "" : "请联系管理员操作";
+      modelUnloadButton.title = admin
+        ? "停掉本地推理进程，把显存整个释放出来；期间本地问答不可用"
+        : "请联系管理员操作";
+    }
+
     function applyUserPermissions() {
       const admin = isAdmin();
       document.querySelectorAll("[data-admin-only]").forEach((item) => {
@@ -4213,6 +4251,9 @@
       startIngestButton.title = admin ? "" : "请联系管理员操作";
       retryIngestButton.title = admin ? "" : "请联系管理员操作";
       resetKnowledgeButton.title = admin ? "删除知识库源文件、解析结果、向量索引和图谱" : "请联系管理员操作";
+      syncRemoteButton.title = admin
+        ? "把现有 chunks 重新推到远端 RAG，并刷新文档上的同步状态"
+        : "请联系管理员操作";
       modelManagementPage.querySelectorAll("input, select").forEach((item) => {
         const unavailable = item.dataset.unavailable === "true";
         item.disabled = !admin || unavailable;
@@ -4235,6 +4276,7 @@
       renderUploadQueue();
       updateKnowledgeResetButton();
       updateOnlineAccessState();
+      updateLocalModelState();
       applyInferenceMode();
     }
 
@@ -4708,8 +4750,14 @@
         modelRuntimeNote.textContent = `视觉优先级有无法识别的值，已按原文保留：${unrecognized.join("、")}`;
       }
       const localRuntime = payload.runtime?.local || {};
+      // 卸载之后探针连不上，available 会是 false——这不是「读不到状态」，
+      // 而是确实没在跑。字段缺失时按「已加载」处理：那种情况下点加载会多一次
+      // 无谓的重启，点卸载则什么也不会发生，两边都不会出错。
+      localModelLoaded = localRuntime.available !== false;
       const runtimeParts = [];
-      if (localRuntime.loaded_model) {
+      if (!localModelLoaded) {
+        runtimeParts.push("本地模型已卸载（显存已释放），本地问答不可用");
+      } else if (localRuntime.loaded_model) {
         runtimeParts.push(`当前已加载：${localRuntime.loaded_model}`);
       }
       if (Number(localRuntime.context_window) > 0) {
@@ -4806,6 +4854,53 @@
         showNotice(`模型配置保存失败：${error.message}`);
       } finally {
         modelSaveButton.disabled = !isAdmin();
+        applyUserPermissions();
+      }
+    }
+
+    // 加载 / 卸载本地推理。两个动作走同一个端点（PATCH /api/local-model），
+    // 由 {loaded} 决定方向；服务端会转成协调器的 /switch-llm 或 /unload-llm。
+    async function setLocalModelLoaded(loaded) {
+      if (!isAdmin()) {
+        showNotice("请联系管理员操作");
+        return;
+      }
+      if (
+        !loaded &&
+        !window.confirm(
+          "卸载会停掉本地推理进程，显存被整个释放；在重新加载之前，本地问答不可用。确认卸载？",
+        )
+      ) {
+        return;
+      }
+      const label = loaded ? "加载" : "卸载";
+      const button = loaded ? modelLoadButton : modelUnloadButton;
+      button.disabled = true;
+      setModelState(`${label}中`, "running");
+      try {
+        const payload = await readResponse(await fetch("/api/local-model", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ loaded }),
+        }));
+        renderModelConfig(payload);
+        setModelState(loaded ? "已加载" : "已卸载");
+        const runtime = payload.apply?.runtime;
+        showNotice(
+          loaded
+            ? `本地模型已加载：${runtime?.loaded_model || "已就绪"}`
+            : "本地模型已卸载，显存已释放",
+        );
+        // 卸载完却还停在离线模式的话，下一次提问必然失败。与其让人撞上 503
+        // 再回来查，不如当场说清楚。
+        if (!loaded && inferenceMode === "offline") {
+          modelRuntimeNote.textContent += "（当前是离线推理模式，本地问答会失败）";
+        }
+      } catch (error) {
+        setModelState(`${label}失败`, "error");
+        modelRuntimeNote.textContent = error.message;
+        showNotice(`本地模型${label}失败：${error.message}`);
+      } finally {
         applyUserPermissions();
       }
     }
@@ -5047,6 +5142,14 @@
         || ingestJobRunning
         || selectedUploadFiles.length > 0
         || !latestFailedIngestJob;
+      // 同步与入库/清空互斥：入库正在重建 chunks 时推过去的是半成品，
+      // 服务端也会以 409 挡掉（这里先拦一道，省一次白跑）。
+      syncRemoteButton.disabled = !isAdmin()
+        || remoteSyncRunning
+        || uploadQueueRunning
+        || knowledgeResetRunning
+        || ingestJobRunning
+        || selectedUploadFiles.length > 0;
     }
 
     function renderUploadQueue() {
@@ -5451,16 +5554,22 @@
           await loadDocuments();
           renderUploadQueue();
           knowledgeResetRunning = false;
+          remoteSyncRunning = false;
           updateKnowledgeResetButton();
           if (job.status === "completed") {
             showNotice(
-              job.remote_rag?.status === "completed"
-                ? "最终完成：大模型已拉起，知识库远端同步完成"
-                : job.full_reset
-                  ? "最终完成：纯净知识库底库已准备完成，大模型已拉起"
-                  : job.delete_document_id
-                    ? "最终完成：文档删除并重建完成，大模型已拉起"
-                    : "最终完成：知识库操作完成，大模型已拉起",
+              // 同步作业只推 chunks，全程没碰大模型——不能说「大模型已拉起」。
+              job.kind === "remote_sync"
+                ? job.remote_rag?.status === "completed"
+                  ? "远端 RAG 同步完成，文档状态已刷新"
+                  : "未配置远端 RAG，没有可推送的节点"
+                : job.remote_rag?.status === "completed"
+                  ? "最终完成：大模型已拉起，知识库远端同步完成"
+                  : job.full_reset
+                    ? "最终完成：纯净知识库底库已准备完成，大模型已拉起"
+                    : job.delete_document_id
+                      ? "最终完成：文档删除并重建完成，大模型已拉起"
+                      : "最终完成：知识库操作完成，大模型已拉起",
             );
           }
           else showNotice("知识库入库失败，请查看任务状态");
@@ -5547,6 +5656,47 @@
         setIngestPipelineState("清空失败", "error");
         ingestJobStatus.classList.add("is-error");
         ingestJobStatus.textContent = `清空失败：${error.message}`;
+      }
+    }
+
+    // 把现有 chunks 重新推到远端 RAG，并刷新文档上的「远端同步」状态。
+    // 为什么需要它：那个状态是**入库那一刻写死的快照**，读取时只补缺失字段、
+    // 从不重算，所以配置晚于入库的文档会一直显示「未配置」——哪怕数据早就推
+    // 过去了。走入库也能改，但那要重建整个知识库；这条只推文件，不碰大模型。
+    async function syncRemoteRag() {
+      if (!isAdmin()) {
+        showNotice("请联系管理员操作");
+        return;
+      }
+      if (knowledgeResetRunning || ingestJobRunning || uploadQueueRunning || selectedUploadFiles.length) {
+        return;
+      }
+      if (
+        !window.confirm(
+          "把当前 chunks 推送到所有已配置的远端 RAG 节点，并刷新文档上的「远端同步」状态。\n" +
+            "不重新解析、不重建索引、不影响本地问答。确认同步？",
+        )
+      ) {
+        return;
+      }
+      remoteSyncRunning = true;
+      ingestJobRunning = true;
+      updateKnowledgeResetButton();
+      setIngestPipelineState("同步远端中", "running");
+      ingestJobStatus.classList.remove("is-error");
+      ingestJobStatus.textContent = "正在推送 chunks 到远端 RAG 节点...";
+      try {
+        const started = await readResponse(await fetch("/api/knowledge/sync", { method: "POST" }));
+        await loadDocuments();
+        await pollIngestJob(started.job.id);
+      } catch (error) {
+        remoteSyncRunning = false;
+        ingestJobRunning = false;
+        updateKnowledgeResetButton();
+        setIngestPipelineState("同步失败", "error");
+        ingestJobStatus.classList.add("is-error");
+        ingestJobStatus.textContent = `远端同步失败：${error.message}`;
+        showNotice(`远端同步失败：${error.message}`);
       }
     }
 
@@ -6761,6 +6911,19 @@
       messagesNode.scrollTop = messagesNode.scrollHeight;
     }
 
+    // 让某条消息**从顶部**进入视野，而不是滚到它的末尾。
+    //
+    // 回答动辄上千字，滚到底等于把用户丢在结论处——他得自己翻回去从头读。
+    // 用 getBoundingClientRect 求差而不是 offsetTop：offsetTop 是相对
+    // offsetParent 的，一旦中间哪层加了 position/transform 就会算错；
+    // 两个 rect 相减只依赖它们在同一坐标系里，稳。
+    function scrollToMessageStart(node, margin = 12) {
+      if (!node) return;
+      const delta = node.getBoundingClientRect().top
+        - messagesNode.getBoundingClientRect().top;
+      messagesNode.scrollTop += delta - margin;
+    }
+
     // 实时测点单独成块：这是「此刻的实测值」，和下面「查看依据」里的文档证据不是一回事，
     // 混在一起会让人分不清哪个是实时数据、哪个是规程里的定值。
     function addLivePoints(container, livePoints) {
@@ -6921,10 +7084,17 @@
           }),
         });
         const data = await readQAStream(response, (event) => {
-          const label = event.evidence
-            ? `${event.label}（${event.evidence} 条证据）`
-            : event.label;
-          setPendingText(pending, `${label}…`);
+          // **文案里不要带省略号**：`.thinking-text::after` 已经有一个带动画的
+          // 省略号（`content: "..."`，是这个等待状态的设计），再加一个就成了
+          // 「……」。那种「文字自带省略号 + CSS 再补一个」的写法在本文件里只有
+          // "Compressing context..." 一处，而它用 `context-compressing` 类把
+          // CSS 那个关掉了（`content: none`）——是刻意配对的，别照抄一半。
+          setPendingText(
+            pending,
+            event.evidence
+              ? `${event.label}（${event.evidence} 条证据）`
+              : event.label,
+          );
         });
         stopThinking(pending);
         const answer = data.answer || "没有返回回答。";
@@ -6972,7 +7142,10 @@
           updateContextGauge(data.context);
         }
         await saveConversationData(conversation);
-        scrollMessagesToBottom();
+        // **定位到回答的开头，不滚到底**：回答动辄上千字，滚到底等于把用户
+        // 丢在结论处，还得自己翻回去。用户提问那一步仍然滚到底（见 ask 开头），
+        // 因为那时要看到的是自己刚发出去的问题。
+        scrollToMessageStart(pending.row);
         stateDot.classList.add("is-online");
         serviceStatus.textContent = "服务在线";
       } catch (error) {
@@ -7065,6 +7238,7 @@
     fullRebuildInput.addEventListener("change", renderUploadQueue);
     documentSearchInput.addEventListener("input", () => renderDocuments());
     document.querySelector("#refreshDocumentsButton").addEventListener("click", loadDocuments);
+    syncRemoteButton.addEventListener("click", syncRemoteRag);
     resetKnowledgeButton.addEventListener("click", resetKnowledgeBase);
 
     graphLabelFilter.addEventListener("change", renderGraph);
@@ -7073,6 +7247,8 @@
     mcpRefreshButton.addEventListener("click", loadMcp);
     modelRefreshButton.addEventListener("click", loadModelConfig);
     modelSaveButton.addEventListener("click", saveModelConfig);
+    modelLoadButton.addEventListener("click", () => setLocalModelLoaded(true));
+    modelUnloadButton.addEventListener("click", () => setLocalModelLoaded(false));
     frpRefreshButton.addEventListener("click", loadFrp);
     frpToggleButton.addEventListener("click", toggleFrp);
     themeToggle.addEventListener("click", cycleTheme);
