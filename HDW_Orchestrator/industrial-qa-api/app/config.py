@@ -73,6 +73,11 @@ class Settings:
     # 这个候选，而不是排在知识库入库任务后面等几分钟——失败快、可预期。
     mineru_max_queue = int(os.getenv("HDW_VISION_MINERU_MAX_QUEUE", "1"))
     mcp_base_url = os.getenv("HDW_MCP_BASE_URL", "http://hdw-mcp:8766/mcp").strip().rstrip("/")
+    # MCP 工具的读取超时。**必须大于工具内部最慢的那次抓取**：日志工具要等
+    # LIEMS 门户，它自己的 read timeout 就是 30 秒。原来写死 `rag_connect_timeout + 15`
+    # = 18 秒，比 LIEMS 先到，于是一次取数失败只剩下一个空消息的 ReadTimeout——
+    # 工具其实已经准备好了 `liems_http_error` 和失败原因，全被切断在返回之前。
+    mcp_timeout = float(os.getenv("HDW_MCP_TIMEOUT", "60"))
     model_config_path = Path(
         os.getenv("HDW_MODEL_CONFIG_PATH", "/data/model-config/config.json")
     )

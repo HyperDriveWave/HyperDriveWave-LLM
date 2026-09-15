@@ -2123,6 +2123,7 @@ Qwen + RAG + reranker + Zvec + Neo4j + MinerU + WebUI + 文件会话
 | `HDW_RAG_REMOTE_URLS` | 远端 RAG 地址列表，逗号分隔，QA 按轮询调用，当前为 `<远端RAG主机IP>:8001,8003` |
 | `HDW_RAG_CONNECT_TIMEOUT` | RAG 建立连接超时；远端不可达时用于快速进入下一个节点或本机 fallback |
 | `HDW_RAG_HEALTH_TIMEOUT` | QA `/health` 检查单个 RAG 节点的超时 |
+| `HDW_MCP_TIMEOUT` | MCP 工具的读取超时，默认 60。**必须大于工具内部最慢的那次抓取**——日志工具要等 LIEMS 门户，它自己的 read timeout 就是 30 秒；超时设小了会抢先切断，工具已备好的失败原因一个字都传不回来 |
 | `HDW_RAG_ADMIN_TOKEN` | 远端 RAG `/admin/sync` 的鉴权令牌。入库和「同步远端」都靠它，缺了会直接报 `HDW_RAG_ADMIN_TOKEN is not configured` |
 | `HDW_REMOTE_RAG_SYNC_TIMEOUT` | 同步远端时**单个 socket 操作**的超时秒数，当前 600（不是总时长，正常上传不受影响）。**置 0 = 不设超时**——远端不回包时作业和文档会永久卡在「同步中」，比原来的「未配置」更糟 |
 | `HDW_REMOTE_RAG_SSH_TARGET` | **仅供 `Scripts/sync_remote_rag.sh` 手工运维**用的 SSH 目标，不含密码。应用内的「同步远端」走 HTTP，不需要 SSH |

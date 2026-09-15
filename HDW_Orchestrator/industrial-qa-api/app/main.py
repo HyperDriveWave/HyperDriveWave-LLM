@@ -662,7 +662,10 @@ def _validate_image_attachments(images: list[ImageAttachment]) -> list[dict[str,
 
 
 async def _mcp_call_tool(name: str, arguments: dict[str, Any]) -> Any:
-    request_timeout = httpx.Timeout(settings.rag_connect_timeout + 15, connect=settings.rag_connect_timeout)
+    # 读取超时用 settings.mcp_timeout，**不能用 `rag_connect_timeout + 15`**。
+    # 后者是 18 秒，而日志工具要等 LIEMS 门户（它自己的 read timeout 就是 30 秒），
+    # 结果是上游先超时、工具已经准备好的失败原因（liems_http_error 等）一个字都传不回来。
+    request_timeout = httpx.Timeout(settings.mcp_timeout, connect=settings.rag_connect_timeout)
     async with httpx.AsyncClient(timeout=request_timeout) as client:
         headers = {
             "Content-Type": "application/json",
@@ -1625,7 +1628,7 @@ async def _search_point_candidates(
     try:
         candidates = await search(keyword)
     except Exception as exc:
-        return [], f"{keyword}: {exc}"
+        return [], f"{keyword}: {_exc_text(exc)}"
     if candidates:
         return candidates, None
 
@@ -1674,7 +1677,7 @@ async def _fetch_live_points(
                 "point_query_current_value", {"kks": str(point.get("kks") or "")}
             )
         except Exception as exc:
-            return None, f"{keyword}: {exc}"
+            return None, f"{keyword}: {_exc_text(exc)}"
         if not isinstance(data, dict) or data.get("value") is None:
             return None, f"{keyword}: 选中测点无实时值"
         return shape(data), None
@@ -1891,10 +1894,39 @@ async def _fetch_series(
     try:
         data = await _mcp_call_tool("point_query_history_series", arguments)
     except Exception as exc:
-        return None, f"{keyword}: {exc}"
+        return None, f"{keyword}: {_exc_text(exc)}"
     if not isinstance(data, dict) or not data.get("samples"):
         return None, f"{keyword}: 该时段无采样数据"
     return _shape_series(data, keyword, kind), None
+
+
+def _logs_failure_reason(data: dict[str, Any]) -> str:
+    """日志工具返回体若是「取数失败」，给出可读原因；正常返回空串。
+
+    **顺序是关键**：失败判定必须早于「有没有 events」。抓取失败时 events 同样是空的，
+    反过来就会把「取数失败」讲成「该时段无记录」——前者重试一次可能就好，后者意味着
+    数据本来就不存在，对用户是相反的两件事。
+
+    工具侧的约定是 `ok = not (fetch_failed and not payloads)`，所以 `ok=False` 恰好
+    表示「抓取失败且本地也没有缓存」，与「确实没记录」互斥。
+    """
+    if str(data.get("status")) == "unavailable":
+        return str(data.get("message") or "数据源未配置")
+    if data.get("ok") is False:
+        fetch_result = data.get("fetch_result") or {}
+        # 类别名（哪个数据源、哪类错误）和具体原因**两个都要**：
+        # query_status 说明是哪条链路挂了（如 liems_http_error），
+        # stderr 说明挂在哪一步（连不上、超时多久）。只留一个都不够定位。
+        detail = str(data.get("message") or "").strip() or " ".join(
+            str(part).strip()
+            for part in (
+                data.get("query_status"),
+                fetch_result.get("stderr") or data.get("fetch_error_type"),
+            )
+            if str(part or "").strip()
+        )
+        return f"取数失败（{' '.join((detail or '原因未知').split())[:200]}）"
+    return ""
 
 
 async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -1920,11 +1952,12 @@ async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
                 "log_query_range", {"days": max(1, min(_QUERY_MAX_DAYS, span))}
             )
     except Exception as exc:
-        return None, f"日志: {exc}"
+        return None, f"日志: {_exc_text(exc)}"
     if not isinstance(data, dict):
         return None, "日志: 返回格式异常"
-    if str(data.get("status")) == "unavailable":
-        return None, f"日志: {data.get('message') or '数据源未配置'}"
+    failure = _logs_failure_reason(data)
+    if failure:
+        return None, f"日志: {failure}"
     events = data.get("events") or []
     if not events:
         return None, "日志: 该时段无记录"
@@ -2104,7 +2137,7 @@ async def _fetch_realtime(
     done = await asyncio.gather(*tasks.values(), return_exceptions=True)
     for name, outcome in zip(tasks.keys(), done):
         if isinstance(outcome, BaseException):
-            errors.append(f"{name}: {outcome}")
+            errors.append(f"{name}: {_exc_text(outcome)}")
             continue
         if name == "live":
             points, point_errors = outcome
@@ -2272,6 +2305,18 @@ def _retrieval_score(item: dict[str, Any]) -> float:
         return float(item.get("score", float("-inf")))
     except (TypeError, ValueError):
         return float("-inf")
+
+
+def _exc_text(exc: BaseException) -> str:
+    """异常的可读描述，**保证非空**。
+
+    httpx 的 ReadTimeout / ConnectTimeout / WriteTimeout 等 `str()` 就是空串
+    （`repr(e)` 是 `ReadTimeout('')`）。直接写 `f"日志: {exc}"` 会得到一句
+    「日志: 」——冒号后面什么都没有，读的人既不知道是什么错、也不知道该去查哪里。
+    类型名至少能指出方向。
+    """
+    detail = str(exc).strip()
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
 
 
 def _live_errors(intent: dict[str, Any], rt_errors: list[str]) -> list[str]:
@@ -3351,6 +3396,7 @@ def _prompt(
     live_points: list[dict[str, Any]] | None = None,
     series: list[dict[str, Any]] | None = None,
     logs: dict[str, Any] | None = None,
+    live_errors: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     evidence = _evidence_block(contexts)
     graph = _graph_block(graph_rows)
@@ -3545,8 +3591,30 @@ def _prompt(
         else ""
     )
 
+    # 实时数据取数失败。**必须让模型看见**，否则它会按「我没有这个能力」作答——
+    # 实测：问「最近五天有什么事情」，规划正确路由到了日志查询，但日志源头不通，
+    # 模型收到的是一片空白，于是回答「我没有实时感知能力，当前对话中未提供实时
+    # 信息检索功能」——这句话对它当时所见而言完全准确，可用户读到的是「系统不支持」。
+    live_error_list = [str(item).strip() for item in (live_errors or []) if str(item).strip()]
+    live_error_block = (
+        "\n\n实时数据取数失败（**是这次没取到，不是系统没有这项数据**）：\n"
+        + "\n".join(f"- {item}" for item in live_error_list)
+        if live_error_list
+        else ""
+    )
+    live_error_rule = (
+        # 直接针对观测到的失效写法：「取数失败」和「没有能力」在用户眼里差别很大，
+        # 前者是稍后重试可能就好的问题，后者会让人以为整个功能不存在。
+        "上面「实时数据取数失败」里的每一项，说明的是**这次没取到**，"
+        "不是「系统没有实时数据能力」。回答时要点明是哪一项取数失败、失败原因是什么，"
+        "并建议稍后重试；**绝不能把它说成「我无法获取实时数据」「本系统未提供实时信息检索」"
+        "或「我没有实时感知能力」**——那会让用户以为功能不存在。"
+        if live_error_list
+        else ""
+    )
+
     if skip_retrieval:
-        user = f"问题：{question}{image_block}{realtime_block}"
+        user = f"问题：{question}{image_block}{realtime_block}{live_error_block}"
         system_body = (
             "本轮未检索文档知识库。"
             + (
@@ -3562,7 +3630,7 @@ def _prompt(
         )
     else:
         user = (
-            f"问题：{question}{image_block}{realtime_block}"
+            f"问题：{question}{image_block}{realtime_block}{live_error_block}"
             f"\n\n检索证据：\n{evidence}\n\n知识图谱上下文：\n{graph}"
         )
         system_body = (
@@ -3598,6 +3666,9 @@ def _prompt(
             "content": (
                 f"你是 {model_name or settings.llm_model}，HyperDriveWave 工业知识问答系统以你作为底座大模型。"
                 f"{system_body}"
+                # 取数失败的说明紧跟在主体之后。**放在 system_body 里面就得写两遍**
+                # （skip_retrieval 分支和正常分支各一份），迟早漏一处。
+                f"{live_error_rule}"
                 + (
                     "实时测点的采集时间已换算为北京时间，照抄即可，"
                     "不要附加时区后缀、不要另做时区换算或补充说明。"
@@ -3656,6 +3727,7 @@ async def _llm_answer(
     live_points: list[dict[str, Any]] | None = None,
     series: list[dict[str, Any]] | None = None,
     logs: dict[str, Any] | None = None,
+    live_errors: list[str] | None = None,
 ) -> tuple[str, str, Any, str | None, dict[str, Any]]:
     if image_attachments:
         candidates, capability_errors = await _vision_candidates(
@@ -3710,6 +3782,7 @@ async def _llm_answer(
                 live_points=live_points,
                 series=series,
                 logs=logs,
+                live_errors=live_errors,
             )
             target_context_window = int(
                 candidate.get("context_window") or _context_window(selected_mode)
@@ -3866,6 +3939,7 @@ async def _answer(
     live_points: list[dict[str, Any]] | None = None,
     series: list[dict[str, Any]] | None = None,
     logs: dict[str, Any] | None = None,
+    live_errors: list[str] | None = None,
     evidence_budget: int | None = None,
 ) -> dict[str, Any]:
     selected_mode = _resolve_inference_mode(inference_mode)
@@ -3889,6 +3963,7 @@ async def _answer(
         live_points=live_points,
         series=series,
         logs=logs,
+        live_errors=live_errors,
     )
     # 数字核对：把答案里的数与送进提示词的那批证据对一遍。
     # **只作提示**——无出处的数不一定错（单位换算、常识数字都可能），
@@ -4358,6 +4433,8 @@ async def _qa_pipeline(
             live_points=rag_info.get("live_points") or [],
             series=rag_info.get("series") or [],
             logs=rag_info.get("logs"),
+            # 取数失败要让模型看见，否则它会按「我没有实时数据能力」作答。
+            live_errors=rag_info.get("live_errors") or [],
             # 证据预算随检索路数增长。单路时等于原来的默认值，所以这里不必
             # 判断「是不是多轮」——见 _retrieval_evidence_budget。
             evidence_budget=_retrieval_evidence_budget(
@@ -4487,6 +4564,30 @@ def _self_check() -> None:
     assert "[证据 2]" in prompt[-1]["content"]
     full_prompt = _prompt("q", [{"text": "a" * 1000}])
     assert "a" * 1000 in full_prompt[-1]["content"]
+    # 实时取数失败必须进 prompt，而且要明说「是这次没取到，不是没这个能力」。
+    # 实测过的失效：日志源头不通，模型收到的是一片空白，于是答「我没有实时感知能力，
+    # 当前对话中未提供实时信息检索功能」——用户读到的结论是「系统不支持」。
+    assert "实时数据取数失败" not in _prompt("q", [])[1]["content"], "没失败时不该出现该块"
+    _le = _prompt("q", [], live_errors=["日志: ReadTimeout"])
+    assert "实时数据取数失败" in _le[1]["content"], "取数失败没进 user 块"
+    assert "日志: ReadTimeout" in _le[1]["content"], "失败明细没带上"
+    assert "不是「系统没有实时数据能力」" in _le[0]["content"], "缺「取不到 ≠ 没能力」规则"
+    # 空消息异常必须有类型名兜底（httpx 的超时异常 str() 就是空串）
+    assert _exc_text(httpx.ReadTimeout("")) == "ReadTimeout"
+    assert _exc_text(ValueError("bad")) == "ValueError: bad"
+    # 日志工具：取数失败不能讲成「该时段无记录」。失败时 events 同样是空的，
+    # 判定顺序反了就会把「重试可能就好」说成「本来就没有」——实测踩过。
+    _liems_down = {
+        "ok": False,
+        "query_status": "liems_http_error",
+        "fetch_result": {"ok": False, "stderr": "Read timed out. (read timeout=30.0)"},
+        "events": [],
+    }
+    _r = _logs_failure_reason(_liems_down)
+    assert "取数失败" in _r and "liems_http_error" in _r, f"失败原因没带出来: {_r!r}"
+    assert "read timeout=30.0" in _r, "工具给的原始原因应保留"
+    assert _logs_failure_reason({"ok": True, "query_status": "ok", "events": []}) == ""
+    assert _logs_failure_reason({"status": "unavailable", "message": "未配置"}) == "未配置"
     # 规划解析：检索无法判定返回 None（调用方保守按「需要检索」），测点无法判定返回空列表
     # 规划解析：返回结构化意图字典。检索无法判定为 None（调用方保守按「需要检索」），
     # 各项无法判定为 None 或空列表。
