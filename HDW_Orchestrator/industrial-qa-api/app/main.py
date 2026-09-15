@@ -11,7 +11,7 @@ import time
 import asyncio
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Callable, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -786,6 +786,10 @@ _LIVE_POINT_CANDIDATES = int(os.getenv("HDW_LIVE_POINT_CANDIDATES", "5"))
 # 日志注入上限：一次抓取实测 118 条，全塞进上下文会挤占文档证据。
 # 按严重程度排序后取前 N 条，重大事件优先。
 _LOGS_MAX = int(os.getenv("HDW_LOGS_MAX", "40"))
+# 逐日工作摘要的行数上限。明细受 _LOGS_MAX 截断（实测一次抓 161 条、只注入 40 条），
+# 摘要负责体现全量规模，所以**条数统计来自全部事件**而不是截断后的那批。
+_LOGS_DIGEST_LINES = int(os.getenv("HDW_LOGS_DIGEST_LINES", "80"))
+_LOGS_DIGEST_ITEMS = int(os.getenv("HDW_LOGS_DIGEST_ITEMS", "4"))
 # 单次查询的时间跨度上限，防止规划器给出离谱区间导致 LIEMS 端长时间抓取
 _QUERY_MAX_DAYS = int(os.getenv("HDW_QUERY_MAX_DAYS", "7"))
 # 历史/趋势注入上下文时的压缩点数上限。实测单次可达 11063 点，
@@ -1947,9 +1951,20 @@ async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
         elif start == end and end == today:
             data = await _mcp_call_tool("log_query_recent", {"days": 1})
         else:
+            # **必须传 start_date / end_date，不能传 days**。
+            # `log_query_range` 的签名是 (query_text, start_date, end_date, ...)，
+            # 根本没有 days 这个参数——传了会被丢掉，日期留空后 `_resolve_dates`
+            # 退化成 start = end = 今天，于是**只查一天**。
+            # 实测：规划器算出 5 天区间（09-11~09-16），工具只返回 09-15 一天，
+            # 答案里的「最近五天」其实是照一天写的。
             span = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+            if span > _QUERY_MAX_DAYS:
+                # 超长区间往前收窄，终点保持用户要的那天。
+                start = (
+                    date.fromisoformat(end) - timedelta(days=_QUERY_MAX_DAYS - 1)
+                ).isoformat()
             data = await _mcp_call_tool(
-                "log_query_range", {"days": max(1, min(_QUERY_MAX_DAYS, span))}
+                "log_query_range", {"start_date": start, "end_date": end}
             )
     except Exception as exc:
         return None, f"日志: {_exc_text(exc)}"
@@ -1967,6 +1982,11 @@ async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
         "end": end,
         "major_only": major_only,
         "summary": data.get("summary") or {},
+        # 按天分好类的全量工作摘要。**工具已经算好了，之前一直没用**——
+        # 明细受 _LOGS_MAX 截断（实测一次抓取 161 条、只注入 40 条），
+        # 模型看不到的 121 条只能靠这个体现：每天的各类条数都在里面，
+        # 重要的逐条列出，次要的至少让模型知道「那天还有多少件事」。
+        "work_digest": data.get("work_digest") or {},
         # 118 条全量注入会挤占文档证据，按严重程度排序后截断
         "events": sorted(
             events,
@@ -2108,8 +2128,19 @@ async def _current_drift(point: dict[str, Any], mode: str = "offline") -> dict[s
     }
 
 
+# 进度上报回调：(stage, label) -> None。**同步**函数——它只是往队列里塞一条，
+# 不涉及 IO，所以链路深处那些不 async 的地方也能调。
+ProgressFn = Callable[[str, str], None]
+
+
+def _noop_progress(stage: str, label: str) -> None:
+    """非流式请求（普通 JSON 返回）没有订阅者，用这个占位，省去每处判空。"""
+
+
 async def _fetch_realtime(
-    plan: dict[str, Any], mode: Literal["online", "offline"]
+    plan: dict[str, Any],
+    mode: Literal["online", "offline"],
+    progress: ProgressFn = _noop_progress,
 ) -> tuple[dict[str, Any], list[str]]:
     """并行取齐规划要求的全部实时数据。
 
@@ -2120,14 +2151,27 @@ async def _fetch_realtime(
     `_fetch_live_points` 的既有约定一致。
     """
     tasks: dict[str, Any] = {}
+    labels: dict[str, str] = {}
     if plan.get("points"):
         tasks["live"] = _fetch_live_points(plan["points"], mode)
+        labels["live"] = "查询实时测点：" + "、".join(plan["points"])
     if plan.get("history"):
-        tasks["history"] = _fetch_series(plan["history"], "history", mode)
+        spec = plan["history"]
+        tasks["history"] = _fetch_series(spec, "history", mode)
+        labels["history"] = f"查询历史序列：{spec.get('keyword')}（{spec.get('start')} ~ {spec.get('end')}）"
     if plan.get("trend"):
-        tasks["trend"] = _fetch_series(plan["trend"], "trend", mode)
+        spec = plan["trend"]
+        tasks["trend"] = _fetch_series(spec, "trend", mode)
+        labels["trend"] = f"查询变化趋势：{spec.get('keyword')}（{spec.get('start')} ~ {spec.get('end')}）"
     if plan.get("logs"):
-        tasks["logs"] = _fetch_logs(plan["logs"])
+        spec = plan["logs"]
+        span = f"{spec.get('start')} ~ {spec.get('end')}"
+        tasks["logs"] = _fetch_logs(spec)
+        labels["logs"] = f"查询运行日志：{span}" + ("（仅重大事件）" if spec.get("major_only") else "")
+    # 先报「要查什么」，再报「查到什么」。只报后者的话，在日志那 30 秒里
+    # 用户看到的是上一句话停着不动——那正是最需要他看见在做事的时候。
+    for name in tasks:
+        progress("mcp", labels[name])
 
     result: dict[str, Any] = {"live_points": [], "series": [], "logs": None, "charts": []}
     errors: list[str] = []
@@ -2138,11 +2182,17 @@ async def _fetch_realtime(
     for name, outcome in zip(tasks.keys(), done):
         if isinstance(outcome, BaseException):
             errors.append(f"{name}: {_exc_text(outcome)}")
+            progress("mcp", f"{labels.get(name, name)} → 失败：{_exc_text(outcome)}")
             continue
         if name == "live":
             points, point_errors = outcome
             result["live_points"] = points
             errors.extend(point_errors)
+            progress(
+                "mcp",
+                f"{labels['live']} → {len(points)} 个测点"
+                + (f"，{len(point_errors)} 个失败" if point_errors else ""),
+            )
             # 给每个当前值配一段「与近期均值的对比」。并发取，不逐点串行。
             if points:
                 drifts = await asyncio.gather(
@@ -2156,9 +2206,14 @@ async def _fetch_realtime(
             item, error = outcome
             if error:
                 errors.append(error)
+                # 失败也要报，而且要报出原因——「一直转圈最后什么都没有」最难受。
+                # 原因文本来自 _exc_text / _fetch_logs，保证非空。
+                progress("mcp", f"{labels.get(name, name)} → {error}")
             elif item:
                 if name == "logs":
                     result["logs"] = item
+                    events = item.get("events") or []
+                    progress("mcp", f"{labels['logs']} → {len(events)} 条记录")
                 else:
                     # 组装图表对象供前端内联绘制 SVG。
                     # **不出 PNG**：矢量图能自适应宽度、可交互，且不必把
@@ -2173,6 +2228,10 @@ async def _fetch_realtime(
                     if chart:
                         result["charts"].append(chart)
                     result["series"].append(item)
+                    progress(
+                        "mcp",
+                        f"{labels.get(name, name)} → {len(item.get('samples') or [])} 个采样点",
+                    )
     return result, errors
 
 
@@ -2182,10 +2241,27 @@ async def _retrieve_planned(
     top_k: int,
     *,
     has_images: bool = False,
+    progress: ProgressFn = _noop_progress,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     # 规划在检索之前：一次调用同时决定要不要查文档，以及要取哪几类实时数据
     # （测点当前值／历史序列／趋势／运行日志）。
+    progress("plan", "分析问题、规划检索范围")
     intent = await _plan_retrieval(_truncate_for_planner(question), mode)
+    # 把规划结论先报出来：后面几秒到几十秒的动作都是由它决定的，
+    # 先说「打算做什么」，再看「做成了什么」，出问题时才知道该找哪一步。
+    progress(
+        "plan",
+        "规划结果：" + ("需要检索知识库" if intent["needs_rag"] else "无需检索知识库")
+        + (
+            "；实时数据 " + "、".join(
+                name
+                for name, key in (("测点", "points"), ("历史", "history"), ("趋势", "trend"), ("日志", "logs"))
+                if intent.get(key)
+            )
+            if _plan_has_realtime(intent)
+            else "；不取实时数据"
+        ),
+    )
 
     # 单向覆写：只在模型判了「不检索」时把它拉回 True，永不反向。
     # 唯一依据是**本轮带了图片**——上传图片在这个系统里永远是「要处理的材料」
@@ -2196,7 +2272,7 @@ async def _retrieve_planned(
         intent["needs_rag"] = True
 
     if not intent["needs_rag"]:
-        realtime, rt_errors = await _fetch_realtime(intent, mode)
+        realtime, rt_errors = await _fetch_realtime(intent, mode, progress)
         plan = {
             "rounds": 0,
             "queries": [],
@@ -2222,7 +2298,7 @@ async def _retrieve_planned(
     if plan.get("no_retrieval"):
         # 不检索也不查图谱：下游拿到空 contexts 会自然产出空 citations / graph_context，
         # 前端 addEvidence() 在两者都空时不渲染依据面板。
-        realtime, rt_errors = await _fetch_realtime(intent, mode)
+        realtime, rt_errors = await _fetch_realtime(intent, mode, progress)
         return [], {
             "plan": plan,
             "rounds": [],
@@ -3550,6 +3626,36 @@ def _prompt(
         categories = "、".join(
             f"{name} {count} 条" for name, count in (summary.get("categories") or {}).items()
         ) or "无"
+        # 逐日工作摘要。**这段是给「全量」的**：下面的明细受 _LOGS_MAX 截断，
+        # 模型只能看到一部分；摘要里每天的各类条数都来自**全量**事件，
+        # 让模型知道「那天一共有多少件事」，而不是把截断后的 40 条当成全部。
+        digest_lines: list[str] = []
+        brief = str(summary.get("brief") or "").strip()
+        if brief and brief != "未查询到匹配日志。":
+            digest_lines.append(f"  摘要：{brief}")
+        for day in (logs.get("work_digest") or {}).get("dates") or []:
+            if len(digest_lines) >= _LOGS_DIGEST_LINES:
+                break
+            counts = day.get("counts") or {}
+            digest_lines.append(
+                f"  {day.get('date')}：主要工作 {counts.get('main_work', 0)} 条、"
+                f"工作票 {counts.get('ticket_work', 0)} 条、"
+                f"重要事件 {counts.get('important_timed_events', 0)} 条"
+            )
+            for bucket, label in (
+                ("important_timed_events", "重要事件"),
+                ("ticket_work", "工作票"),
+                ("main_work", "主要工作"),
+            ):
+                for item in (day.get(bucket) or [])[:_LOGS_DIGEST_ITEMS]:
+                    if len(digest_lines) >= _LOGS_DIGEST_LINES:
+                        break
+                    text = " ".join(str(item.get("content") or item.get("title") or "").split())[:120]
+                    if not text:
+                        continue
+                    digest_lines.append(
+                        f"    · {label} {item.get('time') or ''} {item.get('source') or ''}：{text}"
+                    )
         lines = []
         for idx, event in enumerate(events, 1):
             severity = str(event.get("severity") or "")
@@ -3564,6 +3670,8 @@ def _prompt(
             f"{'，仅重大事件' if logs.get('major_only') else ''}）：\n"
             f"  合计 {summary.get('total_events', len(events))} 条，"
             f"其中重大 {summary.get('major_events', 0)} 条；分类：{categories}\n"
+            + "\n".join(digest_lines)
+            + ("\n  明细（受上限截断，完整条数以「合计」为准）：\n" if lines else "\n")
             + "\n".join(lines)
         )
 
@@ -3728,6 +3836,7 @@ async def _llm_answer(
     series: list[dict[str, Any]] | None = None,
     logs: dict[str, Any] | None = None,
     live_errors: list[str] | None = None,
+    progress: ProgressFn = _noop_progress,
 ) -> tuple[str, str, Any, str | None, dict[str, Any]]:
     if image_attachments:
         candidates, capability_errors = await _vision_candidates(
@@ -3866,12 +3975,25 @@ async def _llm_answer(
             # 相关性选留：把与当前问题无关的历史轮次挡在 prompt 之外。
             # 放在 prepare() **之后**——context_kept_from 是存盘的绝对下标，
             # 在它之前过滤会让存回去的下标指错位置。
+            progress("history", f"筛选相关历史轮次（共 {len(preparation.messages)} 条消息）")
             selected_messages, select_stats = await _select_relevant_turns(
                 client,
                 question,
                 preparation.messages,
                 mode=selected_mode,
             )
+            # 把选留结果报出来。这一步对用户是可感知的（同一句问题，历史长短不同
+            # 速度差很多），说出来他才知道「刚才那几秒花在哪」。
+            if select_stats.get("history_selected"):
+                progress(
+                    "history",
+                    f"历史轮次：保留 {select_stats.get('history_turns_kept')} / "
+                    f"{select_stats.get('history_turns_total')} 轮，"
+                    f"{select_stats.get('history_tokens_before'):,} → "
+                    f"{select_stats.get('history_tokens_after'):,} token",
+                )
+            elif select_stats.get("history_select_error"):
+                progress("history", f"历史选留未生效：{select_stats['history_select_error']}")
             prompt = [base_prompt[0], *selected_messages, *base_prompt[1:]]
             result = await client.complete(
                 prompt,
@@ -3941,9 +4063,11 @@ async def _answer(
     logs: dict[str, Any] | None = None,
     live_errors: list[str] | None = None,
     evidence_budget: int | None = None,
+    progress: ProgressFn = _noop_progress,
 ) -> dict[str, Any]:
     selected_mode = _resolve_inference_mode(inference_mode)
     llm_contexts = _llm_contexts(selected_mode, contexts, evidence_budget)
+    progress("graph", f"查询知识图谱（基于 {len(llm_contexts)} 条证据）")
     graph_rows = await _graph_context(llm_contexts)
     data = conversation_data or {}
     answer, selected_mode, preparation, compression_provider, llm_info = await _llm_answer(
@@ -3964,6 +4088,7 @@ async def _answer(
         series=series,
         logs=logs,
         live_errors=live_errors,
+        progress=progress,
     )
     # 数字核对：把答案里的数与送进提示词的那批证据对一遍。
     # **只作提示**——无出处的数不一定错（单位换算、常识数字都可能），
@@ -4368,6 +4493,31 @@ async def list_models(
 # 却在 77 秒时被拒（"Load failed"）。
 _SSE_HEARTBEAT = float(os.getenv("HDW_SSE_HEARTBEAT", "5"))
 
+async def _stream_until(
+    task: "asyncio.Task[Any]", queue: "asyncio.Queue[dict[str, Any]]"
+) -> AsyncIterator[dict[str, Any]]:
+    """等 task 完成，期间把 queue 里的进度事件与心跳吐出来。
+
+    **必须边等边转发**：进度事件是任务内部不同时刻产生的——MCP 四类取数并发，
+    各自完成时间差很远（日志要等 LIEMS 30 秒）。等任务整个跑完再一次性给，
+    用户在那 30 秒里只会看到上一句话停着不动，等于没有进度。
+
+    最后一项 yield 的是 `{"__result__": ...}`，调用方据此取回 task 的返回值。
+    用 shield 保证超时不会取消任务本身。
+    """
+    while True:
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=_SSE_HEARTBEAT)
+        except asyncio.TimeoutError:
+            while not queue.empty():
+                yield queue.get_nowait()
+            yield {"heartbeat": True}
+            continue
+        while not queue.empty():
+            yield queue.get_nowait()
+        yield {"__result__": result}
+        return
+
 
 def _sse_event(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -4406,10 +4556,28 @@ async def _qa_pipeline(
     # 这顺带修掉了「只配了 MinerU 的用户传图必 503」。
     answer_images = image_attachments if _has_chat_vision_candidate() else []
 
-    yield {"stage": "retrieve", "label": "检索知识库"}
-    contexts, rag_info = await _retrieve_planned(
-        retrieval_text, selected_mode, req.top_k, has_images=bool(image_attachments)
+    # 进度队列：链路深处（_retrieve_planned / _answer）通过 progress 回调往里塞，
+    # 这里边等边转发。**必须并发地等**——MCP 取数最慢的一项要等 LIEMS 30 秒，
+    # 等整个任务跑完再一次性报，用户在那 30 秒里看不到任何变化。
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    def progress(stage: str, label: str) -> None:
+        queue.put_nowait({"stage": stage, "label": label})
+
+    retrieval_task = asyncio.create_task(
+        _retrieve_planned(
+            retrieval_text,
+            selected_mode,
+            req.top_k,
+            has_images=bool(image_attachments),
+            progress=progress,
+        )
     )
+    async for event in _stream_until(retrieval_task, queue):
+        if "__result__" in event:
+            contexts, rag_info = event["__result__"]
+        else:
+            yield event
     rag_info["vision"] = _vision_diagnostics(vision_info)
     history, conversation_data = _conversation_messages(user["code"], req.conversation_id, req.messages)
     if history and history[-1]["role"] == "user" and history[-1]["content"] == question:
@@ -4440,15 +4608,16 @@ async def _qa_pipeline(
             evidence_budget=_retrieval_evidence_budget(
                 selected_mode, len((rag_info.get("plan") or {}).get("queries") or []) or 1
             ),
+            progress=progress,
         )
     )
-    # 生成阶段没有中间产物可发，只能发心跳。用 shield 保证超时不会取消任务本身。
-    while True:
-        try:
-            result = await asyncio.wait_for(asyncio.shield(answer_task), timeout=_SSE_HEARTBEAT)
-            break
-        except asyncio.TimeoutError:
-            yield {"heartbeat": True}
+    # 生成阶段本身没有中间产物，但图谱查询和历史选留都在这个任务里，
+    # 它们各自的进度同样要实时转发（历史选留要跑一次模型调用）。
+    async for event in _stream_until(answer_task, queue):
+        if "__result__" in event:
+            result = event["__result__"]
+        else:
+            yield event
     result["rag"] = rag_info
     yield {"result": result}
 
@@ -4588,6 +4757,50 @@ def _self_check() -> None:
     assert "read timeout=30.0" in _r, "工具给的原始原因应保留"
     assert _logs_failure_reason({"ok": True, "query_status": "ok", "events": []}) == ""
     assert _logs_failure_reason({"status": "unavailable", "message": "未配置"}) == "未配置"
+    # 日志摘要：**全量条数必须来自工具统计，不能是截断后的明细条数**。
+    # 实测抓 161 条只注入 40 条，模型若把 40 当成全部，总结必然写少。
+    _logs_fixture = {
+        "kind": "logs", "start": "2026-09-11", "end": "2026-09-16", "major_only": False,
+        "summary": {
+            "total_events": 161, "major_events": 69,
+            "categories": {"运行": 120, "检修": 41},
+            "brief": "2026-09-15 运行: 循环水泵启动",
+        },
+        "work_digest": {"dates": [{
+            "date": "2026-09-15",
+            "counts": {"main_work": 12, "ticket_work": 3, "important_timed_events": 2},
+            "main_work": [{"time": "08:00", "source": "运行", "content": "循环水泵启动"}],
+            "ticket_work": [], "important_timed_events": [],
+        }]},
+        "events": [{"time": "08:00", "source": "运行", "category": "启停",
+                    "severity": "major", "content": "循环水泵启动"}],
+    }
+    _logs_body = _prompt("q", [], logs=_logs_fixture)[-1]["content"]
+    assert "合计 161 条" in _logs_body, "全量条数没进提示词"
+    assert "2026-09-15：主要工作 12 条、工作票 3 条、重要事件 2 条" in _logs_body, "逐日摘要没渲染"
+    assert "摘要：2026-09-15 运行: 循环水泵启动" in _logs_body, "brief 没进提示词"
+    assert "循环水泵启动" in _logs_body
+    # 日志工具的参数派发。**`log_query_range` 只认 start_date / end_date**——
+    # 曾经传的是 `days`，那个参数不存在、被无声丢弃，日期留空后退化成
+    # start = end = 今天，于是规划器算出的 5 天区间永远只查回一天。
+    # 这类「参数名写错、不报错、只是结果变少」的 bug 只能靠断言拦住。
+    _sent: list[tuple[str, dict[str, Any]]] = []
+
+    async def _fake_mcp(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        _sent.append((tool, dict(args)))
+        return {"ok": True, "query_status": "ok", "events": [], "summary": {}, "work_digest": {}}
+
+    _orig_mcp = globals()["_mcp_call_tool"]
+    globals()["_mcp_call_tool"] = _fake_mcp
+    try:
+        asyncio.run(_fetch_logs({"start": "2026-09-11", "end": "2026-09-16", "major_only": False}))
+        assert _sent[0][0] == "log_query_range", _sent
+        assert _sent[0][1] == {"start_date": "2026-09-11", "end_date": "2026-09-16"}, _sent
+        _sent.clear()
+        asyncio.run(_fetch_logs({"start": "2026-09-11", "end": "2026-09-16", "major_only": True}))
+        assert _sent[0][0] == "log_query_major_events" and _sent[0][1] == {"days": 6}, _sent
+    finally:
+        globals()["_mcp_call_tool"] = _orig_mcp
     # 规划解析：检索无法判定返回 None（调用方保守按「需要检索」），测点无法判定返回空列表
     # 规划解析：返回结构化意图字典。检索无法判定为 None（调用方保守按「需要检索」），
     # 各项无法判定为 None 或空列表。
@@ -5003,6 +5216,28 @@ def _self_check() -> None:
     globals()["_rag_route_cursor"] = original_cursor
     assert _CONVERSATION_ID_RE.fullmatch("local-123")
     assert not _CONVERSATION_ID_RE.fullmatch("../escape")
+
+    # 进度转发：任务内部产生的事件必须先于结果出来，否则「边等边报」就是空话——
+    # 这条链路里 MCP 取数最慢的一项要 30 秒，等完再一次性给等于没有进度。
+    async def _progress_probe() -> list[dict[str, Any]]:
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        async def work() -> str:
+            q.put_nowait({"stage": "mcp", "label": "查询运行日志"})
+            # 让出一次控制权，模拟「事件先于完成」的真实时序
+            await asyncio.sleep(0)
+            return "done"
+
+        seen: list[dict[str, Any]] = []
+        async for event in _stream_until(asyncio.create_task(work()), q):
+            seen.append(event)
+        return seen
+
+    _events = asyncio.run(_progress_probe())
+    assert _events[-1] == {"__result__": "done"}, _events
+    assert {"stage": "mcp", "label": "查询运行日志"} in _events, "进度事件没在结果之前转发出来"
+    assert all("__result__" not in e for e in _events[:-1]), "结果只能出现在最后一条"
+    assert _noop_progress("x", "y") is None, "空实现要能直接调用"
 
 
 if __name__ == "__main__":

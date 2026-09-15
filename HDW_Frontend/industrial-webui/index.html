@@ -1259,6 +1259,33 @@
       white-space: nowrap;
     }
 
+    /* 等待期的进度明细：挂在消息体里、正文下方。
+       颜色全走变量——夜间模式下写死浅色会变成浅字压浅底。 */
+    .progress-steps {
+      display: grid;
+      gap: 3px;
+      margin-top: 8px;
+      padding-left: 10px;
+      max-height: 220px;
+      overflow-y: auto;
+      border-left: 2px solid var(--line);
+      scrollbar-width: thin;
+    }
+
+    .progress-step {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+
+    /* 最后一条是「正在做的那一步」，点亮它、其余压暗——
+       一眼能分清「进行中」和「已完成」，不用去数到第几行。 */
+    .progress-step:last-child {
+      color: var(--ink);
+      font-weight: 600;
+    }
+
     .thinking-text.context-compressing::after {
       content: none;
       animation: none;
@@ -7277,6 +7304,19 @@
       const pending = addMessage("Thinking", "assistant", true, "30");
       const shouldCompress = conversationNearCompression(conversation);
       if (shouldCompress) setPendingText(pending, "Compressing context...", true);
+      // 进度明细：每一条都追加成一行，而不是只把同一行文字换来换去。
+      // 「现在在做什么」和「已经做过什么」是两回事——后者才能看出卡在哪一步，
+      // 而这条链路里 MCP 取数最慢的一项要等 30 秒，只换一行的展示等于没展示。
+      // 上面那行仍跟着最新步骤走（保持原有手感），这里是它的完整留痕。
+      const progressSteps = document.createElement("div");
+      progressSteps.className = "progress-steps";
+      pending.body.appendChild(progressSteps);
+      const pushProgressStep = (text) => {
+        const line = document.createElement("div");
+        line.className = "progress-step";
+        line.textContent = text;
+        progressSteps.appendChild(line);
+      };
       if (pending.ballRecord) {
         const thinkingEmotions = ["30", "40", "32"];
         let thinkingIndex = 0;
@@ -7321,13 +7361,14 @@
           // 「……」。那种「文字自带省略号 + CSS 再补一个」的写法在本文件里只有
           // "Compressing context..." 一处，而它用 `context-compressing` 类把
           // CSS 那个关掉了（`content: none`）——是刻意配对的，别照抄一半。
-          setPendingText(
-            pending,
-            event.evidence
-              ? `${event.label}（${event.evidence} 条证据）`
-              : event.label,
-          );
+          const stepText = event.evidence
+            ? `${event.label}（${event.evidence} 条证据）`
+            : event.label;
+          setPendingText(pending, stepText);
+          pushProgressStep(stepText);
         });
+        // 明细是等待期的东西，答案一出来就该让位。
+        progressSteps.remove();
         stopThinking(pending);
         const answer = data.answer || "没有返回回答。";
         const citations = data.citations || [];
