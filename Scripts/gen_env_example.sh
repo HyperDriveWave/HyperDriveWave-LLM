@@ -77,6 +77,29 @@ EXEMPT = {"HDW_ENABLE_AUTH", "HDW_INTERNAL_API_KEY"}
 # 注释掉等于「这台机器上必须自己填」。所以在模板里只能以注释形态出现。
 REMOTE_ONLY_KEYS = {"HDW_REMOTE_RAG_ROOT"}
 
+# 指向**私有网络或企业内网**的键。这类值不能进模板：
+# 公开仓库里一个可访问的企业登录页等于把攻击面直接指出来，内网 IP 则暴露拓扑。
+# 和路径那批不同，这些键**必须继续生效**（新机器要填自己的值），所以换成占位符，
+# 不能像 REMOTE_ONLY_KEYS 那样整行注释掉。
+# 2026-09-16：原先这里只脱敏绝对路径，企业 SIS 门户地址被原样提交了很久。
+PRIVATE_HOST_KEYS = {
+    "HDW_SIS_BASE_URL": "https://<企业SIS门户>",
+    "HDW_SIS_LOGIN_URL": "https://<企业SIS门户>/login.html",
+    "HDW_RAG_REMOTE_URLS": "http://<远端RAG主机IP>:8001,http://<远端RAG主机IP>:8003",
+    "HDW_REMOTE_RAG_SSH_TARGET": "<远端用户名>@<远端RAG主机IP>",
+    # 占位符里**不要再写字面的私有地址**——_scrub 会把它再收一道，
+    # 变成「<…，如 <私有IP>>」这种嵌套占位符。
+    "HDW_WEBUI_BIND": "<本机内网网卡地址>",
+    "HDW_FRP_PUBLIC_HOST": "<中转机公网地址>",
+}
+
+# 兜底：注释里出现的私有地址也一并收敛。键值那一层由 PRIVATE_HOST_KEYS 处理，
+# 但注释里常顺手写「实测 <某台内网机>:8003 就是这样」——那同样是泄露。
+# （写这条规则时我自己就在注释里把真实内网 IP 写进去了，被本脚本扫出来才发现。）
+_PRIVATE_IP = re.compile(
+    r"\b(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b"
+)
+
 def placeholder(key: str) -> str:
     base = key.replace("HDW_", "").lower()
     if key == "HDW_INTERNAL_API_KEY":
@@ -108,6 +131,10 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replac
         out.append(f"# {k}=/home/<远端用户名>/HyperDriveWave-RAG")
         blanked.append(k)
         continue
+    if k in PRIVATE_HOST_KEYS:
+        out.append(f"{k}={PRIVATE_HOST_KEYS[k]}")
+        blanked.append(k)
+        continue
     if KEY_PAT.search(k) and v and "change_me" not in v and not v.startswith("your"):
         out.append(f"{k}={placeholder(k)}")
         blanked.append(k)
@@ -121,6 +148,8 @@ _project_root = sys.argv[3].rstrip("/")
 
 def _scrub(text: str) -> str:
     text = text.replace(_project_root, "<项目根>")
+    # 注释里的私有地址同样要收：它们暴露内网拓扑，且没有任何保留价值。
+    text = _PRIVATE_IP.sub("<私有IP>", text)
     return re.sub(r"/home/(?!<)[^/\s\"']+", "/home/<用户>", text)
 
 
