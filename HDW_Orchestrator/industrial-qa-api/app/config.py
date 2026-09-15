@@ -35,6 +35,18 @@ class Settings:
     context_compression_max_tokens = int(
         os.getenv("HDW_CONTEXT_COMPRESSION_MAX_TOKENS", "2000")
     )
+    # 历史相关性选留。压缩（上面三个）是**兜底**：选留之后仍然超长时才由它出手。
+    # 总开关存在是为了出问题时能一键退回「全量历史」的老行为。
+    history_select_enabled = os.getenv("HDW_HISTORY_SELECT", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    # 历史少于这么多轮就不判断——对话刚开始时选留没有意义，白花一次调用。
+    history_select_min_turns = int(os.getenv("HDW_HISTORY_SELECT_MIN_TURNS", "3"))
+    # 最多把最近多少轮交给选择器。历史很长时，选择器自己的输入也会变得过大。
+    history_select_max_turns = int(os.getenv("HDW_HISTORY_SELECT_MAX_TURNS", "20"))
     rag_base_url = os.getenv("HDW_RAG_BASE_URL", "http://localhost:8001").strip().rstrip("/")
     rag_remote_urls = tuple(
         url.strip().rstrip("/")

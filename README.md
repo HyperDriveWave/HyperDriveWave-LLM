@@ -8,7 +8,7 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
 <项目根>
 ```
 
-本文档以当前代码和 Compose 配置为准，更新时间：2026-09-09。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
+本文档以当前代码和 Compose 配置为准，更新时间：2026-09-16。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
 
 ## 1. 设计原则
 
@@ -29,7 +29,12 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
 
 | 能力 | 当前实现 | 入口 |
 | --- | --- | --- |
-| 工业聊天问答 | FastAPI QA API 调用 RAG、Neo4j 和 Qwen | WebUI 首页 |
+| 工业聊天问答 | FastAPI QA API 调用 RAG、Neo4j 和 Qwen；默认返回 JSON，传 `stream: true` 时走 SSE（进度事件 + 心跳 + 最终结果） | WebUI 首页 |
+| 图片提问 | 上传图片，自动转写成文字后进入检索；**默认仅管理员可用**，可由管理员开放给普通用户 | WebUI 首页输入框 |
+| 视觉来源优先级 | 图片转写有三种来源（在线对话模型 / 本地模型 / MinerU），按 `vision_priority` 顺序尝试 | 模型管理页面 |
+| 历史相关性选留 | 每次提问前判断哪些历史轮次与当前问题相关，无关的不进 prompt；实测把 82 轮 / 103k token 的会话压到 1.7k | 自动 |
+| 对话内问答导航 | 右侧边缘一列短横线，悬停展开成提问列表，点击跳到那一次问答 | WebUI 右侧 |
+| 本地模型加载/卸载 | 管理员可停掉 llama-server 释放约 21.8 GB 显存，再随时加载回来；期间本地问答不可用 | 模型管理页面 |
 | Qwen 底座 | `llama.cpp` 常驻加载 `Qwen3.8-27B-GSQ` MTP 模型；FreeToken 仅保留为可选旧方案 | `hyperdrivewave-llama.service` |
 | 文档上传 | 局域网 WebUI 上传到 ingest API | 知识库入库页面 |
 | MinerU 解析 | PDF、DOCX、PPTX、XLSX 和图片解析为 Markdown/JSON | `hdw-mineru` |
@@ -51,11 +56,11 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
    也没有纳入主 Compose，不能假设它们已经启动。它们的版本记在 `vendor/vendor.lock`
    里但标为「不默认拉取」，要用时 `bash Scripts/fetch_vendors.sh --with dify,n8n`。
    默认部署真正需要的只有 `MinerU`（`knowledge` profile）和 `aora-bot`（`web` profile 的情绪球）。
-2. QA API 当前会调用 RAG 和 Neo4j，但不会对每个问题自动调用 MCP。MCP 页面用于查看工具和服务状态；实时 SIS/RTSP 工具自动路由需要后续增加意图判断、权限、超时和审计。
+2. MCP 的**只读**工具已经自动并入 `/qa/query`：SIS 测点现值/历史/趋势、LIEMS 日志由同一次检索规划的模型结论决定取哪些，不需要人工触发。仍未接入的是 RTSP、thermal、lstm、alarm、edge_device、custom_rule。
 3. 普通入库和全量重建仍是两种语义。全量重建会重新解析源目录内全部文档，这是为了让源文件、解析结果、Chunk、Neo4j 和 Zvec 一致。
 4. 当前没有“取消正在运行的 ingest 任务”接口。停止任务需要先确认任务状态，再停止 ingest API、清理 MinerU 工作进程，并检查数据是否需要恢复。
 5. `aora-bot/emotion-ball` 的许可证需要在商业部署前重新核对，不能因为已经能运行就默认可以商业使用。
-6. 远端双 GPU RAG 与本机 CPU RAG 的索引必须保持一致；WebUI 入库任务会在本机重建完成并拉起 llama 后自动同步远端两份索引，`Scripts/sync_remote_rag.sh` 保留作人工恢复工具。
+6. 远端双 GPU RAG 与本机 CPU RAG 的索引必须保持一致；WebUI 入库任务会在本机重建完成并拉起 llama 后自动同步远端两份索引。此外知识库页面有独立的「同步远端」按钮（`POST /sync`），用于**不重建**而只把现有 chunks 重推一遍、刷新文档上的同步状态——`Scripts/sync_remote_rag.sh` 保留作人工恢复工具。
 
 ## 3. 项目结构
 
@@ -513,9 +518,11 @@ docker compose down -v
   -> 返回高质量 Chunk
   -> QA API 根据 chunk_id 查询 Neo4j
   -> 补充文档、章节、前后 Chunk、设备、参数、故障、报警、动作
-  -> Qwen3.8-27B-FP8
-  -> 返回 answer、citations、graph_context、status
-  -> WebUI 展示回答和可展开依据
+  -> Qwen3.8-27B-GSQ（MTP 投机解码）
+  -> 返回 answer、citations、graph_context、status、llm、context、
+     unsupported_numbers、rag
+  -> WebUI 展示回答、进度阶段提示、实时测点卡片、趋势图（内联 SVG）、
+     可展开依据、以及数字出处缺失时的提示
 ```
 
 Qwen 是底座模型。RAG、Neo4j、MCP 和球球不是替代模型，而是围绕模型的扩展：
@@ -527,7 +534,19 @@ Qwen 是底座模型。RAG、Neo4j、MCP 和球球不是替代模型，而是围
 - QA API 负责编排、边界和返回格式。
 - WebUI 负责交互和证据展示。
 
-当前 QA API 已经接入 RAG 和 Neo4j；MCP 自动调用还未并入 `/qa/query`。后续接入 MCP 时必须先定义：
+响应的几个字段值得单独说明：
+
+- `citations` 是**真正进了提示词**的那批证据，不是全部召回结果——它和 `unsupported_numbers`
+  的核对用的是同一份文本。
+- `llm` 里有 `history_select`（历史选留的统计）和 `prompt_tokens_estimate`（实际送出的
+  prompt 大小），排查「为什么这次慢」时先看这两个。
+- `context` 是压缩/选留的元信息，`unsupported_numbers` 是答案里找不到出处的数字，
+  **空列表才是常态**。
+- 开 `stream: true` 时这些都在 SSE 的最后一条 `result` 事件里。
+
+**MCP 只读调用已并入 `/qa/query`**（SIS 测点现值/历史/趋势、LIEMS 日志），
+由同一次检索规划的模型结论决定取哪些，不再是"按需人工触发"。仍未接入的是
+RTSP、thermal、lstm、alarm、edge_device、custom_rule 这类。后续继续接入时必须先定义：
 
 1. 哪些问题允许读实时测点。
 2. 哪些工具只读，哪些工具允许写入。
@@ -672,13 +691,28 @@ HDW_LLAMA_BINARY=<项目>/HDW_Inference/llama/llama.cpp-upstream/build-cuda/bin/
 RAG 和 Neo4j** —— 下游拿到空 contexts 会自然产出空 `citations`/`graph_context`，
 前端的 `addEvidence()` 在两者都空时不渲染依据面板，无需改前端。
 
-链路：
+链路（**现在的实现**）：
 
 ```text
-问题 → _needs_retrieval()  ← 一次极小调用：无证据、只出 1 个 token
-         ├─ no  → 空 contexts，直接进 LLM
-         └─ yes → _plan_rag → RAG → Neo4j → LLM
+问题 → _plan_retrieval()   ← 一次模型调用，出 5 行：检索 / 测点 / 历史 / 趋势 / 日志
+         ├─ 检索=否 → 空 contexts，直接进 LLM
+         └─ 检索=是 → _plan_queries()   ← 再让模型把问题拆成 N 路各自独立的检索 query
+                       ↓
+                     asyncio.gather 并发跑 N 路 RAG，按下标合并去重
+                       ↓
+                     Neo4j 上下文 → LLM
 ```
+
+`_plan_is_complete` **只检查结构**（5 行都在吗），不判断内容；失败重试一次
+（`_PLANNER_ATTEMPTS=2`），仍然失败才退回保守默认（照常检索）并把 `degraded`
+放进返回值——**不静默退化**，因为「本来能答的问题变成答不了」比多查一次糟得多。
+
+多路检索改成并发后，24 题卷子从 38.8s 降到 25.2s。**规划完全由模型完成，没有关键词启发式**——
+早期那套「自称词 + 元信息关键词 + 短问题」的规则、以及 MCP 里的 `rag_query_plan` 工具
+都已删除。
+
+> 下面这张表是**旧版单次判定**（`_needs_retrieval()`，只出 1 个 token）的实测结果，
+> 保留作为「该不该路由」这个判断本身的证据；函数本身已被上面的 5 行规划取代。
 
 实测（同一批问题）：
 
@@ -709,22 +743,28 @@ RAG 和 Neo4j** —— 下游拿到空 contexts 会自然产出空 `citations`/`
 
 ### 7.5 实时测点（MCP sis_point）
 
-**问题**：MCP 有 27 个工具，但 `/qa/query` 只用到了 `rag_query_plan`，从不调工具。
-问「现在主汽温度多少」只会拿到文档里写的定值，不是实测值。
+**问题**：MCP 有一批工具，但 `/qa/query` 从不调它们。问「现在主汽温度多少」只会拿到
+文档里写的定值，不是实测值。
 
-**方案**：和检索路由**合并成同一次规划调用**，一次决定「要不要查文档」和「要读哪些实时测点」。
-规划的产物里，测点关键词并行去查 SIS，结果作为**独立区块**进 prompt —— 实时数据与文档证据
-分栏，不混为一谈。
+**方案**：和检索路由**合并成同一次规划调用**。那次调用出 **5 行**——检索 / 测点 / 历史 /
+趋势 / 日志——历史与趋势按 `关键词|起|止[|间隔秒]`、日志按 `起|止[|重大]` 解析。
+测点、历史、趋势、日志并行去查 SIS 与 LIEMS，结果作为**独立区块**进 prompt ——
+实时数据与文档证据分栏，不混为一谈。
 
 ```text
-问题 → 一次规划（模型出两行：检索: yes/no ｜ 测点: <关键词> 或 无）
-        ├─ 测点 → 并行 point_query_current_value（最多 3 个）
-        └─ 检索 → RAG + Neo4j
+问题 → _plan_retrieval() 一次出 5 行
+        ├─ 测点 → point_query_current_value（并行，有上限）
+        ├─ 历史 ┐
+        ├─ 趋势 ┤→ point_query_history_series
+        ├─ 日志 → log_query_recent | log_query_range | log_query_major_events
+        └─ 检索 → _plan_queries → 多路并发 RAG + Neo4j
         ↓
-      LLM（实时测点数据 与 检索证据 分两个区块）
+      LLM（实时数据 与 检索证据 分区块）
         ↓
-      前端：citations 为空时不渲染依据面板
+      前端：实时测点卡片 + 趋势图（内联 SVG）；citations 为空也照样显示
 ```
+
+实时数据抓取与多路检索是**并行**的（`asyncio.create_task` + `gather`），不是串行等。
 
 实测：
 
@@ -781,14 +821,96 @@ HDW_SIS_BASE_URL / HDW_SIS_LOGIN_URL / HDW_SIS_USERNAME / HDW_SIS_PASSWORD / HDW
    输出 `YYYY-MM-DD HH:MM:SS` 无后缀。`_prompt()` 只展示、不再二次换算 ——
    重算会把已经本地化的值再当 UTC 加 8 小时。无时区的输入按 UTC 解释（SIS 侧就是 UTC，
    当成本地时间会少算 8 小时）；解析失败原样返回，不丢采集时间。
-**其他工具组的现状**（未接入）
+**其他工具组的现状**
 
 | 工具组 | 状态 |
 | --- | --- |
+| liems_log | **已接入**。`/qa/query` 会调 `log_query_recent` / `log_query_range` / `log_query_major_events`，数据在 `HDW_DataFoundation/Mapping/Log_Fetching/data` |
 | thermal | 服务 ready，但无匹配测量点 |
 | rtsp | 服务 ready，但 `HDW_RTSP_STREAMS_JSON` 为空 → 0 路流 |
 | lstm | 服务 ready，但 0 个模型 |
-| alarm / edge_device / custom_rule / liems_log | 缺数据文件，不可用 |
+| alarm / edge_device / custom_rule | 缺数据文件，不可用 |
+
+### 7.6 流式返回（SSE）
+
+`POST /qa/query` 默认仍返回一个完整 JSON，老调用方不受影响；传 `stream: true` 时改成
+`StreamingResponse`，按事件流推送：
+
+```text
+{"stage":"vision"|"retrieve"|"generate","label":"…"}   进度事件（generate 带 evidence 条数）
+{"heartbeat":true}                                      心跳，每 HDW_SSE_HEARTBEAT 秒一条
+{"result": {…}}                                         最终结果，结构和不流式时完全一样
+{"error": {"message":"…"}}                              流内错误
+```
+
+为什么要加：一次问答实测要 25–77 秒，中间没有任何反馈时浏览器会以为卡死，
+代理也可能提前掐断长连接。
+
+三个实现细节值得记住：
+
+- **前端用 `fetch` + `ReadableStream`，不是 `EventSource`**——后者只支持 GET，
+  而 `/qa/query` 必须 POST。
+- **校验错误仍走真实 HTTP 状态码**（401/403/422 在开流之前就定了），
+  不会变成流里的一条 error 事件。
+- nginx 侧要 `X-Accel-Buffering: no`，否则响应会被缓冲到结束才吐出来，流式等于白做。
+
+### 7.7 图片上传与权限
+
+上传图片提问默认**只对管理员开放**，普通用户要由管理员在模型管理页打开
+`image_upload_for_users` 才能用。
+
+权限位由 `_permissions_for_user()` 统一给出，前端只负责置灰，**真正的拦截在服务端**
+（带图请求会被直接 403）。界面是公开的，只靠前端置灰等于没拦。
+
+这个开关存在 `HDW_Runtime/model-config/config.json` 的 `permissions` 段，**不在 `.env` 里**——
+它属于运行时模型配置，不是部署参数。
+
+### 7.8 图片来源优先级
+
+问答链路的图片转写有**三种来源**，由模型配置里的 `vision_priority` 统一驱动
+（1–4 项，每项 `{priority, kind, mode, model, enabled}`）：
+
+| kind | 走什么 |
+| --- | --- |
+| `chat` + `mode=online` | 在线对话模型 |
+| `chat` + `mode=offline` | 本地 llama（需要 `mmproj` 投影器） |
+| `mineru` | 本地 MinerU `/file_parse` |
+
+两条视图读同一份列表：`_ordered_vision_candidates()` 决定**转写**用哪个来源
+（接受 chat 和 mineru），`_vision_candidates()` 决定**答题**用哪个视觉模型
+（只接受 chat，选不出就 503）。转写结果会拼进检索问题，原图仍然同时给答题模型，
+提示词里明写「图片文字是自动识别，不要当证据引用」。
+
+**缺省 `kind` 当 `chat`**：老配置里没有这个字段，不这样兼容的话升级后所有视觉候选都会被判非法。
+`mmproj` 是**启动参数**，改了不重启本地推理不生效。
+
+### 7.9 历史相关性选留
+
+**问题**：历史是一轮一轮线性堆上去的，而解码速度直接由上下文长度决定——短上下文约
+150 t/s，5–20k 掉到约 130，5 万以上只剩约 100。对话越长，每个回答越慢。
+
+**方案**：每次提问前多一次小调用，判断哪些历史轮次与当前问题**主题相关**，无关的不进 prompt。
+三轮对话「什么是汽轮机 / 电气差动保护是什么 / 汽轮机超速有什么后果」，问第三轮时第二轮不会进 token。
+
+几个刻意的设计：
+
+- **按轮选，不按单条消息选**。一轮 = 一个 user + 其后紧邻的 assistant；
+  只选一条会出现「留了答案、丢了问题」这种半截状态。
+- **摘要那条 system 消息永远保留**——它是压缩产物，丢了等于丢整段历史。
+- **失败方向朝「全留」倒**。选择器超时、报错、输出解析不出来，一律退回全量历史：
+  **选错只是慢一点，丢错上下文是答错**。特别地，「模型明确说『无』」（合法结论，返回空）
+  和「输出看不懂」（故障，全留）必须分开——混起来就会在解析失败时静默丢掉整段历史。
+- **选留放在 `ContextManager.prepare()` 之后**。`context_kept_from` 是存盘的绝对下标，
+  在它之前过滤会让存回去的下标指错位置。
+- 只把最近 `HDW_HISTORY_SELECT_MAX_TURNS` 轮交给选择器，更早的一律丢弃——这是**有意的
+  近因策略**，也让选择器自身的输入有上界。
+
+**和压缩的关系**：`ContextManager` 的 75% 阈值压缩**保留为兜底**——选留之后历史仍然超长
+才由它出手。选留是日常手段，每轮都跑。实测最大的一个会话有 82 轮、103,075 token 的历史，
+选留后只剩 1,685（省 98%）。
+
+结果记录在响应的 `llm.history_select` 里（选了几轮、丢了哪几轮、花了多久、有没有失败、
+前后 token 数），排查时先看这个。`HDW_HISTORY_SELECT=0` 可一键退回全量历史。
 
 ## 8. 对话历史文件存储
 
@@ -812,10 +934,11 @@ HDW_SIS_BASE_URL / HDW_SIS_LOGIN_URL / HDW_SIS_USERNAME / HDW_SIS_PASSWORD / HDW
 HDW_CHATDATA_ROOT=/data/chatdata
 ```
 
-每个会话一个 JSON 文件，例如：
+每个会话一个 JSON 文件，**按用户分目录**，例如：
 
 ```text
-HDW_Runtime/chatdata/local-1788679371-ab12cd.json
+HDW_Runtime/chatdata/<用户code>/<会话id>.json
+HDW_Runtime/chatdata/046/local-1788939310439-clb1h6.json
 ```
 
 ### 8.2 文件结构
@@ -832,6 +955,9 @@ HDW_Runtime/chatdata/local-1788679371-ab12cd.json
     {
       "role": "user",
       "content": "启动前需要检查什么？",
+      "citations": [],
+      "graph_context": [],
+      "emotion_id": null,
       "created_at": "2026-09-06T15:00:00+08:00"
     },
     {
@@ -842,9 +968,29 @@ HDW_Runtime/chatdata/local-1788679371-ab12cd.json
       "emotion_id": "33",
       "created_at": "2026-09-06T15:02:00+08:00"
     }
-  ]
+  ],
+  "context_summary": "",
+  "context_kept_from": 0,
+  "context_token_estimate": 0,
+  "context_compressed_at": null,
+  "last_inference_mode": "offline"
 }
 ```
+
+**user 消息也带 `citations` / `graph_context` / `emotion_id` 三个字段**（默认空），
+不是只有 assistant 有——所有消息是同一个结构。
+
+后面那五个 `context_*` / `last_inference_mode` 字段是上下文管理的状态：
+
+| 字段 | 含义 |
+| --- | --- |
+| `context_summary` | 75% 阈值压缩的产物。**实测从未被写过**——压缩线是 0.75 × 262,144 = 196,608 token，而最大的会话也只有 118k |
+| `context_kept_from` | 已摘要掉的轮次边界，**存盘的绝对下标** |
+| `context_token_estimate` | 上次保存时的历史 token 估算 |
+| `context_compressed_at` | 上次压缩时间 |
+| `last_inference_mode` | 上次用的是在线还是离线，跨模式时会触发一次压缩 |
+
+历史相关性选留读的就是这个文件——**原文一个字不动**，只是决定哪些轮次进 prompt。
 
 保存采用临时文件写入后 `replace()`，避免浏览器刷新或进程中断时留下半个 JSON。会话 ID 只允许字母、数字、下划线和短横线，防止路径穿越。
 
@@ -1600,6 +1746,30 @@ curl --unix-socket HDW_Runtime/maintenance/maintenance.sock -X POST http://local
 curl --unix-socket HDW_Runtime/maintenance/maintenance.sock -X POST http://localhost/frp-disable
 ```
 
+临时把显存让出来（不想停整个项目时用这个）：
+
+```bash
+# 卸载：停掉 llama-server，释放全部显存
+curl --unix-socket HDW_Runtime/maintenance/maintenance.sock \
+  -X POST http://localhost/unload-llm
+
+# 加载回来
+curl --unix-socket HDW_Runtime/maintenance/maintenance.sock \
+  -X POST http://localhost/switch-llm
+```
+
+日常入口是 WebUI 模型管理页的「卸载本地模型 / 加载本地模型」按钮（管理员可见），
+对应 `PATCH /api/local-model`，body `{"loaded": true|false}`——加载复用协调器的
+`/switch-llm`，它的语义本来就是「确保配置里的本地模型在跑」，不另造重复端点。
+
+**为什么卸载只能停进程**：llama.cpp 单模型模式**没有任何运行期卸载接口**——
+`/models/unload` 只在多模型 router 模式下注册（本项目单模型启动，那条路由根本没挂上）。
+而单元是 `Restart=always` + `RestartSec=3`，**kill 掉进程会在 3 秒后自己回来**，
+只有 `systemctl --user stop` 这种显式停止才算数。
+
+实测：卸载后显存从 22454 MiB 降到 678 MiB（释放约 21.8 GB），加载回来约 22236 MiB。
+卸载期间本地问答不可用，界面会当场提示。
+
 ### 11.1 外网访问（公网隧道）
 
 推荐入口：**控制中心 → 外网访问**。管理员可切换，普通用户只能看状态。停用后公网
@@ -1650,6 +1820,13 @@ docker compose --env-file Configs/.env -f Configs/docker-compose.yml \
 
 ## 12. 文档入库操作
 
+**这一节的接口全部需要登录会话**，命令行调用必须带 `X-HDW-Session` 头，否则一律 `401 login required`：
+
+```bash
+SESSION=<登录会话>     # 浏览器登录后 localStorage 里的 hdw-auth-session 值
+ADMIN=<管理员会话>     # 上传、入库、同步、删除、清空都要求 role=admin
+```
+
 推荐使用 WebUI：
 
 1. 进入“控制中心”。
@@ -1659,30 +1836,33 @@ docker compose --env-file Configs/.env -f Configs/docker-compose.yml \
 5. 需要重新整理全部文档时勾选“全量一致性重建”。
 6. 点击“知识库入库”。
 7. 等待 MinerU、切分、Neo4j 和 Zvec 全部完成。
+8. 远端 RAG 由入库流程自动同步；只有文档上的「远端同步」显示「未配置」而远端其实已有数据时，才需要点「同步远端」单独刷新（见下）。
 
 命令行上传：
 
 ```bash
 curl -f -X POST http://127.0.0.1:8090/upload \
+  -H "X-HDW-Session: $ADMIN" \
   -F "file=@/path/to/document.docx"
 ```
 
 查看文档：
 
 ```bash
-curl -fsS http://127.0.0.1:8090/documents
+curl -fsS http://127.0.0.1:8090/documents -H "X-HDW-Session: $SESSION"
 ```
 
 查看任务：
 
 ```bash
-curl -fsS http://127.0.0.1:8090/jobs/<job-id>
+curl -fsS http://127.0.0.1:8090/jobs/<job-id> -H "X-HDW-Session: $SESSION"
 ```
 
 普通入库请求：
 
 ```bash
 curl -f -X POST http://127.0.0.1:8090/ingest \
+  -H "X-HDW-Session: $ADMIN" \
   -H 'Content-Type: application/json' \
   -d '{"document_ids":["<document-id>"],"full_rebuild":false}'
 ```
@@ -1691,22 +1871,37 @@ curl -f -X POST http://127.0.0.1:8090/ingest \
 
 ```bash
 curl -f -X POST http://127.0.0.1:8090/ingest \
+  -H "X-HDW-Session: $ADMIN" \
   -H 'Content-Type: application/json' \
   -d '{"document_ids":[],"full_rebuild":true}'
 ```
+
+只同步远端、不重建：
+
+```bash
+curl -f -X POST http://127.0.0.1:8090/sync -H "X-HDW-Session: $ADMIN"
+```
+
+把**现有的** `chunks.jsonl` 重新推到 `HDW_RAG_REMOTE_URLS` 里的每个节点，并刷新每个文档的 `remote_sync_status`。不解析、不嵌入、不碰 Neo4j、不用大模型、不占显存，所以比入库快得多（实测两个节点各推 10.8 MB、各重建 9021 个片段，整轮约 160 秒）。
+
+另一个任务处于 queued/running 时返回 `409`；没有已入库文档时返回 `400`；一个远端都没配时把状态写成 `not_configured`，不粉饰成「完成」。
+
+**为什么需要这个接口**：`remote_sync_status` 是**入库那一刻写死的快照**，读取时只补缺失字段（`setdefault`）、从不重算。所以远端如果是在某次入库**之后**才配置的，那批文档会永远显示「未配置」——哪怕数据其实早就推过去了。这条路径就是用来不重建而把标签刷成真实值的。
 
 删除已入库文档必须使用文档删除接口，让系统重新构建剩余图谱和向量：
 
 ```bash
 curl -f -X DELETE \
-  http://127.0.0.1:8090/documents/<document-id>
+  http://127.0.0.1:8090/documents/<document-id> \
+  -H "X-HDW-Session: $ADMIN"
 ```
 
 删除“已上传但尚未进入任务”的文件才使用 staged 接口：
 
 ```bash
 curl -f -X DELETE \
-  http://127.0.0.1:8090/documents/<document-id>/staged
+  http://127.0.0.1:8090/documents/<document-id>/staged \
+  -H "X-HDW-Session: $ADMIN"
 ```
 
 ## 13. 清空知识库
@@ -1913,18 +2108,27 @@ Qwen + RAG + reranker + Zvec + Neo4j + MinerU + WebUI + 文件会话
 | `HDW_ONLINE_LLM_API_KEY` | 在线模型密钥，只放在被忽略的 `Configs/.env` |
 | `HDW_ONLINE_GRAPH_TOP_K` | 在线问答送入 LLM 的图谱上下文上限，默认 40 |
 | `HDW_LOCAL_GRAPH_TOP_K` | 离线问答送入 LLM 的图谱上下文上限，默认 10；先由 reranker 排序，再取前 10 条 |
-| `HDW_CONTEXT_WINDOW_TOKENS` | 在线上下文估算上限，当前为 262,144 |
+| `HDW_CONTEXT_WINDOW_TOKENS` | 在线上下文估算上限，当前为 **1,000,000**（262,144 是下面那个本地键的值，两者别混） |
 | `HDW_LOCAL_CONTEXT_WINDOW_TOKENS` | 离线上下文估算上限 |
-| `HDW_CONTEXT_COMPRESSION_THRESHOLD` | 触发上下文压缩的比例，当前为 75% |
+| `HDW_CONTEXT_COMPRESSION_THRESHOLD` | 触发上下文压缩的比例，当前为 75%。**这是兜底机制**：选留之后历史仍然超长才由它出手；按 0.75 × 262,144 = 196,608 token 换算，实际从未触发过 |
 | `HDW_CONTEXT_COMPRESSION_TARGET` | 压缩后目标比例 |
+| `HDW_CONTEXT_COMPRESSION_MAX_TOKENS` | 单次摘要的输出上限，默认 2000 |
+| `HDW_HISTORY_SELECT` | 历史相关性选留总开关，默认 1。每次提问前判断哪些历史轮次与当前问题相关，无关的不进 prompt；**置 0 可一键退回「全量历史」** |
+| `HDW_HISTORY_SELECT_MIN_TURNS` | 历史少于这么多轮就不做选留（刚开始对话时没意义，白花一次调用），默认 3 |
+| `HDW_HISTORY_SELECT_MAX_TURNS` | 最多把最近多少轮交给选择器；更早的一律丢弃（近因策略，也让选择器输入有上界），默认 20 |
+| `HDW_SSE_HEARTBEAT` | SSE 心跳间隔秒数，默认 5；防止长连接被代理掐断（仅代码默认值，compose 未透传） |
 | `HDW_RAG_DEVICE` | 常态 RAG 使用 CPU 或 GPU；WebUI 维护重建时由覆盖文件临时设为 `cuda` |
 | `HDW_LLM_BASE_URL` | QA API 使用的 LLM 地址 |
 | `HDW_RAG_BASE_URL` | QA API 使用的 RAG 地址 |
 | `HDW_RAG_REMOTE_URLS` | 远端 RAG 地址列表，逗号分隔，QA 按轮询调用，当前为 `<远端RAG主机IP>:8001,8003` |
 | `HDW_RAG_CONNECT_TIMEOUT` | RAG 建立连接超时；远端不可达时用于快速进入下一个节点或本机 fallback |
 | `HDW_RAG_HEALTH_TIMEOUT` | QA `/health` 检查单个 RAG 节点的超时 |
-| `HDW_REMOTE_RAG_SSH_TARGET` | 远端 RAG 同步脚本的 SSH 目标，不包含密码 |
-| `HDW_REMOTE_RAG_ROOT` | 远端 RAG 独立部署目录 |
+| `HDW_RAG_ADMIN_TOKEN` | 远端 RAG `/admin/sync` 的鉴权令牌。入库和「同步远端」都靠它，缺了会直接报 `HDW_RAG_ADMIN_TOKEN is not configured` |
+| `HDW_REMOTE_RAG_SYNC_TIMEOUT` | 同步远端时**单个 socket 操作**的超时秒数，当前 600（不是总时长，正常上传不受影响）。**置 0 = 不设超时**——远端不回包时作业和文档会永久卡在「同步中」，比原来的「未配置」更糟 |
+| `HDW_REMOTE_RAG_SSH_TARGET` | **仅供 `Scripts/sync_remote_rag.sh` 手工运维**用的 SSH 目标，不含密码。应用内的「同步远端」走 HTTP，不需要 SSH |
+| `HDW_REMOTE_RAG_ROOT` | 同上，远端 RAG 的独立部署目录 |
+| `HDW_MINERU_TIMEOUT` | 问答图片转写走 MinerU 时的超时秒数，默认 180（问答有人在等，和批处理的「不设超时」刻意不同） |
+| `HDW_VISION_MINERU_MAX_QUEUE` | MinerU 转写的排队上限，默认 1；队列非空就直接放弃该候选，失败快 |
 | `HDW_MINERU_BASE_URL` | ingest 使用的 MinerU 地址 |
 | `HDW_MAINTENANCE_SOCKET` | llama/RAG/MinerU 资源协调器 Unix socket |
 | `HDW_MAINTENANCE_TIMEOUT` | 维护切换等待上限；`0` 表示不设置总等待上限 |

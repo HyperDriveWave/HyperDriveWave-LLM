@@ -653,6 +653,105 @@
       background: var(--page);
     }
 
+    /* 右侧对话快速切换栏：收起时只留一列短横线，鼠标移上去展开成标题列表。
+       颜色全部走 var(--*)，不再写死浅色——那正是夜间模式那一类问题的来源。 */
+    .quick-rail {
+      position: fixed;
+      top: 50%;
+      right: 0;
+      z-index: 30;
+      display: flex;
+      flex-direction: column;
+      width: 30px;                    /* 收起时刚好放下一根短横线 */
+      max-height: min(72vh, 640px);
+      padding: 8px 0;
+      overflow: hidden;
+      transform: translateY(-50%);
+      border: 1px solid transparent;
+      border-right: none;
+      border-radius: 12px 0 0 12px;
+      background: transparent;
+      transition: width 160ms ease, background 160ms ease, border-color 160ms ease;
+    }
+
+    .quick-rail[hidden] {
+      display: none;
+    }
+
+    .quick-rail:hover,
+    .quick-rail:focus-within {
+      width: 300px;
+      border-color: var(--line);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .quick-rail-list {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      min-height: 0;
+      overflow-y: auto;
+      scrollbar-width: thin;
+    }
+
+    .quick-rail-item {
+      display: flex;
+      align-items: center;
+      flex: 0 0 auto;
+      width: 100%;
+      min-height: 28px;
+      padding: 0 8px;
+      overflow: hidden;
+      border: none;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .quick-rail-item:hover {
+      background: var(--hover);
+      color: var(--ink);
+    }
+
+    .quick-rail-item.is-active {
+      background: var(--surface-soft);
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    .quick-rail-title {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* 短横线用 margin-left:auto 顶到最右。收起时标题被压成 0 宽，
+       留在 30px 可视区里的就只有它——这就是参考图第二张的样子。 */
+    .quick-rail-dash {
+      flex: 0 0 auto;
+      width: 14px;
+      height: 2px;
+      margin-left: auto;
+      border-radius: 1px;
+      background: var(--line-strong);
+    }
+
+    .quick-rail-item.is-active .quick-rail-dash {
+      height: 3px;
+      background: var(--ink);
+    }
+
+    /* 窄屏没有悬停，收起状态根本点不到；切换职责交给侧栏抽屉。 */
+    @media (max-width: 760px) {
+      .quick-rail {
+        display: none;
+      }
+    }
+
     .workspace-header {
       display: flex;
       align-items: center;
@@ -1386,6 +1485,14 @@
       background: #fff7f7;
     }
 
+    /* 这个面板的底色写死成浅粉，可里面所有文字用的都是 var(--ink)/var(--muted)/
+       var(--blue)——夜间模式这几个变量会翻成浅色，于是变成浅字压浅底，几乎看不见。
+       只换底色和描边，文字继续跟着主题走。 */
+    :root[data-theme="night"] .ingest-progress-panel.is-error {
+      border-color: #6d3c3c;
+      background: #3a2427;
+    }
+
     .ingest-progress-heading,
     .ingest-progress-meta {
       display: flex;
@@ -1637,6 +1744,16 @@
       color: #b44343;
       font-size: 10px;
       white-space: nowrap;
+    }
+
+    /* 浅底 + 随主题翻转的字色：夜间模式下绿字压浅绿底看不见。 */
+    :root[data-theme="night"] .mcp-service-status {
+      background: #3a2427;
+      color: #f0a3a3;
+    }
+
+    :root[data-theme="night"] .mcp-service-status.is-ready {
+      background: #1d3328;
     }
 
     .mcp-service-status.is-ready {
@@ -2257,6 +2374,12 @@
       color: #a23e3e;
     }
 
+    :root[data-theme="night"] .ingest-job-status.is-error {
+      border-color: #6d3c3c;
+      background: #3a2427;
+      color: #f0a3a3;
+    }
+
     .document-toolbar {
       display: flex;
       align-items: center;
@@ -2384,6 +2507,11 @@
       color: #962f2f;
     }
 
+    :root[data-theme="night"] .danger-button:hover {
+      background: #3a2427;
+      color: #f0a3a3;
+    }
+
     .status-chip {
       display: inline-flex;
       align-items: center;
@@ -2403,6 +2531,11 @@
       color: var(--green);
     }
 
+    /* 同理：浅绿底配 var(--green)，夜间模式下亮绿压浅绿。 */
+    :root[data-theme="night"] .status-chip.is-done {
+      background: #1d3328;
+    }
+
     .status-chip.is-running {
       background: var(--blue-soft);
       color: var(--blue);
@@ -2411,6 +2544,11 @@
     .status-chip.is-error {
       background: #fff0f0;
       color: #b44343;
+    }
+
+    :root[data-theme="night"] .status-chip.is-error {
+      background: #3a2427;
+      color: #f0a3a3;
     }
 
     .document-empty {
@@ -3201,6 +3339,10 @@
     </aside>
     <div id="sidebarResizer" class="sidebar-resizer" role="separator" aria-label="调整历史记录栏宽度" aria-orientation="vertical"></div>
 
+    <nav id="quickRail" class="quick-rail" aria-label="本对话问答导航">
+      <div id="quickRailList" class="quick-rail-list"></div>
+    </nav>
+
     <section class="workspace">
       <header class="workspace-header">
         <div class="workspace-heading">
@@ -3748,6 +3890,8 @@
     };
 
     const historyNode = document.querySelector("#history");
+    const quickRail = document.querySelector("#quickRail");
+    const quickRailList = document.querySelector("#quickRailList");
     const messagesNode = document.querySelector("#messages");
     const emptyState = document.querySelector("#emptyState");
     const welcomeHeading = document.querySelector("#welcomeHeading");
@@ -6275,6 +6419,89 @@
       }
     }
 
+    // 右侧导航栏：列出**本对话内**用户的每一个提问，点一下跳到那一次问答。
+    // 长对话里想翻回上面某一轮要滚很久，这一栏就是给这种场景用的。
+    // 注意它是「同一对话内跳转」，不是切换不同对话——切换对话在左侧栏。
+    function quickRailQuestions() {
+      const messages = Array.isArray(activeConversationData?.messages)
+        ? activeConversationData.messages
+        : [];
+      return messages.filter((message) => message.role === "user");
+    }
+
+    // DOM 里的 user 行与上面的提问列表**按下标一一对应**：openConversation 是
+    // 按顺序逐条 addMessage 的。空内容的提问也照样占一个位置，否则后面全部错位。
+    function userMessageRows() {
+      return Array.from(messagesNode.querySelectorAll(".message-row.user"));
+    }
+
+    function scrollToExchange(index) {
+      const row = userMessageRows()[index];
+      if (!row) return;
+      scrollToMessageStart(row);
+      // 跳过去之后立刻更新高亮，不等下一次滚动事件
+      window.requestAnimationFrame(syncQuickRailActive);
+    }
+
+    // 高亮「当前读到哪一轮」＝视口顶部之上最后一条提问。
+    function syncQuickRailActive() {
+      const rows = userMessageRows();
+      const items = quickRailList.children;
+      if (!rows.length || !items.length) return;
+      const top = messagesNode.getBoundingClientRect().top + 12;
+      let active = 0;
+      rows.forEach((row, index) => {
+        if (row.getBoundingClientRect().top <= top) active = index;
+      });
+      for (let index = 0; index < items.length; index += 1) {
+        items[index].classList.toggle("is-active", index === active);
+      }
+    }
+
+    // 加载长对话时 addMessage 是逐条调的，每调一次就重建整栏的话，
+    // 80 个提问的会话会把同一个列表重建 160 次。用「会话 id + 提问条数」做键
+    // 跳过重复重建——只比条数是不够的：两个各有 5 个提问的会话会撞键、
+    // 切过去以后标题还是旧的。
+    let quickRailKey = "";
+
+    function renderQuickRail() {
+      const questions = quickRailQuestions();
+      const key = `${activeConversation || ""}:${questions.length}`;
+      if (key === quickRailKey) return;
+      quickRailKey = key;
+      quickRailList.textContent = "";
+      quickRail.hidden = questions.length === 0;
+      questions.forEach((message, index) => {
+        const text = String(message.content || "").trim();
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "quick-rail-item";
+        // 收起成短横线时只能靠 tooltip 认出是哪一条
+        button.title = text || "（空白提问）";
+        const title = document.createElement("span");
+        title.className = "quick-rail-title";
+        title.textContent = text || "（空白提问）";
+        const dash = document.createElement("span");
+        dash.className = "quick-rail-dash";
+        button.append(title, dash);
+        button.addEventListener("click", () => scrollToExchange(index));
+        quickRailList.appendChild(button);
+      });
+      // 等一帧再算高亮：刚 append 的节点还没布局，rect 全是 0。
+      window.requestAnimationFrame(syncQuickRailActive);
+    }
+
+    // 滚动时更新高亮。用 rAF 合并，免得一次滚动里反复量 rect。
+    let quickRailScrollPending = false;
+    messagesNode.addEventListener("scroll", () => {
+      if (quickRailScrollPending) return;
+      quickRailScrollPending = true;
+      window.requestAnimationFrame(() => {
+        quickRailScrollPending = false;
+        syncQuickRailActive();
+      });
+    });
+
     function setHome() {
       activeTool = null;
       app.classList.remove("is-tool-page", "is-collapsed");
@@ -6903,6 +7130,8 @@
         badge.textContent = "AI";
       }
       scrollMessagesToBottom();
+      // 新增一条消息就刷新右侧导航栏（加载会话时 openConversation 也是走这里）。
+      renderQuickRail();
       // 带上 body：回答里的趋势图卡片要挂在它下面，而不是塞进文字段落里
       return { row, body, content, ball: ballRecord?.ball || null, ballRecord };
     }
@@ -7040,6 +7269,9 @@
         content: text,
         created_at: new Date().toISOString(),
       });
+      // addMessage 在 push **之前**跑，所以它顺带触发的那次重建读到的还是旧列表，
+      // 会漏掉刚问的这句。这里必须再刷一次，别指望下一条消息碰巧补上。
+      renderQuickRail();
       updateContextGauge();
       await saveConversationData(conversation);
       const pending = addMessage("Thinking", "assistant", true, "30");

@@ -20,7 +20,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from hdw_auth import AuthError, AuthStore
-from LLM_API import ContextManager, OpenAICompatibleClient
+from LLM_API import (
+    ContextManager,
+    OpenAICompatibleClient,
+    estimate_messages,
+)
 
 from .config import settings
 
@@ -2374,6 +2378,175 @@ async def _compress_history(
     ).content
 
 
+# 历史相关性选留。目的：让**与当前问题无关的轮次不进 prompt**。
+# 上下文长度直接决定解码速度（短约 150 t/s，5 万 token 以上掉到约 100），
+# 而历史是一轮一轮线性堆上去的。
+#
+# 与 _compress_history 的分工：压缩是**兜底**（选留之后仍然超长时按
+# 75% 阈值出手，行为与参数都不变）；选留是**日常**手段，每轮都跑。
+_HISTORY_SELECT_PROMPT = (
+    "下面给出多轮对话的历史轮次和用户当前的问题。判断哪些历史轮次与当前问题相关、"
+    "需要带入上下文。\n"
+    "· 依据是**主题是否相关**，不是时间是否接近——紧挨着的上一轮也可能完全无关\n"
+    "· 当前问题里出现「它 / 这个 / 那个 / 上面说的 / 刚才的」这类指代时，"
+    "**必须保留被指代的那一轮**，哪怕它看起来和当前主题不同\n"
+    "· 拿不准就保留：少带一轮只是答得差一点，丢错上下文会答错\n"
+    "· 只输出轮次编号，每行一个。不要解释，不要别的文字\n"
+    "· 一轮都不相关就只输出：无\n"
+)
+
+# 交给选择器的答案摘录长度。只给问题不够——「那它的定值是多少」这种指代
+# 光看问题判不出来；给全文又太贵。80 字足够看出这一轮在讲什么。
+_HISTORY_SELECT_ANSWER_CHARS = 80
+
+
+def _group_turns(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """把扁平的 role/content 列表切成轮次。
+
+    一轮 = 一个 user 消息 + 其后紧随的 assistant 消息。**必须按轮选**，
+    按单条消息选会出现「留了答案、丢了问题」这种半截状态。
+    没有配对 assistant 的 user（提问中途失败）也算一轮，答案为空串。
+    """
+    turns: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for message in messages:
+        role = str(message.get("role") or "")
+        content = str(message.get("content") or "")
+        if role == "user":
+            if current is not None:
+                turns.append(current)
+            current = {"question": content, "answer": ""}
+        elif role == "assistant" and current is not None:
+            current["answer"] = content
+    if current is not None:
+        turns.append(current)
+    return turns
+
+
+def _parse_turn_selection(text: str, total: int) -> list[int] | None:
+    """解析选择器输出，返回保序去重的 0 基下标。
+
+    返回 `None` 表示**没看懂**，调用方必须 fail-open（保留全部）；
+    返回 `[]` 表示模型明确说了「无」——那是合法结论，和故障是两回事。
+    把这两者混起来，就会在解析失败时静默丢掉整段历史。
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return None
+    if stripped.strip("。.、，,；; \n\t") == "无":
+        return []
+    picked: list[int] = []
+    for raw in re.findall(r"\d+", stripped):
+        index = int(raw) - 1  # 提示词里是 1 基编号
+        if 0 <= index < total and index not in picked:
+            picked.append(index)
+    if not picked:
+        return None
+    return sorted(picked)
+
+
+async def _select_relevant_turns(
+    client: OpenAICompatibleClient,
+    question: str,
+    messages: list[dict[str, Any]],
+    *,
+    mode: Literal["online", "offline"],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """挑出与当前问题相关的历史轮次，返回 (选留后的消息, 统计信息)。
+
+    **任何异常都退回「保留全部」**：选留判错只是慢一点，丢错上下文是答错，
+    代价不对等，所以故障方向必须朝「全留」倒。
+    """
+    stats: dict[str, Any] = {
+        "history_turns_total": 0,
+        "history_turns_kept": 0,
+        "history_dropped_turns": [],
+        "history_select_ms": 0,
+        "history_select_error": "",
+        "history_selected": False,
+        # 选留前后的历史 token 数。没选留时两者相等，一眼能看出是没跑还是白跑。
+        "history_tokens_before": 0,
+        "history_tokens_after": 0,
+    }
+    before_tokens = estimate_messages(messages)
+    stats["history_tokens_before"] = before_tokens
+    stats["history_tokens_after"] = before_tokens
+    # 摘要那条 system 消息是压缩产物，丢了等于丢整段历史——永远保留，不参与选留。
+    fixed = [m for m in messages if str(m.get("role") or "") == "system"]
+    turns = _group_turns(
+        [m for m in messages if str(m.get("role") or "") != "system"]
+    )
+    stats["history_turns_total"] = len(turns)
+    if not settings.history_select_enabled:
+        return messages, stats
+    if len(turns) < max(1, settings.history_select_min_turns):
+        return messages, stats
+
+    # 只把最近 N 轮交给选择器，更早的一律丢弃——这是**有意的近因策略**，
+    # 也让选择器自身的输入有上界。越久远的轮次越不容易和当前问题相关。
+    window = turns[-max(1, settings.history_select_max_turns):]
+    offset = len(turns) - len(window)
+    listing = "\n".join(
+        f"[{offset + i + 1}] {turn['question']}"
+        + (
+            "\n    → " + turn["answer"][:_HISTORY_SELECT_ANSWER_CHARS].replace("\n", " ")
+            if turn["answer"]
+            else ""
+        )
+        for i, turn in enumerate(window)
+    )
+    started = time.monotonic()
+    try:
+        thinking_enabled = _thinking_enabled(mode)
+        raw = (
+            await client.complete(
+                [
+                    {"role": "system", "content": _HISTORY_SELECT_PROMPT},
+                    {
+                        "role": "user",
+                        "content": f"当前问题：{question}\n\n历史轮次：\n{listing}",
+                    },
+                ],
+                max_tokens=64,
+                temperature=0.0,
+                chat_template_kwargs=(
+                    {"enable_thinking": False}
+                    if mode == "offline" and not thinking_enabled
+                    else None
+                ),
+                thinking_enabled=thinking_enabled if mode == "online" else None,
+            )
+        ).content
+    except Exception as exc:
+        stats["history_select_error"] = f"{type(exc).__name__}: {exc}"
+        return messages, stats
+    finally:
+        stats["history_select_ms"] = int((time.monotonic() - started) * 1000)
+
+    picked = _parse_turn_selection(raw, len(turns))
+    if picked is None:
+        stats["history_select_error"] = f"无法解析选择结果：{str(raw)[:80]}"
+        return messages, stats
+
+    kept = set(picked)
+    selected: list[dict[str, Any]] = []
+    dropped: list[int] = []
+    for index, turn in enumerate(turns):
+        if index not in kept:
+            dropped.append(index + 1)
+            continue
+        selected.append({"role": "user", "content": turn["question"]})
+        if turn["answer"]:
+            selected.append({"role": "assistant", "content": turn["answer"]})
+    stats.update(
+        history_turns_kept=len(picked),
+        history_dropped_turns=dropped,
+        history_selected=True,
+        history_tokens_after=estimate_messages(fixed + selected),
+    )
+    return fixed + selected, stats
+
+
 def _rag_route_order() -> tuple[list[str], set[str]]:
     local_url = settings.rag_base_url
     remote_urls = list(dict.fromkeys(url for url in settings.rag_remote_urls if url != local_url))
@@ -3617,7 +3790,16 @@ async def _llm_answer(
                 elif completion_reasoning_effort == "high":
                     completion_reasoning_effort = "xhigh"
                     thinking_budget_tokens = 4096
-            prompt = [base_prompt[0], *preparation.messages, *base_prompt[1:]]
+            # 相关性选留：把与当前问题无关的历史轮次挡在 prompt 之外。
+            # 放在 prepare() **之后**——context_kept_from 是存盘的绝对下标，
+            # 在它之前过滤会让存回去的下标指错位置。
+            selected_messages, select_stats = await _select_relevant_turns(
+                client,
+                question,
+                preparation.messages,
+                mode=selected_mode,
+            )
+            prompt = [base_prompt[0], *selected_messages, *base_prompt[1:]]
             result = await client.complete(
                 prompt,
                 temperature=0.2,
@@ -3651,6 +3833,11 @@ async def _llm_answer(
                     "attempts": len(errors) + 1,
                     "context_window": target_context_window,
                     "thinking_enabled": thinking_enabled,
+                    # 历史相关性选留的结果：选了几轮、丢了哪几轮、花了多久、
+                    # 有没有失败。出问题时要能一眼分清「选错了」和「选择器挂了」。
+                    "history_select": select_stats,
+                    # 实际送出去的完整 prompt 大小（系统提示 + 历史 + 本轮证据）。
+                    "prompt_tokens_estimate": estimate_messages(prompt),
                 },
             )
         except Exception as exc:
