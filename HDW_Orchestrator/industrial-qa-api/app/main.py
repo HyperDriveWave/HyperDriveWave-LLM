@@ -788,8 +788,53 @@ _LIVE_POINT_CANDIDATES = int(os.getenv("HDW_LIVE_POINT_CANDIDATES", "5"))
 _LOGS_MAX = int(os.getenv("HDW_LOGS_MAX", "40"))
 # 逐日工作摘要的行数上限。明细受 _LOGS_MAX 截断（实测一次抓 161 条、只注入 40 条），
 # 摘要负责体现全量规模，所以**条数统计来自全部事件**而不是截断后的那批。
-_LOGS_DIGEST_LINES = int(os.getenv("HDW_LOGS_DIGEST_LINES", "80"))
-_LOGS_DIGEST_ITEMS = int(os.getenv("HDW_LOGS_DIGEST_ITEMS", "4"))
+_LOGS_DIGEST_LINES = int(os.getenv("HDW_LOGS_DIGEST_LINES", "120"))
+_LOGS_DIGEST_ITEMS = int(os.getenv("HDW_LOGS_DIGEST_ITEMS", "6"))
+
+# 日志作答规范。**只在有日志时注入**——没有日志还挂着，模型会去找不存在的日志。
+#
+# 来源：SmartGasTurbine 的 log_summary_prompt.md（14 条交接班口径）。筛掉了它的
+# 语音播报条款（它要求「不要标题、不要列表、不要星号」，那是给 TTS 的；
+# 我们前端渲染 Markdown，照搬会适得其反），保留按运行交接口径归纳的部分。
+_LOG_ANSWER_RULES = (
+    "\n\n【本次有运行日志，按下面的口径归纳】\n"
+    "· 按日期分组；每个日期下分成「主要工作」和「两票工作」两部分。\n"
+    "· 主要工作说明涉及的机组、系统、设备、试验、启停、补水、检修、运行交代、"
+    "接地线、异常或报警——**合并同类项**，不要逐条念原文。\n"
+    "· 两票（工作票、操作票、许可、批准、终结、延期）按票种或设备系统归纳，"
+    "讲清任务、设备系统、负责人和风险关注点即可；票号与审批流不必写进正文。\n"
+    "· **一般事项不必精确到分钟**，说明做了什么就行；只有重要事件必须带时间"
+    "（并网、停机、跳闸、保护动作、重要调度命令、重大异常、重要设备启停）。\n"
+    "· **某天有实际内容时，不要只写成「共有 N 条」这种统计**——统计只是佐证，"
+    "要把那天做了什么说出来。\n"
+    "· 事件之间要有逻辑：夜班发现的缺陷白班已处理，就写「存在缺陷，白班已处理，"
+    "需严密监视」，不要只记「存在缺陷」。\n"
+    "· 「合计」「分类」里的条数是**全量**统计，按天列出的只是其中一部分；"
+    "引用规模时以合计为准，不要把列出的条数说成总数。\n"
+)
+
+# 完整性专项规范。缺班次时必须点破，否则读的人会以为看到的是全部。
+_LOG_COMPLETENESS_RULE = (
+    "· 上面给出了「日志完整性」：**缺哪些日志类型、缺哪些班次必须如实说明**，"
+    "不能把不完整的日志当成已全部拿到。\n"
+)
+
+
+def _shift_context() -> str:
+    """当前时间 + 班次划分。
+
+    日志按班次逐段产生：现在是白班，当天的中班记录自然还不存在。
+    不告诉模型这一点，它会把「还没发生」报成「数据缺失」。
+    """
+    now = datetime.now()
+    hour = now.hour
+    shift = "白班" if 8 <= hour < 16 else ("中班" if 16 <= hour < 23 else "夜班")
+    return (
+        f"\n当前时间：{now.strftime('%Y-%m-%d %H:%M')}（{shift}）。"
+        "班次划分：夜班 前日23:00~今日08:00，白班 08:00~16:00，中班 16:00~23:00。"
+        "**当天的日志按班次逐段产生，尚未到来的班次没有记录是正常的**，"
+        "不要当成数据缺失报出来。"
+    )
 # 单次查询的时间跨度上限，防止规划器给出离谱区间导致 LIEMS 端长时间抓取
 _QUERY_MAX_DAYS = int(os.getenv("HDW_QUERY_MAX_DAYS", "7"))
 # 历史/趋势注入上下文时的压缩点数上限。实测单次可达 11063 点，
@@ -1904,6 +1949,29 @@ async def _fetch_series(
     return _shape_series(data, keyword, kind), None
 
 
+def _logs_completeness_line(completeness: dict[str, Any]) -> str:
+    """把日志完整性渲染成一行。
+
+    结构：每天 → 各日志类型（值长／#1主值／#2主值／化学）→ 缺哪些班次。
+    **只报缺失项**：全拿到的逐条念出来，这一行会比日志本身还长，
+    而它唯一的作用就是提示「哪块数据不可信」。
+    """
+    parts: list[str] = []
+    for day in completeness.get("dates") or []:
+        if not isinstance(day, dict):
+            continue
+        missing: list[str] = []
+        for program in day.get("byProgram") or []:
+            if not isinstance(program, dict) or program.get("complete"):
+                continue
+            label = str(program.get("programLabel") or "日志").strip()
+            gone = "、".join(str(item) for item in (program.get("missingShifts") or []))
+            missing.append(f"{label}缺{gone or '部分班次'}")
+        date_text = str(day.get("date") or "").strip()
+        parts.append(f"{date_text} " + ("、".join(missing) if missing else "各类型各班次齐全"))
+    return "；".join(parts)
+
+
 def _logs_failure_reason(data: dict[str, Any]) -> str:
     """日志工具返回体若是「取数失败」，给出可读原因；正常返回空串。
 
@@ -1987,6 +2055,10 @@ async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
         # 模型看不到的 121 条只能靠这个体现：每天的各类条数都在里面，
         # 重要的逐条列出，次要的至少让模型知道「那天还有多少件事」。
         "work_digest": data.get("work_digest") or {},
+        # 日志完整性：按日期 × 日志类型（值长／#1主值／#2主值／化学）× 班次
+        # 记录哪些拿到了。**不说清完整性 = 把不完整的日志讲成完整的**——
+        # 实测「最近五天」那次，模型根本不知道它只拿到了一天。
+        "log_completeness": data.get("log_completeness") or {},
         # 118 条全量注入会挤占文档证据，按严重程度排序后截断
         "events": sorted(
             events,
@@ -3623,56 +3695,70 @@ def _prompt(
     if logs:
         summary = logs.get("summary") or {}
         events = logs.get("events") or []
+        days = (logs.get("work_digest") or {}).get("dates") or []
         categories = "、".join(
             f"{name} {count} 条" for name, count in (summary.get("categories") or {}).items()
         ) or "无"
-        # 逐日工作摘要。**这段是给「全量」的**：下面的明细受 _LOGS_MAX 截断，
-        # 模型只能看到一部分；摘要里每天的各类条数都来自**全量**事件，
-        # 让模型知道「那天一共有多少件事」，而不是把截断后的 40 条当成全部。
-        digest_lines: list[str] = []
+        head = (
+            f"\n\n运行日志（{logs.get('start')} ~ {logs.get('end')}"
+            f"{'，仅重大事件' if logs.get('major_only') else ''}）：\n"
+            f"  合计 {summary.get('total_events', len(events))} 条，"
+            f"其中重大 {summary.get('major_events', 0)} 条；分类：{categories}\n"
+        )
+        # 完整性：哪些日志类型缺哪些班次。**不说清 = 把不完整的讲成完整的**。
+        completeness = _logs_completeness_line(logs.get("log_completeness") or {})
+        if completeness:
+            head += f"  日志完整性：{completeness}\n"
+        # brief 与逐日分栏是两套说法，同时给会互相打架；有分栏时以分栏为准。
         brief = str(summary.get("brief") or "").strip()
-        if brief and brief != "未查询到匹配日志。":
-            digest_lines.append(f"  摘要：{brief}")
-        for day in (logs.get("work_digest") or {}).get("dates") or []:
-            if len(digest_lines) >= _LOGS_DIGEST_LINES:
+        if brief and brief != "未查询到匹配日志。" and not days:
+            head += f"  摘要：{brief}\n"
+
+        # 逐日分栏。**这段承载「全量」**：下面明细受 _LOGS_MAX 截断（实测抓 161 条
+        # 只注入 40 条），看不到的那部分只能靠这里的条数体现——按天给，
+        # 分「主要工作／两票／重要事件」三栏，与交接班口径一致。
+        day_lines: list[str] = []
+        for day in days:
+            if len(day_lines) >= _LOGS_DIGEST_LINES:
                 break
             counts = day.get("counts") or {}
-            digest_lines.append(
-                f"  {day.get('date')}：主要工作 {counts.get('main_work', 0)} 条、"
-                f"工作票 {counts.get('ticket_work', 0)} 条、"
-                f"重要事件 {counts.get('important_timed_events', 0)} 条"
+            day_lines.append(
+                f"\n  {day.get('date')}（主要工作 {counts.get('main_work', 0)} 条、"
+                f"两票 {counts.get('ticket_work', 0)} 条、"
+                f"重要事件 {counts.get('important_timed_events', 0)} 条）"
             )
             for bucket, label in (
                 ("important_timed_events", "重要事件"),
-                ("ticket_work", "工作票"),
+                ("ticket_work", "两票"),
                 ("main_work", "主要工作"),
             ):
                 for item in (day.get(bucket) or [])[:_LOGS_DIGEST_ITEMS]:
-                    if len(digest_lines) >= _LOGS_DIGEST_LINES:
+                    if len(day_lines) >= _LOGS_DIGEST_LINES:
                         break
-                    text = " ".join(str(item.get("content") or item.get("title") or "").split())[:120]
+                    text = " ".join(
+                        str(item.get("content") or item.get("title") or "").split()
+                    )[:140]
                     if not text:
                         continue
-                    digest_lines.append(
-                        f"    · {label} {item.get('time') or ''} {item.get('source') or ''}：{text}"
+                    day_lines.append(
+                        f"    〔{label}〕{item.get('time') or ''} "
+                        f"{item.get('source') or ''}：{text}"
                     )
-        lines = []
+
+        detail_lines = []
         for idx, event in enumerate(events, 1):
             severity = str(event.get("severity") or "")
             mark = "【重大】" if severity == "major" else ("【重要】" if severity == "important" else "")
-            lines.append(
+            detail_lines.append(
                 f"[日志 {idx}] {mark}{event.get('time') or event.get('date') or ''} "
                 f"{event.get('source') or ''}／{event.get('category') or ''}："
                 f"{str(event.get('content') or '').strip()}"
             )
         logs_block = (
-            f"\n\n运行日志（{logs.get('start')} ~ {logs.get('end')}"
-            f"{'，仅重大事件' if logs.get('major_only') else ''}）：\n"
-            f"  合计 {summary.get('total_events', len(events))} 条，"
-            f"其中重大 {summary.get('major_events', 0)} 条；分类：{categories}\n"
-            + "\n".join(digest_lines)
-            + ("\n  明细（受上限截断，完整条数以「合计」为准）：\n" if lines else "\n")
-            + "\n".join(lines)
+            head
+            + "\n".join(day_lines)
+            + "\n\n  明细（按严重程度排序，受上限截断；完整条数以「合计」为准）：\n"
+            + "\n".join(detail_lines)
         )
 
     # 未检索时不拼证据段落：一旦出现「检索证据：无」这类框架，模型会顺着去说
@@ -3720,6 +3806,17 @@ def _prompt(
         if live_error_list
         else ""
     )
+
+    # 日志归纳规范。只在**本轮确实有日志**时注入：没日志还挂着这段，
+    # 模型会去找根本不存在的日志内容（同样的道理见 image_rule）。
+    log_rule = ""
+    if logs:
+        log_rule = _LOG_ANSWER_RULES
+        # 完整性专项只在真拿到完整性数据时才加，避免无谓的规则堆积。
+        if logs.get("log_completeness"):
+            log_rule += _LOG_COMPLETENESS_RULE
+        # 班次上下文跟着日志走：它解释的是「当天的日志为什么某几段没记录」。
+        log_rule += _shift_context()
 
     if skip_retrieval:
         user = f"问题：{question}{image_block}{realtime_block}{live_error_block}"
@@ -3777,6 +3874,8 @@ def _prompt(
                 # 取数失败的说明紧跟在主体之后。**放在 system_body 里面就得写两遍**
                 # （skip_retrieval 分支和正常分支各一份），迟早漏一处。
                 f"{live_error_rule}"
+                # 日志归纳规范同理放在主体之后：skip_retrieval 分支和正常分支都要有。
+                f"{log_rule}"
                 + (
                     "实时测点的采集时间已换算为北京时间，照抄即可，"
                     "不要附加时区后缀、不要另做时区换算或补充说明。"
@@ -4777,8 +4876,35 @@ def _self_check() -> None:
     }
     _logs_body = _prompt("q", [], logs=_logs_fixture)[-1]["content"]
     assert "合计 161 条" in _logs_body, "全量条数没进提示词"
-    assert "2026-09-15：主要工作 12 条、工作票 3 条、重要事件 2 条" in _logs_body, "逐日摘要没渲染"
-    assert "摘要：2026-09-15 运行: 循环水泵启动" in _logs_body, "brief 没进提示词"
+    assert "2026-09-15（主要工作 12 条、两票 3 条、重要事件 2 条）" in _logs_body, "逐日分栏没渲染"
+    assert "〔主要工作〕08:00 运行：循环水泵启动" in _logs_body, "分栏明细没渲染"
+    # 日志归纳规范：有日志才注入，且完整性/班次上下文跟着走。
+    _sys_with_logs = _prompt("q", [], logs=_logs_fixture)[0]["content"]
+    assert "按下面的口径归纳" in _sys_with_logs, "日志归纳规范没注入"
+    assert "当前时间：" in _sys_with_logs and "夜班 前日23:00~今日08:00" in _sys_with_logs, "班次上下文没注入"
+    assert "缺哪些日志类型、缺哪些班次必须如实说明" not in _sys_with_logs, "没有完整性数据时不该加完整性专项"
+    _no_logs_sys = _prompt("q", [])[0]["content"]
+    assert "按下面的口径归纳" not in _no_logs_sys, "没日志时不该注入日志规范"
+    assert "当前时间：" not in _no_logs_sys, "没日志时不该注入班次上下文"
+    # 完整性行：只报缺失项
+    _comp = _logs_completeness_line({"dates": [
+        {"date": "2026-09-15", "byProgram": [
+            {"programLabel": "值长日志", "complete": True, "missingShifts": []},
+            {"programLabel": "化学日志", "complete": False, "missingShifts": ["夜班"]},
+        ]},
+    ]})
+    assert _comp == "2026-09-15 化学日志缺夜班", _comp
+    assert _logs_completeness_line({}) == ""
+    _with_comp = dict(_logs_fixture)
+    _with_comp["log_completeness"] = {"dates": [{"date": "2026-09-15", "byProgram": []}]}
+    assert "日志完整性：" in _prompt("q", [], logs=_with_comp)[-1]["content"], "完整性行没渲染"
+    assert "缺哪些班次必须如实说明" in _prompt("q", [], logs=_with_comp)[0]["content"], "完整性专项没注入"
+    # brief 与逐日分栏是两套说法，同时给会互相打架：有分栏时以分栏为准。
+    assert "摘要：" not in _logs_body, "有逐日分栏时不该再输出 brief"
+    _no_digest = dict(_logs_fixture)
+    _no_digest["work_digest"] = {}
+    assert "摘要：2026-09-15 运行: 循环水泵启动" in _prompt("q", [], logs=_no_digest)[-1]["content"], \
+        "没有分栏时 brief 应作为兜底出现"
     assert "循环水泵启动" in _logs_body
     # 日志工具的参数派发。**`log_query_range` 只认 start_date / end_date**——
     # 曾经传的是 `days`，那个参数不存在、被无声丢弃，日期留空后退化成
