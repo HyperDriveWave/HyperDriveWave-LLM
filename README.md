@@ -147,6 +147,7 @@ HyperDriveWave/
 │   ├── langgraph/
 │   ├── dify/
 │   └── n8n/
+├── HDW_API/                               # 对外问答 API（给别的项目调用）
 ├── HDW_Frontend/
 │   ├── industrial-webui/
 │   └── open-webui/
@@ -388,6 +389,7 @@ Action
 | `hdw-rag` | `base` | BGE、重排、Zvec | `127.0.0.1:8001` |
 | `hdw-qa-api` | `base` | 问答和会话 API | `:8080` |
 | `hdw-ingest` | `base` | 文档上传和入库任务 | `127.0.0.1:8090` |
+| `hdw-api` | `base` | 对外问答 API（给别的项目调用，不做上下文管理） | `:8095` |
 | `hdw-mcp` | `base` | MCP 工具服务 | `127.0.0.1:8766` |
 | `hyperdrivewave-llama.service` | `systemd` | 当前 Qwen GSQ/MTP 本地推理 | `127.0.0.1:1919` |
 | `hdw-llm` | `legacy-freetoken` | 可选 FreeToken 旧推理 | `127.0.0.1:8000` |
@@ -395,7 +397,7 @@ Action
 | `hdw-webui` | `web` | Nginx WebUI 和反向代理（含 TLS 终结） | `${HDW_WEBUI_BIND}:3000` 明文、`:8443` TLS |
 | `hyperdrivewave-frpc.service` | `systemd` | 可选公网隧道客户端，由控制中心开关 | 无本地监听 |
 
-当前默认是 9 个 Compose 容器，加 1 个由用户级 systemd 管理的 `llama.cpp` 服务，共 10 个运行服务；`hyperdrivewave-frpc.service` 是第 11 个，仅在启用外网访问时运行。FreeToken、Dify、n8n、Langfuse、Keycloak 和 Open WebUI 默认不启动；它们不应被误计为当前在线服务。
+当前默认是 10 个 Compose 容器，加 1 个由用户级 systemd 管理的 `llama.cpp` 服务，共 11 个运行服务；`hyperdrivewave-frpc.service` 是第 12 个，仅在启用外网访问时运行。FreeToken、Dify、n8n、Langfuse、Keycloak 和 Open WebUI 默认不启动；它们不应被误计为当前在线服务。
 
 当前 WebUI 的局域网地址取决于 `Configs/.env`：
 
@@ -543,6 +545,14 @@ Qwen 是底座模型。RAG、Neo4j、MCP 和球球不是替代模型，而是围
 - `context` 是压缩/选留的元信息，`unsupported_numbers` 是答案里找不到出处的数字，
   **空列表才是常态**。
 - 开 `stream: true` 时这些都在 SSE 的最后一条 `result` 事件里。
+
+**服务间入口 `/internal/qa/query`**（`POST`）是给 `hdw-api` 容器用的，走同一条
+管线但**不做上下文管理**：不读也不写任何用户的会话历史，模型只看到当次问题。
+它与 `/qa/query` 的关键差别是鉴权——`/qa/query` 要求登录会话，
+`/internal/qa/query` 只认 `X-HDW-Internal-Key`（`HDW_API_INTERNAL_KEY`），
+且**无条件校验**：`_check_auth` 在 `HDW_ENABLE_AUTH=false` 时是空操作，
+而 qa-api 绑在所有网卡上，拿它守这条入口等于敞开，所以这里单独实现
+（见 `_require_internal_api_key` 的注释）。密钥没配时返回 503，不放行。
 
 **MCP 只读调用已并入 `/qa/query`**（SIS 测点现值/历史/趋势、LIEMS 日志），
 由同一次检索规划的模型结论决定取哪些，不再是"按需人工触发"。仍未接入的是
@@ -1005,6 +1015,20 @@ PUT    /conversations/{id}
 PATCH  /conversations/{id}
 DELETE /conversations/{id}
 ```
+
+对外问答 API（`hdw-api`，给别的项目调用）另有一套，**不做上下文管理**，
+留档在 `chatdata/api/`，详见 [HDW_API/README.md](HDW_API/README.md)：
+
+```text
+POST   /api/v1/ask                    提问，同步返回回答（不带证据）
+GET    /api/v1/sessions?limit=50      列出留档会话
+GET    /api/v1/sessions/{id}          某会话的全部问答
+DELETE /api/v1/sessions/{id}          删除某会话留档
+GET    /health                        探活（无需鉴权）
+```
+
+它与 QA API 的关系：`hdw-api` 不实现问答，而是带上服务间密钥调
+`qa-api` 的 `POST /internal/qa/query`（见 §7 末尾），把回答落盘后返回。
 
 WebUI 行为：
 
@@ -1609,7 +1633,8 @@ bash Scripts/deploy.sh                                # 交互式：列出现状
 | 服务 | 默认 | 绑定 |
 | --- | --- | --- |
 | WebUI HTTP / HTTPS | 3000 / 8443 | 局域网 |
-| QA API | 8080 | **所有网卡**（唯一一个） |
+| QA API | 8080 | **所有网卡** |
+| 对外问答 API | 8095 | **所有网卡**（给别的项目调用，靠密钥保护） |
 | 宿主 llama.cpp | 1919 | 仅本机 |
 | 本机 RAG / MinerU | 8001 / 8002 | 仅本机 |
 | Neo4j HTTP / Bolt | 7475 / 7688 | 仅本机 |
@@ -2135,7 +2160,11 @@ Qwen + RAG + reranker + Zvec + Neo4j + MinerU + WebUI + 文件会话
 | `HDW_MAINTENANCE_TIMEOUT` | 维护切换等待上限；`0` 表示不设置总等待上限 |
 | `HDW_CHATDATA_ROOT` | QA API 容器内的会话目录 |
 | `HDW_ENABLE_AUTH` | 是否启用内部 Bearer 鉴权 |
-| `HDW_INTERNAL_API_KEY` | 内部 API key |
+| `HDW_INTERNAL_API_KEY` | 内部 API key（只被 `_check_auth` 用，且受 `HDW_ENABLE_AUTH` 开关控制） |
+| `HDW_API_PORT` | 对外问答 API 的宿主端口（容器内固定 8095） |
+| `HDW_API_KEY` | 对外问答 API 的调用方密钥，**发给调用方项目** |
+| `HDW_API_INTERNAL_KEY` | `hdw-api` ↔ `qa-api` 的服务间密钥，不外发；两侧必须一致 |
+| `HDW_API_QA_TIMEOUT` | `hdw-api` 等上游问答的超时秒数，默认 600 |
 | `NEO4J_AUTH` | Neo4j 认证 |
 | `HDW_SIS_BASE_URL` | SIS 服务地址 |
 | `HDW_SIS_USERNAME` | SIS 用户名，必须放本地环境变量 |

@@ -182,6 +182,10 @@ services:
       HDW_FRP_PUBLIC_HOST: ${HDW_FRP_PUBLIC_HOST:-}
       HDW_LLM_PRESENCE_PENALTY: ${HDW_LLM_PRESENCE_PENALTY:-0.3}
       HDW_INTERNAL_API_KEY: ${HDW_INTERNAL_API_KEY:-local-dev-key}
+      # 服务间入口 /internal/qa/query 用的密钥。**必须与 hdw-api 那个服务里
+      # 同名变量的值一致**——两侧不一致时调用方只会拿到一个 502，看不出原因，
+      # 所以 deploy_verify.sh 里专门有一条检查在挑这个。留空则该接口不开放。
+      HDW_API_INTERNAL_KEY: ${HDW_API_INTERNAL_KEY:-}
       HDW_ENABLE_AUTH: ${HDW_ENABLE_AUTH:-false}
       HDW_MAINTENANCE_SOCKET: /run/hdw-maintenance/maintenance.sock
       HDW_MAINTENANCE_TIMEOUT: ${HDW_MAINTENANCE_TIMEOUT:-0}
@@ -260,6 +264,37 @@ services:
         condition: service_started
       hdw-neo4j:
         condition: service_healthy
+
+  hdw-api:
+    build:
+      context: ../HDW_API
+      args:
+        # 构建期 pip 源。docker build 不读宿主机的 pip.conf，只能这样注入。
+        # 改 Configs/.env 里的 PIP_INDEX_URL 即可切换；要回官方源填 https://pypi.org/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    profiles: ["base"]
+    environment:
+      # 本服务自己不做问答，转发给 qa-api 的服务间入口。
+      # 走服务名 + 容器内端口，与宿主映射无关（改 HDW_QA_API_PORT 不影响这里）。
+      HDW_QA_API_URL: http://hdw-qa-api:8080
+      # 两个密钥分工不同：HDW_API_KEY 给调用方（别的项目），
+      # HDW_API_INTERNAL_KEY 只有本容器和 qa-api 知道。**必须在 environment 里
+      # 显式透传**，compose 没有 env_file，漏写就是容器里读不到（同 167-177 行那批）。
+      HDW_API_KEY: ${HDW_API_KEY:-}
+      HDW_API_INTERNAL_KEY: ${HDW_API_INTERNAL_KEY:-}
+      HDW_API_QA_TIMEOUT: ${HDW_API_QA_TIMEOUT:-600}
+      HDW_CHATDATA_ROOT: /data/chatdata
+    volumes:
+      # 只挂 chatdata：留档写这里，其余一概不碰。
+      - ${HDW_RUNTIME_ROOT:-../HDW_Runtime}/chatdata:/data/chatdata
+    ports:
+      # 绑所有网卡（与 qa-api 同款 `any`）。内网直连，暂不经 FRP。
+      # 这个端口是给**别的项目**调用的，靠 HDW_API_KEY 保护——
+      # 密钥没配时接口直接拒绝服务，不会敞开（见 app.py 的 _require_caller）。
+      - "${HDW_API_PORT:-8095}:8095"
+    depends_on:
+      hdw-qa-api:
+        condition: service_started
 
   hdw-mcp:
     build:

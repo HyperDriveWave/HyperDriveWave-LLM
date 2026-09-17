@@ -59,6 +59,8 @@ RAG_PORT="${HDW_RAG_PORT:-8001}"
 RAG_URL="http://127.0.0.1:$RAG_PORT"
 QA_PORT="${HDW_QA_API_PORT:-8080}"
 QA_URL="http://127.0.0.1:$QA_PORT"
+API_PORT="${HDW_API_PORT:-8095}"
+API_URL="http://127.0.0.1:$API_PORT"
 MINERU_PORT="${HDW_MINERU_PORT:-8002}"
 MINERU_URL="http://127.0.0.1:$MINERU_PORT"
 # Neo4j HTTP。原来在检查里写死 7475，改了端口就会出现
@@ -93,6 +95,7 @@ declare -A _wait_urls=(
   ["llama"]="$LLAMA_URL/health"
   ["rag"]="$RAG_URL/health"
   ["qa-api"]="$QA_URL/health"
+  ["hdw-api"]="$API_URL/health"
   ["mineru"]="$MINERU_URL/health"
   ["webui"]="http://$BIND_WAIT:$WEBUI_PORT_WAIT/"
 )
@@ -284,6 +287,33 @@ else
   else
     pass "MTP 未启用（配置里也没要求）"
   fi
+
+  # ── --timeout 不能是 0 ──
+  # llama.cpp 把它透传给 cpp-httplib 的 set_read_timeout()，而 httplib 把
+  # (0,0) 解释成 poll(...,0)——「立即返回」，不是「永不超时」。读大 body 时
+  # 只要 socket 缓冲区恰好空一次就判短读，返回空 body 的 400，表现为问答
+  # 偶发 `503: LLM generation failed: LLM HTTP 400: `。**间歇、无日志**，
+  # 排查时极容易走成「网络/GPU 问题」。这里在验收阶段直接把它挡下来。
+  # 扫**全部**匹配进程而不是取第一个：pgrep -f 可能同时命中父 shell 和真正
+  # 的服务进程，只看第一条会读到空值或别人的参数。任一带 0 就算失败。
+  _to="" ; _zero=0
+  for _pid in $(pgrep -f 'llama-server' 2>/dev/null); do
+    # 读 /proc 的 cmdline 最可靠：ps 会按终端宽度截断参数
+    _v="$(tr '\0' '\n' < "/proc/$_pid/cmdline" 2>/dev/null \
+          | awk '/^--timeout$/{getline; print; exit}')"
+    if [ -n "$_v" ]; then
+      _to="$_v"
+      [ "$_v" = "0" ] && _zero=1
+    fi
+  done
+  if [ "$_zero" = "1" ]; then
+    fail "llama-server 带着 --timeout 0 在跑 —— 会导致问答偶发 503（空 body 400）。
+     改 Configs/.env 的 HDW_LLAMA_TIMEOUT=3600 后重启：systemctl --user restart hyperdrivewave-llama.service"
+  elif [ -n "$_to" ]; then
+    pass "llama --timeout $_to（非 0，正常）"
+  else
+    vwarn "读不到 llama-server 的 --timeout（进程在跑的话应能读到）"
+  fi
 fi
 fi   # ← 结束「本地推理是否停用」的分支
 
@@ -427,6 +457,45 @@ except Exception as e: print('读取失败')
     esac
   done
 fi
+
+# ═══ 8.5 对外问答 API（给别的项目调用的那个）══════════════════
+section "对外问答 API"
+
+API_HEALTH="$(curl -fsS --max-time 20 "$API_URL/health" 2>/dev/null)"
+if [ -z "$API_HEALTH" ]; then
+  fail "对外问答 API /health 不通（$API_URL）"
+else
+  KEY_OK="$(printf '%s' "$API_HEALTH" | json_get key_configured)"
+  case "$KEY_OK" in
+    True|true) pass "对外问答 API 正常，已配置调用方密钥" ;;
+    *) vwarn "对外问答 API 起来了但没配 HDW_API_KEY —— 接口会拒绝所有调用" ;;
+  esac
+  # 端口通只说明进程活着，不说明门是关着的。这条才验证鉴权真的生效：
+  # 无密钥调用必须 401，返回 200 就意味着这个端口对局域网敞开了。
+  _api_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    -X POST "$API_URL/api/v1/ask" -H 'Content-Type: application/json' \
+    -d '{"question":"ping"}' 2>/dev/null)"
+  case "$_api_code" in
+    401) pass "无密钥调用被拒（401）" ;;
+    000) vwarn "无密钥调用无响应" ;;
+    *)   fail "无密钥调用返回 $_api_code（应为 401）—— 接口没有正确实施鉴权" ;;
+  esac
+fi
+
+# 服务间入口：错误密钥必须被拒。两侧 HDW_API_INTERNAL_KEY 不一致时，
+# hdw-api 只会给调用方一个 502，看不出是配置问题，所以在这里先挑出来。
+# 用错误密钥发**合法请求体**——FastAPI 先校验 body 再进函数，
+# body 不合法的话拿到的是 422，证明不了鉴权这一层。
+_api_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+  -X POST "$QA_URL/internal/qa/query" -H 'Content-Type: application/json' \
+  -H 'X-HDW-Internal-Key: deliberately-wrong' \
+  -d '{"question":"ping"}' 2>/dev/null)"
+case "$_api_code" in
+  401) pass "服务间入口拒绝错误密钥（401）" ;;
+  503) vwarn "服务间入口未启用（HDW_API_INTERNAL_KEY 未配置）" ;;
+  000) vwarn "服务间入口无响应" ;;
+  *)   fail "服务间入口对错误密钥返回 $_api_code（应为 401）" ;;
+esac
 
 # ═══ 9. 模型配置一致性 ════════════════════════════════════════
 section "模型配置一致性"

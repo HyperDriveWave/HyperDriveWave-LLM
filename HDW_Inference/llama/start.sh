@@ -47,7 +47,29 @@ PORT="${HDW_LLAMA_PORT:-1919}"
 DEVICE="${HDW_LLAMA_DEVICE:-Vulkan0}"
 CTX="${HDW_LLAMA_CTX:-${CONFIG_CTX:-262144}}"
 GPU_LAYERS="${HDW_LLAMA_GPU_LAYERS:-}"
-SERVER_TIMEOUT="${HDW_LLAMA_TIMEOUT:-0}"
+SERVER_TIMEOUT="${HDW_LLAMA_TIMEOUT:-3600}"
+# 护栏：把 0/空/非数字挡在 --timeout 之外。
+#
+# 这个值会被原样传给 llama-server 的 --timeout，llama.cpp 再透传给
+# cpp-httplib 的 set_read_timeout()，而 httplib 把 (0,0) 解释成
+# poll(&pfd, 1, 0)——**立即返回**，不是「永不超时」。后果：读大 body 时
+# 只要 socket 缓冲区恰好空一次就被判成短读，返回一个空 body 的 400
+# （qa-api 侧表现为偶发 `503: LLM generation failed: LLM HTTP 400: `）。
+#
+# 为什么用代码挡而不是写在文档里：这个失败模式伪装性极强——间歇出现、
+# 重试有时好有时坏、llama 应用层日志一条都没有（server-http.cpp 把 httplib
+# 的 logger 注释掉了），看着就像随机网络故障。而 `0` 又恰好符合「0 = 不超时」
+# 这个通行约定，太容易被再写一次。
+#
+# 3600 是 llama.cpp 自己的默认值（common/common.h:622）。
+if ! printf '%s' "$SERVER_TIMEOUT" | grep -qE '^[1-9][0-9]*$'; then
+  {
+    echo "警告：HDW_LLAMA_TIMEOUT='${SERVER_TIMEOUT}' 不是正整数，已回落到 3600。"
+    echo "      注意 0 在这里**不等于**「不超时」：它会被 httplib 当成 poll(...,0)"
+    echo "      立即返回，导致读大 body 时短读、返回空 body 的 400，问答偶发 503。"
+  } >&2
+  SERVER_TIMEOUT=3600
+fi
 # 视觉投影器。来源优先级与 MODEL/CTX/MTP 同构：环境变量 > 模型配置 > 自动发现。
 # 配置里可以写绝对路径，也可以只写文件名——下面的解析会去模型目录找它。
 MMPROJ="${HDW_LLAMA_MMPROJ:-${CONFIG_MMPROJ:-}}"

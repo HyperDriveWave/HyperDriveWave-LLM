@@ -17,6 +17,11 @@ class Settings:
     )
     online_llm_model = os.getenv("HDW_ONLINE_LLM_MODEL", "deepseek-v4-flash")
     online_llm_api_key = os.getenv("HDW_ONLINE_LLM_API_KEY", "")
+    # 单次生成的**总时限**，不是「每次读」的超时。llama 走的是非流式
+    # （LLM_API/client.py 的 "stream": False），实测响应头要等整段生成结束
+    # 才发（time_starttransfer == time_total），所以 httpx 的 read timeout
+    # 覆盖的是整段生成。并发时（llama 4 个槽位，WebUI 与对外 API 共享）
+    # 单次耗时会翻几倍，这个值要留够。
     llm_timeout = float(os.getenv("HDW_LLM_TIMEOUT", "120"))
     llm_max_tokens = int(os.getenv("HDW_LLM_MAX_TOKENS", "1536"))
     llm_reasoning_effort = os.getenv("HDW_LLM_REASONING_EFFORT", "low")
@@ -96,6 +101,12 @@ class Settings:
     frp_public_host = os.getenv("HDW_FRP_PUBLIC_HOST", "").strip()
     internal_api_key = os.getenv("HDW_INTERNAL_API_KEY", "local-dev-key")
     enable_auth = os.getenv("HDW_ENABLE_AUTH", "false").lower() == "true"
+    # 服务间调用（HDW_API → /internal/qa/query）的密钥。**与上面那个刻意分开**：
+    # `internal_api_key` 只被 `_check_auth` 用，而 `_check_auth` 在 enable_auth
+    # 为 false 时是空操作（默认部署就是 false）。两者合一的话，对外 API 的
+    # 密钥一旦泄露，持有者可以绕过 HDW_API 直连 qa-api——那条路没有留档，
+    # 也拿不到调用方维度的吊销。默认空串 = 该接口不开放（fail-closed）。
+    api_internal_key = os.getenv("HDW_API_INTERNAL_KEY", "").strip()
     chatdata_root = Path(os.getenv("HDW_CHATDATA_ROOT", "/data/chatdata"))
     auth_csv_path = Path(os.getenv("HDW_AUTH_CSV_PATH", "/app/auth.csv"))
     auth_secret = os.getenv("HDW_AUTH_SECRET", "change_me")

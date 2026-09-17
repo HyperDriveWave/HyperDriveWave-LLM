@@ -32,6 +32,7 @@ neo4j_bolt	HDW_NEO4J_BOLT_PORT	7688	Neo4j Bolt	loopback	yes
 postgres	HDW_POSTGRES_PORT	5432	PostgreSQL	loopback	yes
 redis	HDW_REDIS_PORT	6379	Redis	loopback	yes
 ingest	HDW_INGEST_PORT	8090	入库 API	loopback	yes
+hdw_api	HDW_API_PORT	8095	对外问答 API	any	yes
 mcp	HDW_MCP_PORT	8766	MCP 服务	loopback	no
 EOF
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hmac
 import json
 import math
 import os
@@ -62,6 +63,19 @@ class QARequest(BaseModel):
     images: list[ImageAttachment] = Field(default_factory=list, max_length=4)
     # 默认 False：老的调用方（含 /v1/chat/completions 的内部转发）行为不变。
     stream: bool = False
+
+
+class InternalQARequest(BaseModel):
+    """服务间问答请求（HDW_API 容器 → qa-api）。
+
+    与 `QARequest` 的差别就是**没有 conversation_id 和 messages**：这条通道
+    按约定不做上下文管理，管线只看到当次问题。不提供这两个字段，
+    比提供了再在路由里强制置空更难被误用。
+    """
+
+    question: str = Field(min_length=1, max_length=8000)
+    top_k: int = Field(default=40, ge=1, le=40)
+    inference_mode: Literal["online", "offline"] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -543,6 +557,39 @@ def _check_auth(authorization: str | None) -> None:
     if not settings.enable_auth:
         return
     if authorization != f"Bearer {settings.internal_api_key}":
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+# 对外问答 API（HDW_API 容器）调进来的身份。**不是登录用户**：
+# 它不进 auth.csv，也拿不到会话令牌，只是给管线一个「谁在问」的占位。
+# 管线上真正读 user 的只有三处，都只看 role / default_inference_mode
+# （_online_inference_allowed、_image_upload_allowed、_user_default_inference_mode），
+# 所以这里刻意给 role="user"——服务通道不该默认拥有管理员才有的在线推理权限。
+_API_SERVICE_IDENTITY = {
+    "code": "api",
+    "name": "对外 API",
+    "role": "user",
+    "default_inference_mode": "offline",
+}
+
+
+def _require_internal_api_key(key: str | None) -> None:
+    """服务间调用的无条件鉴权。
+
+    **刻意不复用 `_check_auth`**：那个函数在 `HDW_ENABLE_AUTH=false` 时直接
+    return，而 qa-api 的端口绑在所有网卡上（compose 里是 `"${HDW_QA_API_PORT}:8080"`）。
+    本机实测 `enable_auth` 就是 false——拿 `_check_auth` 守这条新入口，等于在
+    局域网上开一个无鉴权的问答接口。这里不设开关，永远校验。
+
+    密钥也没配时同样拒绝：宁可这条通道不可用，也不能静默放行。
+    """
+    expected = settings.api_internal_key
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="HDW_API_INTERNAL_KEY 未配置，服务间接口不可用",
+        )
+    if not key or not hmac.compare_digest(str(key), expected):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -4784,6 +4831,46 @@ async def qa_query(
     )
 
 
+@app.post("/internal/qa/query")
+async def internal_qa_query(
+    req: InternalQARequest,
+    x_hdw_internal_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """服务间问答入口：给 HDW_API 容器用，不做上下文管理。
+
+    这条路的全部意义是**每次提问都独立**：不读某个用户的历史，也不写回去。
+    落实方式是三个参数——`conversation_id=None`、`messages=[]`、
+    `conversation_data=None`——它们各自对应管线里一道短路，缺一不可：
+
+    · `_conversation_messages(code, None, [])` 返回 `([], {})`，不碰磁盘
+    · `context_manager.prepare` 因 `not messages[kept_from:]` 提前返回，不压缩
+    · `_select_relevant_turns` 因 `len(turns) < history_select_min_turns` 提前返回，
+      不额外调一次模型
+    · `_answer` 的写回被 `if user_code and conversation_id:` 拦住
+
+    任何一道失效都会让「只看到当次问题」不再成立。改这里之前先看
+    `_self_check` 里对应的断言。
+    """
+    _require_internal_api_key(x_hdw_internal_key)
+    question = req.question.strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="question is required")
+    selected_mode = _resolve_inference_mode(req.inference_mode)
+    if selected_mode == "online" and not _online_inference_allowed(_API_SERVICE_IDENTITY):
+        raise HTTPException(status_code=403, detail="在线推理未开放给服务通道")
+    pipeline = _qa_pipeline(
+        question=question,
+        user=_API_SERVICE_IDENTITY,
+        req=QARequest(question=question, top_k=req.top_k, inference_mode=selected_mode),
+        image_attachments=[],
+        selected_mode=selected_mode,
+    )
+    async for event in pipeline:
+        if "result" in event:
+            return event["result"]
+    raise HTTPException(status_code=500, detail="pipeline produced no result")
+
+
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(
     req: ChatCompletionRequest,
@@ -5364,6 +5451,36 @@ def _self_check() -> None:
     assert {"stage": "mcp", "label": "查询运行日志"} in _events, "进度事件没在结果之前转发出来"
     assert all("__result__" not in e for e in _events[:-1]), "结果只能出现在最后一条"
     assert _noop_progress("x", "y") is None, "空实现要能直接调用"
+    # 服务间入口「不做上下文管理」的**确定性证据**。
+    # 靠观察「第二轮回答有没有提到第一轮」来验证是不可靠的——模型本来就可能
+    # 不提。这里直接断言管线拿到的是空历史、空会话数据，与模型行为无关。
+    _hist, _cdata = _conversation_messages("api", None, [])
+    assert (_hist, _cdata) == ([], {}), f"无会话时必须零磁盘读写: {_hist!r} {_cdata!r}"
+    # 有 conversation_id 但文件不存在时同样不该炸，也不该造出目录
+    _hist2, _cdata2 = _conversation_messages("api", "no-such-session", [])
+    assert _hist2 == [], _hist2
+    # 服务身份不能自带管理员权限：role=user 才走「在线推理是否对用户开放」这条判断
+    assert _API_SERVICE_IDENTITY["role"] == "user", "服务身份不该是 admin"
+    # 内部密钥：没配 = 拒绝（fail-closed），配了但给错 = 401，给对 = 放行。
+    # 这里临时改 settings 再还原，避免依赖部署环境里到底配没配。
+    _saved_key = settings.api_internal_key
+    try:
+        settings.api_internal_key = ""
+        try:
+            _require_internal_api_key("anything")
+            raise AssertionError("未配置密钥时必须拒绝")
+        except HTTPException as exc:
+            assert exc.status_code == 503, exc.status_code
+        settings.api_internal_key = "k" * 32
+        for _bad in (None, "", "k" * 31, "k" * 33, "local-dev-key"):
+            try:
+                _require_internal_api_key(_bad)
+                raise AssertionError(f"错误密钥必须 401: {_bad!r}")
+            except HTTPException as exc:
+                assert exc.status_code == 401, exc.status_code
+        assert _require_internal_api_key("k" * 32) is None, "正确密钥要放行"
+    finally:
+        settings.api_internal_key = _saved_key
 
 
 if __name__ == "__main__":
