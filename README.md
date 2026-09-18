@@ -2204,7 +2204,8 @@ Qwen + RAG + reranker + Zvec + Neo4j + MinerU + WebUI + 文件会话
 | `HDW_ENABLE_AUTH` | 是否启用内部 Bearer 鉴权 |
 | `HDW_INTERNAL_API_KEY` | 内部 API key（只被 `_check_auth` 用，且受 `HDW_ENABLE_AUTH` 开关控制） |
 | `HDW_API_PORT` | 对外问答 API 的宿主端口（容器内固定 8095） |
-| `HDW_API_KEY` | 对外问答 API 的调用方密钥，**发给调用方项目** |
+| `HDW_API_KEYS` | 对外问答 API 的调用方密钥，格式 `标签:密钥,标签:密钥`。**一把对一个调用方**，吊销互不影响；标签会记进留档的 `caller` 字段 |
+| `HDW_API_KEY` | 单密钥形式，**只在没配 `HDW_API_KEYS` 时使用**。只配一个调用方时可以只用它 |
 | `HDW_API_INTERNAL_KEY` | `hdw-api` ↔ `qa-api` 的服务间密钥，不外发；两侧必须一致 |
 | `HDW_API_QA_TIMEOUT` | `hdw-api` 等上游问答的超时秒数，默认 600 |
 | `NEO4J_AUTH` | Neo4j 认证 |
@@ -2238,6 +2239,39 @@ Qwen + RAG + reranker + Zvec + Neo4j + MinerU + WebUI + 文件会话
 **注意 `config.json` 通常归 root**——qa-api 容器以 root 身份写它（在 UI 里保存
 一次就会这样），所以宿主机用户直接编辑会 `Permission denied`。
 `--sync-model-config` 会自动借容器写入，不需要 sudo。
+
+### 16.2 对外 API 的调用方密钥
+
+`Configs/.env` 的 `HDW_API_KEYS`，格式 `标签:密钥,标签:密钥`。
+**一把密钥对一个调用方**——共用一把的话，想停掉 A 就会把 B 也断了。
+标签只允许字母/数字/下划线/连字符，会写进留档文件的 `caller` 字段。
+
+**新增一个调用方：**
+
+```bash
+cd <项目根>
+# 1. 生成（HDW- 前缀 + 24 位纯字母数字，约 143 位熵）
+NEW="$(python3 -c "import secrets,string;print('HDW-'+''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(24)))")"
+# 2. 追加到列表（<新标签> 换成调用方名字，如 monitor）
+sed -i "s|^HDW_API_KEYS=.*|&,<新标签>:$NEW|" Configs/.env
+# 3. 重建——密钥是启动时读的，不重建不生效
+docker compose --env-file Configs/.env -f Configs/docker-compose.yml \
+  --profile base --profile knowledge --profile web up -d hdw-api
+# 4. 验证：新密钥能过，别人的密钥不受影响
+bash Scripts/deploy_verify.sh
+```
+
+把第 2 步生成的那把密钥**单独**发给调用方。
+
+**吊销一个调用方**：从 `HDW_API_KEYS` 里删掉它那一段，重建容器。
+**其它调用方不受影响**——这正是分多把密钥的意义。
+
+**两条纪律：**
+
+- 密钥只放 `Configs/.env`（已 gitignore）。`Configs/.env.example` 由
+  `Scripts/gen_env_example.sh` 生成，`HDW_API_KEYS` 会被自动换成
+  `your-label1:your-key,your-label2:your-key`——**不要手工编辑模板**。
+- 推送前扫描照常跑（§10.9）。密钥一旦进了 git 历史，改 HEAD 是收不回来的。
 
 ## 17. 最后检查清单
 

@@ -277,9 +277,12 @@ services:
       # 本服务自己不做问答，转发给 qa-api 的服务间入口。
       # 走服务名 + 容器内端口，与宿主映射无关（改 HDW_QA_API_PORT 不影响这里）。
       HDW_QA_API_URL: http://hdw-qa-api:8080
-      # 两个密钥分工不同：HDW_API_KEY 给调用方（别的项目），
+      # 密钥分工不同：调用方密钥（HDW_API_KEYS / HDW_API_KEY）给别的项目，
       # HDW_API_INTERNAL_KEY 只有本容器和 qa-api 知道。**必须在 environment 里
       # 显式透传**，compose 没有 env_file，漏写就是容器里读不到（同 167-177 行那批）。
+      # 调用方密钥。HDW_API_KEYS 是列表（标签:密钥,标签:密钥），配了它以它为准；
+      # HDW_API_KEY 是单密钥形式，只有没配列表时才用。两个都透传。
+      HDW_API_KEYS: ${HDW_API_KEYS:-}
       HDW_API_KEY: ${HDW_API_KEY:-}
       HDW_API_INTERNAL_KEY: ${HDW_API_INTERNAL_KEY:-}
       HDW_API_QA_TIMEOUT: ${HDW_API_QA_TIMEOUT:-600}

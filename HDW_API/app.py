@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import re
 import time
 from typing import Any, Literal
 
@@ -32,12 +33,53 @@ import store
 UPSTREAM_URL = os.getenv(
     "HDW_QA_API_URL", "http://hdw-qa-api:8080"
 ).strip().rstrip("/") + "/internal/qa/query"
-# 服务间密钥，只有本容器和 qa-api 知道。**与给调用方的 HDW_API_KEY 是两个**：
+# 服务间密钥，只有本容器和 qa-api 知道。**与给调用方的密钥刻意分开**：
 # 合一的话，拿到对外密钥的人可以绕过本服务直连 qa-api（那条路不留档、
 # 也没有调用方维度的吊销）。
 INTERNAL_KEY = os.getenv("HDW_API_INTERNAL_KEY", "").strip()
-# 调用方持有的密钥。
+# 调用方密钥的单密钥形式。**保留作向后兼容**：只配了一个调用方的部署不用动。
 API_KEY = os.getenv("HDW_API_KEY", "").strip()
+
+# 调用方标签的字符集。它会写进留档文件的 `caller` 字段，所以限制成安全字符，
+# 免得一个手滑的标签把留档写坏。
+_CALLER_LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+def _load_api_keys(spec: str, legacy: str) -> list[tuple[str, str]]:
+    """解析 `HDW_API_KEYS`，格式 `标签:密钥,标签:密钥`。
+
+    配了它就用它——**一把密钥对一个调用方**，吊销其中一个不影响其它。
+    没配则退回单密钥 `HDW_API_KEY`（标签取 `default`）。
+
+    **格式错误直接抛异常，不静默跳过**：一条写错的条目若被忽略，表现是
+    「某个调用方突然 401」而配置看上去没问题——那种问题很难查。
+    宁可启动时就炸，错误信息里直接说清期望的格式。
+    """
+    keys: list[tuple[str, str]] = []
+    for item in str(spec or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        # 按**第一个**冒号切：密钥里万一有冒号也不会把标签切坏
+        label, sep, key = item.partition(":")
+        if not sep:
+            # 没写标签就整条当密钥，标签取 default（与单密钥路径一致）
+            label, key = "default", label
+        label, key = label.strip(), key.strip()
+        if not key:
+            raise ValueError(f"HDW_API_KEYS 里有一条没有密钥：{item!r}")
+        if not _CALLER_LABEL_RE.fullmatch(label):
+            raise ValueError(
+                f"HDW_API_KEYS 的标签 {label!r} 不合法：只允许字母、数字、"
+                "下划线和连字符（1-32 字符）"
+            )
+        keys.append((label, key))
+    if not keys and legacy:
+        keys = [("default", legacy)]
+    return keys
+
+
+API_KEYS = _load_api_keys(os.getenv("HDW_API_KEYS", ""), API_KEY)
 # 上游超时。**必须大于管线自己最慢的路径**：MCP 取数最慢的日志工具要等
 # LIEMS 门户 30 秒，之后才是生成。实测单发一次提问 5 秒到 2 分钟。
 #
@@ -68,33 +110,43 @@ class AskRequest(BaseModel):
     top_k: int = Field(default=40, ge=1, le=40)
 
 
-def _require_caller(authorization: str | None, x_hdw_api_key: str | None) -> None:
-    """校验调用方。
+def _require_caller(authorization: str | None, x_hdw_api_key: str | None) -> str:
+    """校验调用方，**返回匹配到的标签**（用于留档区分是谁问的）。
 
     **未配置密钥时拒绝服务，不静默放行**：这个端口绑在所有网卡上，没有密钥
     就等于给局域网开了个免费的大模型入口。宁可接口不可用，也不能默认敞开。
     """
-    if not API_KEY:
+    if not API_KEYS:
         raise HTTPException(
             status_code=503,
-            detail="HDW_API_KEY 未配置，对外接口不可用（见 Configs/.env）",
+            detail="未配置任何调用方密钥（HDW_API_KEYS / HDW_API_KEY），对外接口不可用",
         )
     presented = ""
     if authorization and authorization.lower().startswith("bearer "):
         presented = authorization[7:].strip()
     elif x_hdw_api_key:
         presented = x_hdw_api_key.strip()
-    if not presented or not hmac.compare_digest(presented, API_KEY):
-        raise HTTPException(status_code=401, detail="unauthorized")
+    if presented:
+        for label, key in API_KEYS:
+            # 逐个比。密钥数量是个位数，不需要建索引；每一条都是常数时间比较。
+            if hmac.compare_digest(presented, key):
+                return label
+    # 不区分「没带」和「带错了」——对调用方都一样，也不必告诉试探者哪一步错了
+    raise HTTPException(status_code=401, detail="unauthorized")
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    """给部署校验用的探活。无鉴权，但也不泄露任何配置值。"""
+    """给部署校验用的探活。无鉴权，但也不泄露任何配置值。
+
+    **报数量不报标签**：这个端点不需要鉴权，标签等于告诉任何能访问的人
+    「有哪些项目在调这个接口」。
+    """
     return {
         "status": "ok",
         "upstream": UPSTREAM_URL,
-        "key_configured": bool(API_KEY),
+        "key_configured": bool(API_KEYS),
+        "keys_configured": len(API_KEYS),
         "sessions": len(store.list_sessions(limit=1000)),
     }
 
@@ -105,7 +157,7 @@ async def ask(
     authorization: str | None = Header(default=None),
     x_hdw_api_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _require_caller(authorization, x_hdw_api_key)
+    caller = _require_caller(authorization, x_hdw_api_key)
     question = req.question.strip()
     if not question:
         raise HTTPException(status_code=422, detail="question is required")
@@ -158,7 +210,7 @@ async def ask(
 
     result = response.json()
     answer = str(result.get("answer") or "")
-    turn = store.append_exchange(session_id, question, answer)
+    turn = store.append_exchange(session_id, question, answer, caller=caller)
     return {
         "session_id": session_id,
         "turn": turn,
@@ -214,30 +266,55 @@ def _self_check() -> None:
     """配置自检。**在 import 时跑**，与 qa-api 同一套约定：
     配错了要在启动时就炸，而不是等第一个请求进来才发现。"""
     assert UPSTREAM_URL.endswith("/internal/qa/query"), UPSTREAM_URL
-    # 密钥校验的三个分支。临时改模块变量再还原，不依赖部署环境配没配。
-    global API_KEY
-    saved = API_KEY
+
+    # ── 多密钥的解析 ──
+    # 单密钥向后兼容：只配 HDW_API_KEY 时标签取 default
+    assert _load_api_keys("", "") == [], "都没配就是空"
+    assert _load_api_keys("", "solo") == [("default", "solo")], "单密钥要退回 default"
+    two = _load_api_keys("fault:HDW-aaa,monitor:HDW-bbb", "")
+    assert two == [("fault", "HDW-aaa"), ("monitor", "HDW-bbb")], two
+    # 配了列表就以列表为准，legacy 不再补进来（否则会多出一把没人知道的密钥）
+    assert _load_api_keys("fault:HDW-aaa", "solo") == [("fault", "HDW-aaa")]
+    # 没写标签就整条当密钥，标签 default
+    assert _load_api_keys("HDW-ccc", "") == [("default", "HDW-ccc")]
+    # 密钥里带冒号时按**第一个**冒号切，不会把标签切坏
+    assert _load_api_keys("fault:a:b", "") == [("fault", "a:b")]
+    # 空条目（尾随逗号）要跳过，不能变成一把空密钥
+    assert _load_api_keys("fault:HDW-aaa,", "") == [("fault", "HDW-aaa")]
+    # **格式错误必须炸**：静默跳过会让某个调用方突然 401，而配置看着没问题
+    for bad_spec in ("fault:", ":", "bad label:HDW-aaa", "有中文:HDW-aaa", "a" * 33 + ":HDW-aaa"):
+        try:
+            _load_api_keys(bad_spec, "")
+            raise AssertionError(f"非法 HDW_API_KEYS 必须抛异常：{bad_spec!r}")
+        except ValueError:
+            pass
+
+    # ── 校验分支 ── 临时改模块变量再还原，不依赖部署环境配没配
+    global API_KEYS
+    saved = API_KEYS
     try:
-        API_KEY = ""
+        API_KEYS = []
         try:
             _require_caller(None, None)
             raise AssertionError("未配置密钥必须拒绝")
         except HTTPException as exc:
             assert exc.status_code == 503, exc.status_code
-        API_KEY = "c" * 32
+
+        API_KEYS = [("fault", "c" * 32), ("monitor", "d" * 32)]
         # 注意最后一个：**长度对但内容错**的 Bearer，不能因为走对了格式就放行。
         # （曾经把正确密钥写进这个列表，断言失败反而暴露的是测试写错了。）
-        for bad in (None, "", "c" * 31, "c" * 33, "Bearer " + "d" * 32, "Bearer ", "Basic " + "c" * 32):
+        for bad in (None, "", "c" * 31, "c" * 33, "Bearer " + "e" * 32, "Bearer ", "Basic " + "c" * 32):
             try:
                 _require_caller(bad, None)
                 raise AssertionError(f"错误密钥必须 401: {bad!r}")
             except HTTPException as exc:
                 assert exc.status_code == 401, exc.status_code
-        assert _require_caller("Bearer " + "c" * 32, None) is None, "Bearer 形式要放行"
-        assert _require_caller(None, "c" * 32) is None, "X-HDW-API-Key 形式要放行"
-        assert _require_caller("bearer " + "c" * 32, None) is None, "Bearer 大小写不敏感"
+        # **要返回匹配到的那个标签**——留档靠它区分调用方，返回错了比不返回更糟
+        assert _require_caller("Bearer " + "c" * 32, None) == "fault", "Bearer 形式"
+        assert _require_caller(None, "d" * 32) == "monitor", "X-HDW-API-Key 形式"
+        assert _require_caller("bearer " + "d" * 32, None) == "monitor", "Bearer 大小写不敏感"
     finally:
-        API_KEY = saved
+        API_KEYS = saved
     store.self_check()
 
 

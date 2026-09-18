@@ -13,13 +13,13 @@
 ## 快速开始
 
 把 `<本机内网地址>` 换成部署这台机器的内网 IP（端口默认 8095，见 `Configs/.env`
-的 `HDW_API_PORT`）。密钥在 `Configs/.env` 的 `HDW_API_KEY`，**只发给调用方**，
-不写进任何仓库。
+的 `HDW_API_PORT`）。**密钥由服务端运维单独发给你**（存在 `Configs/.env` 的
+`HDW_API_KEYS` 里），别写进任何会提交的文件。
 
 ```bash
 curl -X POST http://<本机内网地址>:8095/api/v1/ask \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer <HDW_API_KEY>' \
+  -H 'Authorization: Bearer <运维给你的密钥>' \
   -d '{"question":"汽轮机超速保护动作值是多少？"}'
 ```
 
@@ -39,7 +39,7 @@ Python（`httpx` 或 `requests` 都行）：
 import httpx
 
 BASE = "http://<本机内网地址>:8095"
-KEY = "<HDW_API_KEY>"          # 放环境变量，别写死在代码里
+KEY = "<运维给你的密钥>"        # 放环境变量，别写死在代码里
 
 resp = httpx.post(
     f"{BASE}/api/v1/ask",
@@ -80,19 +80,24 @@ print(resp.json()["answer"])
 两种写法等价，二选一：
 
 ```
-Authorization: Bearer <HDW_API_KEY>
-X-HDW-API-Key: <HDW_API_KEY>
+Authorization: Bearer <你的密钥>
+X-HDW-API-Key: <你的密钥>
 ```
 
 密钥比对用常数时间比较，不匹配一律 `401`（不区分"没带"和"带错了"）。服务端
-没配 `HDW_API_KEY` 时返回 `503` 而不是放行——这是有意的，见下面「安全」。
+**一把密钥都没配**时返回 `503` 而不是放行——这是有意的，见下面「安全」。
+
+**每个调用方一把密钥**（`HDW_API_KEYS`，格式 `标签:密钥,标签:密钥`）。
+这样吊销其中一个不影响其它——共用一把的话，想停掉 A 就会把 B 也断了。
+你的密钥由服务端运维单独发给你；`HDW_API_KEY` 是单密钥形式，
+只在服务端没配列表时使用。
 
 ### 状态码
 
 | 码 | 含义 | 怎么办 |
 | --- | --- | --- |
 | 200 | 正常 | — |
-| 401 | 密钥不对 | 检查 `HDW_API_KEY` |
+| 401 | 密钥不对 | 检查密钥值；注意 `Bearer ` 后面有个空格 |
 | 403 | 请求了未开放的在线推理 | 改用 `offline` |
 | 404 | `session_id` 不存在（读取/删除时） | — |
 | 422 | `question` 为空、`session_id` 非法 | 见下 |
@@ -136,13 +141,16 @@ llama 走非流式（`stream: false`），响应头要等生成结束才发—�
 ## 安全
 
 - 这个端口绑在**所有网卡**上（内网可达）。门是密钥，不是网络位置。
-- **两个密钥分工不同，别合并**：
-  - `HDW_API_KEY` —— 调用方持有，配到你自己的项目里
-  - `HDW_API_INTERNAL_KEY` —— 只有 `hdw-api` 和 `qa-api` 两个容器知道，不外发
+- **两类密钥分工不同，别合并**：
+  - `HDW_API_KEYS` —— 调用方密钥，每个调用方一个标签一把，**各持各的**。
+    吊销其中一个不影响其它。
+  - `HDW_API_INTERNAL_KEY` —— 只有 `hdw-api` 和 `qa-api` 两个容器知道，不外发。
   合并的话，拿到对外密钥的人可以绕过本服务直连 qa-api 的内部入口。
-- 两个密钥任一为空，对应接口就拒绝服务（fail-closed），不会静默敞开。
-- `/health` 不需要密钥，但只返回 `status`/`key_configured` 这类布尔量，
-  不返回任何配置值。
+- 密钥列表为空时接口直接拒绝服务（fail-closed），不会静默敞开。
+- `/health` 不需要密钥，只返回 `status` / 已配置密钥**数量**这类信息——
+  **不返回标签**：那等于告诉任何能访问的人「有哪些项目在调这个接口」。
+- 留档文件里记了调用方标签（`caller` 字段），方便翻查是哪个项目问的；
+  但**同一 session_id 被两个调用方复用时只记最先创建的那个**。
 
 ## 运维
 

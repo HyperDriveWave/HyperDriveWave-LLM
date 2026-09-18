@@ -68,7 +68,7 @@ import pathlib, re, sys
 #   HDW_LLM_MAX_TOKENS / HDW_CONTEXT_WINDOW_TOKENS        （含 "TOKEN"）
 # 这些都是配置值不是凭据，被清成占位符会让模板直接不可用。
 # 加上边界后只命中 _KEY / _TOKEN / _SECRET 这类真正的凭据键。
-KEY_PAT = re.compile(r"_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|USERNAME)$", re.I)
+KEY_PAT = re.compile(r"_(KEY|KEYS|TOKEN|SECRET|PASSWORD|PASSWD|USERNAME)$", re.I)
 # 明确不是凭据的例外
 EXEMPT = {"HDW_ENABLE_AUTH", "HDW_INTERNAL_API_KEY"}
 
@@ -104,6 +104,10 @@ def placeholder(key: str) -> str:
     base = key.replace("HDW_", "").lower()
     if key == "HDW_INTERNAL_API_KEY":
         return "local-dev-key"          # 本地开发用的固定值，不是真凭据
+    if key == "HDW_API_KEYS":
+        # 值里**本身含多把密钥**，占位符要把格式也带上，否则看模板的人不知道
+        # 该写成什么样。**别在这一行里写真实标签**——_scrub 收不走它们。
+        return "your-label1:your-key,your-label2:your-key"
     if "USERNAME" in key.upper():
         return "your-username"
     if "PASSWORD" in key.upper() or "PASSWD" in key.upper():

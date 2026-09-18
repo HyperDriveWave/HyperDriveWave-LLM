@@ -76,8 +76,16 @@ def _write(session_id: str, data: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def append_exchange(session_id: str, question: str, answer: str) -> int:
-    """追加一轮问答，返回这是第几轮（user 消息的条数）。"""
+def append_exchange(
+    session_id: str, question: str, answer: str, caller: str = ""
+) -> int:
+    """追加一轮问答，返回这是第几轮（user 消息的条数）。
+
+    `caller` 是调用方标签（哪把密钥），记在会话上——翻留档时能看出是
+    **哪个项目问的**，而不是只知道「API 问的」。**只在创建时写**：
+    同一个 session_id 被两个调用方复用属于用法问题，标成最先创建的那个
+    比每次覆盖更好查。
+    """
     timestamp = now_iso()
     with _lock:
         data = _read(session_id) or {
@@ -88,6 +96,8 @@ def append_exchange(session_id: str, question: str, answer: str) -> int:
             "created_at": timestamp,
             "messages": [],
         }
+        if caller:
+            data.setdefault("caller", caller)
         data["messages"].append({"role": "user", "content": question, "created_at": timestamp})
         data["messages"].append({"role": "assistant", "content": answer, "created_at": timestamp})
         data["updated_at"] = timestamp
@@ -120,6 +130,8 @@ def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
             {
                 "session_id": data.get("id") or path.stem,
                 "title": data.get("title", ""),
+                # 哪把密钥问的。列表是给运维看的，这一列能区分调用方
+                "caller": data.get("caller", ""),
                 "turns": sum(
                     1 for m in data.get("messages", []) if m.get("role") == "user"
                 ),
@@ -160,9 +172,13 @@ def self_check() -> None:
             assert load("nope") is None
             assert delete("nope") is False
 
-            assert append_exchange("s1", "第一问", "第一答") == 1
+            assert append_exchange("s1", "第一问", "第一答", caller="fault-diag") == 1
             assert append_exchange("s1", "第二问", "第二答") == 2
             doc = load("s1")
+            # 调用方标签只在创建时写；后续追加不覆盖（复用 session_id 是用法问题，
+            # 标成最先创建的那个比每次覆盖更好查）
+            assert doc["caller"] == "fault-diag", doc.get("caller")
+            assert list_sessions()[0]["caller"] == "fault-diag", list_sessions()[0]
             assert doc is not None
             assert [m["role"] for m in doc["messages"]] == [
                 "user",
