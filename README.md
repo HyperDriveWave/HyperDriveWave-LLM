@@ -1485,8 +1485,8 @@ bash Scripts/deploy_verify.sh
 （RAG 实际用 PyPI 的版本，该目录既没被 COPY 也没被挂载）。现在直接在
 `HDW_Inference/RAG_Service/requirements.txt` 里钉 `zvec==0.7.0`。
 
-**许可证**：`vendor/` 下都是别人的代码，各自遵循上游许可证。
-`aora-bot/emotion-ball`（WebUI 首页那个情绪球）的许可证在商业部署前需重新核对。
+**许可证**：`vendor/` 下都是别人的代码，各自遵循上游许可证。本项目自有代码
+采用 Apache License 2.0，范围与第三方边界见 §18。
 
 ### 10.9 推送到版本库前的凭据扫描
 
@@ -2317,3 +2317,32 @@ bash Scripts/deploy_verify.sh --deep   # 额外做重启演练
   -> 通过健康检查和端到端测试
   -> 再进入下一阶段
 ```
+
+
+## 18. 许可证
+
+本项目**自有的代码**采用 **Apache License 2.0**，全文见仓库根目录的
+[LICENSE](LICENSE)。附录里的版权所有者已按 Apache 的要求填好：
+
+```text
+Copyright 2026 HyperDriveWave
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+```
+
+**根目录的 LICENSE 只覆盖本项目自有的代码。** 下面这些不是我们的，各自遵循
+上游许可证——它们与本许可证兼容，但署名和分发义务要按各自的要求走：
+
+| 路径 | 是什么 | 许可证 |
+| --- | --- | --- |
+| `HDW_Frontend/FRP/` | frp 客户端及其二进制 | 自带 `LICENSE`（同为 Apache 2.0） |
+| `vendor/overlays/` | 对第三方源码的覆盖文件，衍生于上游 | 随上游（如 MCP python-sdk 为 MIT） |
+| `vendor/vendor.lock` | 只是「配方」（路径 / commit / URL） | 不适用——它列出的项目由 `fetch_vendors.sh` 单独克隆，**不在本仓库内** |
+| `HDW_Animation/aora-bot/` | WebUI 首页那个情绪球 | **不在本仓库内**；商业部署前需重新核对（见 §2 第 5 条） |
+
+第三方源码、模型权重、构建产物都不进版本库（见 §10.8），所以仓库里属于别人的
+内容只有上表前两处。若要对外分发，这两处的上游许可证副本需要一并保留。
