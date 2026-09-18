@@ -1828,9 +1828,17 @@ def _round_robin_by_round(contexts: list[dict[str, Any]]) -> list[dict[str, Any]
 _RAG_QUERY_PLAN_PROMPT = (
     "你在为知识库检索拆查询。把用户要回答的内容拆成若干条**各自独立**的"
     "检索查询，每条都单独拿去检索。\n"
-    "· 只有一个问题时，**只输出一条**\n"
-    "· 一段材料里有多个并列的问题时，**每个问题一条**——"
-    "一路查询覆盖不到的问题，后面只能靠猜，而猜出来的答案从表面看不出来\n"
+    "**先判断问题类型，再决定拆几条**——拆得多不是目的，覆盖到才是：\n"
+    "· 问一个具体事实、一个参数、一个概念（「是多少」「什么是」「怎么处理」）——"
+    "**1 条就够**，不要为了凑数拆开，多拆只会白花时间和上下文\n"
+    "· 问「有哪些」「包括哪些」「都有什么」这类**列举**——"
+    "**按该类设备的各个子项各拆一条**。一条查询只能覆盖一个子项："
+    "实测问「汽轮机主保护有哪些」时，单条查询只会捞回「主蒸汽温度保护」一类"
+    "（字面撞上「主…保护」），而「超速保护系统」「EH油压低保护」「差胀保护」"
+    "这些逐项条目一条都进不了榜，漏掉的子项后面只能靠猜。"
+    "例如这类问题就按 超速、轴承温度、润滑油压、EH油压、差胀、真空低、"
+    "轴向位移、振动 等子项拆\n"
+    "· 一段材料里有多个并列的问题时，**每个问题一条**\n"
     "· 每条的写法：写成**能直接检索的查询**，保留区分性的限定词"
     "（设备名、部位、参数名），去掉「请简述」「是多少」这类问句外壳\n"
     "· **不要**输出「相关定义、范围和判断依据」这类空泛查询，它们检不到东西\n"
@@ -1844,6 +1852,9 @@ _RAG_QUERY_TOP_K = int(os.getenv("HDW_RAG_QUERY_TOP_K", "8"))
 # 证据总预算的上限。一路约 400 字，80 条约 3 万字，离上下文上限还很远。
 _RAG_ONLINE_EVIDENCE_CAP = int(os.getenv("HDW_RAG_ONLINE_EVIDENCE_CAP", "120"))
 _RAG_LOCAL_EVIDENCE_CAP = int(os.getenv("HDW_RAG_LOCAL_EVIDENCE_CAP", "80"))
+# 落到本机 CPU RAG（串行，实测 7.5 s/路）时，最多保留几路检索。
+# 远端 GPU 节点可用时不生效——那边 8 路并发只要 3.7 s，没必要压。
+_RAG_FALLBACK_ROUTE_CAP = int(os.getenv("HDW_RAG_FALLBACK_ROUTE_CAP", "2"))
 
 # 模型偶尔会加行首编号，或者在行尾带解释。剥掉编号；解释留着也无害
 # （检索器对长句本来就有截断），所以不做更激进的清洗。
@@ -2432,6 +2443,24 @@ async def _retrieve_planned(
     # 总耗时取决于较慢的一项而不是两者之和。
     realtime_task = asyncio.create_task(_fetch_realtime(intent, mode))
 
+    # **回退路径要压路数**。并发检索的前提是**后端真的能并发**：
+    #   远端 GPU 节点   1 路 0.46 s / 8 路并发 3.70 s   ← 5 倍加速
+    #   本机 CPU RAG    1 路 7.55 s / 8 路并发 61.0 s   ← 完全串行
+    # 本机那份被 `_MODEL_LOCK` 串行化了，所以远端一挂，多路的代价从
+    # +3 秒变成 +54 秒——正好在用户等答案的时候雪上加霜。
+    # 只在路数够多时才探测（1-2 路本来就没多少可省的），探测本身有成本。
+    if len(plan["queries"]) > _RAG_FALLBACK_ROUTE_CAP and not await _remote_rag_available():
+        _dropped = len(plan["queries"]) - _RAG_FALLBACK_ROUTE_CAP
+        plan["queries"] = plan["queries"][:_RAG_FALLBACK_ROUTE_CAP]
+        plan["reason"] = (
+            f"{plan.get('reason') or ''}（远端 RAG 不可用，落到本机串行路径，"
+            f"路数已从 {_RAG_FALLBACK_ROUTE_CAP + _dropped} 压回 {_RAG_FALLBACK_ROUTE_CAP}）"
+        ).strip()
+        progress(
+            "plan",
+            f"远端检索不可用，本机串行执行，路数压回 {_RAG_FALLBACK_ROUTE_CAP} 路",
+        )
+
     merged: dict[str, dict[str, Any]] = {}
     round_infos: list[dict[str, Any]] = []
     # **并发检索**。逐题检索后轮次可以到几十，串行会把这些延迟直接叠加
@@ -2804,6 +2833,27 @@ def _rag_health_urls() -> tuple[list[str], set[str]]:
     local_url = settings.rag_base_url
     remote_urls = list(dict.fromkeys(url for url in settings.rag_remote_urls if url != local_url))
     return remote_urls + [local_url], set(remote_urls)
+
+
+async def _remote_rag_available() -> bool:
+    """远端 GPU 节点是否至少有一个能用。**任何异常都当"不可用"**——
+    这个判断只用来决定压不压路数，判断不出来时保守按串行路径处理，
+    宁可少取几路证据，也不要在用户等答案时把 8 路串行跑成 61 秒。
+    """
+    _, remote_urls = _rag_health_urls()
+    if not remote_urls:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=settings.rag_health_timeout) as client:
+            checks = await asyncio.gather(
+                *(_check_rag_url(client, url) for url in remote_urls),
+                return_exceptions=True,
+            )
+    except Exception:  # noqa: BLE001
+        return False
+    return any(
+        isinstance(c, dict) and c.get("status") != "unavailable" for c in checks
+    )
 
 
 async def _check_rag_url(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
@@ -5481,6 +5531,25 @@ def _self_check() -> None:
         assert _require_internal_api_key("k" * 32) is None, "正确密钥要放行"
     finally:
         settings.api_internal_key = _saved_key
+    # 拆查询提示词必须区分「事实题」和「列举题」。
+    # 实测失效：旧提示词写着「只有一个问题时只输出一条」，于是
+    # 「汽轮机主保护有哪些」只发一条查询，捞回来的全是字面撞上
+    # 「主…保护」的温度保护，超速/EH油压/差胀这些逐项条目一条都进不了榜——
+    # 培训教材里 28 个讲保护的片段，答案只用到 5 个。这条断言防的是
+    # 有人把这个区分改回"单问题就单路"。
+    assert "列举" in _RAG_QUERY_PLAN_PROMPT, "提示词丢了「列举型要拆子项」这条"
+    assert "1 条就够" in _RAG_QUERY_PLAN_PROMPT, "提示词丢了「事实题不要多拆」这条"
+    assert "{max_queries}" in _RAG_QUERY_PLAN_PROMPT, "占位符被改掉了"
+    # 回退路径的路数上限必须是个小数字：它的唯一用途就是在串行后端上
+    # 把耗时从「路数 × 7.5 s」压回来。
+    assert 1 <= _RAG_FALLBACK_ROUTE_CAP <= 4, _RAG_FALLBACK_ROUTE_CAP
+    # 没配远端时必须是「不可用」——这条决定了要不要压路数，判错就等于不压。
+    _saved_remote = settings.rag_remote_urls
+    try:
+        settings.rag_remote_urls = ()
+        assert asyncio.run(_remote_rag_available()) is False, "没配远端时必须判为不可用"
+    finally:
+        settings.rag_remote_urls = _saved_remote
 
 
 if __name__ == "__main__":
