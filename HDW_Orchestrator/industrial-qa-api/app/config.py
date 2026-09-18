@@ -15,7 +15,7 @@ class Settings:
         "HDW_ONLINE_LLM_BASE_URL",
         "https://api.deepseek.com",
     )
-    online_llm_model = os.getenv("HDW_ONLINE_LLM_MODEL", "deepseek-v4-flash")
+    online_llm_model = os.getenv("HDW_ONLINE_LLM_MODEL", "deepseek-flash")
     online_llm_api_key = os.getenv("HDW_ONLINE_LLM_API_KEY", "")
     # 单次生成的**总时限**，不是「每次读」的超时。llama 走的是非流式
     # （LLM_API/client.py 的 "stream": False），实测响应头要等整段生成结束

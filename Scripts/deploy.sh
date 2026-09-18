@@ -452,7 +452,7 @@ if [ "$HDW_GPU_COUNT" -eq 0 ]; then
   _cur_model="$(env_get "$ENV_FILE" HDW_ONLINE_LLM_MODEL || echo '')"
   _cur_key="$(env_get "$ENV_FILE" HDW_ONLINE_LLM_API_KEY || echo '')"
   _cur_base="${_cur_base:-https://api.deepseek.com}"
-  _cur_model="${_cur_model:-deepseek-v4-flash}"
+  _cur_model="${_cur_model:-deepseek-flash}"
 
   if [ -n "$_cur_key" ]; then
     info "当前已配置在线 API（key 已填，不显示）"
@@ -629,7 +629,7 @@ cfg = {
     },
     "online": {
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "context_window": 262144,
         "multimodal_enabled": False,
         "thinking_enabled": True,

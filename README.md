@@ -1713,7 +1713,7 @@ bash Scripts/deploy.sh                                # 交互式：列出现状
 
 切换到在线 API？[Y/n]
   base_url [https://api.deepseek.com]:
-  model [deepseek-v4-flash]:
+  model [deepseek-flash]:
   api_key（必填，否则提问会返回 503）:
 ```
 
