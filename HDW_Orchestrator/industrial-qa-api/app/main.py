@@ -2443,11 +2443,16 @@ async def _retrieve_planned(
     # 总耗时取决于较慢的一项而不是两者之和。
     realtime_task = asyncio.create_task(_fetch_realtime(intent, mode))
 
-    # **回退路径要压路数**。并发检索的前提是**后端真的能并发**：
-    #   远端 GPU 节点   1 路 0.46 s / 8 路并发 3.70 s   ← 5 倍加速
-    #   本机 CPU RAG    1 路 7.55 s / 8 路并发 61.0 s   ← 完全串行
-    # 本机那份被 `_MODEL_LOCK` 串行化了，所以远端一挂，多路的代价从
-    # +3 秒变成 +54 秒——正好在用户等答案的时候雪上加霜。
+    # **回退路径要压路数**。`_rag_route_order` 会把多路轮询分到两个远端节点，
+    # 但**每个节点内部是完全串行的**：`_search_zvec` 每次请求都要拿
+    # `_MODEL_LOCK` 两次（_embed 一次、_rerank 一次），锁覆盖整个 GPU 推理。
+    # 实测（2026-09-18，32 请求/档）：
+    #     单节点 任意并发档位   吞吐恒 2.15 req/s，延迟随并发线性增长，加速比 1.0×
+    #     两节点轮询           4.24 req/s（正好翻倍——并发能力来自节点**数量**）
+    #     单请求延迟           远端 0.46 s vs 本机 CPU 7.55 s（差 16 倍）
+    # 所以多路的耗时就是「路数 × 单请求延迟」，两条路径都逃不掉：
+    #     10 路   生产路径 2.36 s      本机回退 75.5 s
+    # 远端一挂，同一串数字涨 32 倍——正好在用户等答案的时候雪上加霜。
     # 只在路数够多时才探测（1-2 路本来就没多少可省的），探测本身有成本。
     if len(plan["queries"]) > _RAG_FALLBACK_ROUTE_CAP and not await _remote_rag_available():
         _dropped = len(plan["queries"]) - _RAG_FALLBACK_ROUTE_CAP
