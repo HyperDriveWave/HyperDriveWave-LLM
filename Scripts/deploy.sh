@@ -12,6 +12,8 @@
 #   bash Scripts/deploy.sh --port webui=3000,qa=8080   # 指定端口，跳过交互（见 --ports）
 #   bash Scripts/deploy.sh --dry-run              # 只报告会改什么，一个文件都不写
 #   bash Scripts/deploy.sh --takeover             # 接管本机上指向别处的已有安装
+#   bash Scripts/deploy.sh --sync-model-config    # 把 .env 的模型/地址同步进 config.json
+#                                                 # （只改这 4 个字段，其余原样保留；不做别的步骤）
 #
 # 设计原则：
 #   1. **路径一律相对**。代码本身已经自定位（脚本用 BASH_SOURCE 推根目录、
@@ -53,6 +55,7 @@ PORT_OVERRIDE=""
 SHOW_PORTS=0
 ONLINE_ONLY=0
 TAKEOVER=0
+SYNC_MODEL_CONFIG=0
 
 usage() {
   # 取开头连续的注释块。**不用硬编码行号**——早先写的是 `sed -n "2,21p"`，
@@ -75,6 +78,7 @@ while [ $# -gt 0 ]; do
     --port)       PORT_OVERRIDE="${2:-}"; shift 2 ;;
     --ports)      SHOW_PORTS=1; shift ;;
     --takeover)   TAKEOVER=1; shift ;;
+    --sync-model-config) SYNC_MODEL_CONFIG=1; shift ;;
     -h|--help)    usage ;;
     *) die "未知参数：$1（--help 看用法）" ;;
   esac
@@ -315,6 +319,139 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+# ── model-config/config.json：它和 .env 谁说了算 ──
+#
+# 这是「同一个值散在多处」里最容易踩的一个：qa-api 的 `_effective_profile`
+# 让它**优先于 .env**（.env 只是 fallback），所以改 .env 的模型名或 base_url
+# **不会生效，而且没有任何提示**——容器 /health 全绿、模型页正常，
+# 只有提问时才看出不对。
+#
+# 约定（2026-09-18 定）：
+#   · 生成时取 .env 的值——首次部署写出来的就该是 .env 说的那样
+#   · 之后 **config.json 权威**，WebUI 里改的模型重启后要保留
+#   · 想让 .env 重新生效，跑 `bash Scripts/deploy.sh --sync-model-config`
+CONFIG_JSON="$RUNTIME_ROOT/model-config/config.json"
+
+# 把 .env 的 4 个键写进 config.json，stdout 输出改动（制表符分隔的三列）。
+#   create —— 文件不存在：写完整默认值
+#   sync   —— 文件存在：**只更新那 4 个字段**，其余原样保留。
+#             mtp_enabled / mmproj / permissions / retrieval / vision_priority
+#             都是 UI 管的运行态设置，整份覆盖会把它们抹掉，比不改更糟。
+write_model_config() {
+  local mode="$1" _lb _lm _ob _om _tmp _changes
+  _lb="$(env_get "$ENV_FILE" HDW_LOCAL_LLM_BASE_URL || echo '')"
+  _lm="$(env_get "$ENV_FILE" HDW_LOCAL_LLM_MODEL || echo '')"
+  _ob="$(env_get "$ENV_FILE" HDW_ONLINE_LLM_BASE_URL || echo '')"
+  _om="$(env_get "$ENV_FILE" HDW_ONLINE_LLM_MODEL || echo '')"
+  # 兜底值只在 .env 里连键都没有时才用得上
+  _lb="${_lb:-http://host.docker.internal:1919/v1}"
+  _lm="${_lm:-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf}"
+  _ob="${_ob:-https://api.deepseek.com}"
+  _om="${_om:-deepseek-flash}"
+
+  # 先在临时文件里算好内容（读原文件不受属主影响），改动行走 stdout
+  _tmp="$(mktemp)"
+  _changes="$(python3 - "$CONFIG_JSON" "$mode" "$_lb" "$_lm" "$_ob" "$_om" "$_tmp" <<'PY'
+import json, sys
+from pathlib import Path
+
+target, mode = Path(sys.argv[1]), sys.argv[2]
+local_base, local_model, online_base, online_model = sys.argv[3:7]
+out = Path(sys.argv[7])
+
+FIELDS = (
+    ("local", "base_url", local_base),
+    ("local", "model", local_model),
+    ("online", "base_url", online_base),
+    ("online", "model", online_model),
+)
+
+if mode == "sync" and target.is_file():
+    cfg = json.loads(target.read_text(encoding="utf-8"))
+else:
+    # create：完整默认值，只在本文件不存在时走到
+    cfg = {
+        "version": 2,
+        "local": {
+            "base_url": local_base,
+            "model": local_model,
+            "engine": "llama.cpp",
+            "context_window": 262144,
+            "multimodal_enabled": False,
+            "mtp_enabled": True,
+            "thinking_enabled": True,
+            "model_options": [],
+            "engine_options": ["llama.cpp", "FreeToken"],
+        },
+        "online": {
+            "base_url": online_base,
+            "model": online_model,
+            "context_window": 262144,
+            "multimodal_enabled": False,
+            "thinking_enabled": True,
+            "enabled_for_users": True,
+            "model_options": [],
+        },
+        "retrieval": {"embedding_model": "bge-m3", "reranker_model": "bge-reranker-v2-m3"},
+        "vision_priority": [],
+    }
+
+for section, key, value in FIELDS:
+    current = (cfg.get(section) or {}).get(key)
+    if current != value:
+        print(f"{section}.{key}\t{current}\t{value}")
+        cfg.setdefault(section, {})[key] = value
+
+out.write_text(json.dumps(cfg, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
+PY
+)"
+
+  # 搬到目标位置。**属主是个坑**：config.json 通常归 root——qa-api 容器以
+  # root 身份写它（UI 里保存一次就会这样），于是宿主机用户直写会
+  # Permission denied。首次部署刚生成时归当前用户，所以不能假定它一直可写。
+  if cp "$_tmp" "$CONFIG_JSON" 2>/dev/null; then
+    rm -f "$_tmp"; printf '%s' "$_changes"; return 0
+  fi
+  # 借容器搬。用与造成这个属主相同的机制，不需要 sudo。
+  if docker run --rm -v "$(dirname "$CONFIG_JSON"):/d" -v "$_tmp:/src:ro" alpine \
+       sh -c 'cat /src > "/d/$1"' _ "$(basename "$CONFIG_JSON")" 2>/dev/null; then
+    rm -f "$_tmp"; printf '%s' "$_changes"; return 0
+  fi
+  rm -f "$_tmp"
+  return 1
+}
+
+if [ "$SYNC_MODEL_CONFIG" = "1" ]; then
+  step "按 .env 同步 model-config"
+  _mc_fail_hint="config.json 写不进去。它通常归 root（qa-api 容器写入后即是），
+       宿主机用户改不了。可手动执行（会覆盖这一份配置）：
+         docker run --rm -v \"$(dirname "$CONFIG_JSON"):/d\" -v <新内容文件>:/src:ro \\
+           alpine sh -c 'cat /src > /d/config.json'"
+  if [ ! -f "$CONFIG_JSON" ]; then
+    info "config.json 不存在——按 .env 生成一份（其余字段用默认值）"
+    if write_model_config create >/dev/null; then
+      ok "已生成 $CONFIG_JSON"
+    else
+      die "$_mc_fail_hint"
+    fi
+  else
+    if ! _changes="$(write_model_config sync)"; then
+      die "$_mc_fail_hint"
+    fi
+    if [ -z "$_changes" ]; then
+      ok "config.json 与 .env 已经一致，无需改动"
+    else
+      printf '%s\n' "$_changes" | while IFS=$'\t' read -r _k _old _new; do
+        info "  $_k：$_old → $_new"
+      done
+      ok "已按 .env 更新 $CONFIG_JSON"
+    fi
+  fi
+  dim "  只改这四个字段；mtp / mmproj / 权限 / 检索模型等其他设置原样保留"
+  dim "  注意：config.json 优先于 .env。下次改完 .env 要再跑一次本命令才生效。"
+  exit 0
+fi
+
 # ═══ 阶段 1.5：端口 ═══════════════════════════════════════════
 # 放在配置渲染之前——它要写 .env。
 
@@ -487,6 +624,22 @@ if [ "$HDW_GPU_COUNT" -eq 0 ]; then
     ok "在线 API 已配置：$_new_base / $_new_model"
     [ -n "$_new_key" ] || warn "没填 api_key，提问会返回 503（online LLM API key is not configured）"
 
+    # ── 同步进 config.json ──
+    # **不补这一步，前面全白做**：qa-api 的 `_effective_profile` 读的是
+    # config.json 的 online.model / online.base_url，.env 只是 fallback。
+    # 而 config.json 从首次部署起就一直存在，所以只写 .env 的话，
+    # 用户在提示里输入的模型根本不会生效——却会看到上面那句成功提示。
+    if ! _mc_changes="$(write_model_config sync)"; then
+      warn "config.json 写不进去，在线模型切换**不会生效**（qa-api 读的是它）。
+       它通常归 root（qa-api 容器写入后即是）。等部署跑完再执行：
+         sudo chown \"\$USER\" HDW_Runtime/model-config/config.json
+         bash Scripts/deploy.sh --sync-model-config"
+    elif [ -n "$_mc_changes" ]; then
+      printf '%s\n' "$_mc_changes" | while IFS=$'\t' read -r _k _old _new; do
+        info "  同步 $_k：$_old → $_new"
+      done
+    fi
+
     # ── auth.csv 的默认推理模式 ──
     # **这一处不改，前面全白做**：每次问答的默认模式取的是
     # auth_store 里该用户的 default_inference_mode 字段
@@ -600,51 +753,16 @@ info ".env 已更新（HDW_WEBUI_BIND=$BIND_IP，绝对路径覆盖已清除）"
 # ── model-config/config.json ──
 # 隐藏硬依赖：llama/start.sh、resource_coordinator、qa-api 三方都读它，
 # 但仓库里没有任何地方生成它。
-CONFIG_JSON="$RUNTIME_ROOT/model-config/config.json"
-# base_url 从 .env 取，不写死。写死的话新机器首次部署就会写出带旧端口的配置，
-# 而 qa-api 读的正是它（.env 只是 fallback）——改了端口却在这里被拽回 1919。
-# 注意必须在 source .env 之后取，所以这里现读现算。
-_LOCAL_LLM_BASE_URL="$(sed -n 's/^HDW_LOCAL_LLM_BASE_URL=//p' "$ENV_FILE" 2>/dev/null | tail -1)"
-_LOCAL_LLM_BASE_URL="${_LOCAL_LLM_BASE_URL:-http://host.docker.internal:1919/v1}"
-
 if [ ! -f "$CONFIG_JSON" ]; then
-  python3 - "$CONFIG_JSON" "$_LOCAL_LLM_BASE_URL" <<'PY'
-import json, sys
-from pathlib import Path
-target = Path(sys.argv[1])
-local_base_url = sys.argv[2]
-target.parent.mkdir(parents=True, exist_ok=True)
-cfg = {
-    "version": 2,
-    "local": {
-        "base_url": local_base_url,
-        "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
-        "engine": "llama.cpp",
-        "context_window": 262144,
-        "multimodal_enabled": False,
-        "mtp_enabled": True,
-        "thinking_enabled": True,
-        "model_options": [],
-        "engine_options": ["llama.cpp", "FreeToken"],
-    },
-    "online": {
-        "base_url": "https://api.deepseek.com",
-        "model": "deepseek-flash",
-        "context_window": 262144,
-        "multimodal_enabled": False,
-        "thinking_enabled": True,
-        "enabled_for_users": True,
-        "model_options": [],
-    },
-    "retrieval": {"embedding_model": "bge-m3", "reranker_model": "bge-reranker-v2-m3"},
-    "vision_priority": [],
-}
-target.write_text(json.dumps(cfg, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
-PY
+  # 字段来源统一在 write_model_config 里（见阶段 1 之后的定义）：
+  # 4 个字段都从 .env 取，不再是写死的字面量。
+  write_model_config create >/dev/null \
+    || die "写不出 $CONFIG_JSON。qa-api、llama/start.sh、resource_coordinator 三方都读它，没有它部署不可用。"
   # 归属当前用户：qa-api 要写回它，root 属主会让 PATCH /model-config 失败
   info "已生成 model-config/config.json（此前是隐藏硬依赖，仓库里没有）"
 else
   dim "  model-config/config.json 已存在，保留（含 UI 里改过的模型选择）"
+  dim "    要让 .env 的模型/地址生效：bash Scripts/deploy.sh --sync-model-config"
 fi
 
 # ── systemd 单元 ──

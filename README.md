@@ -1718,8 +1718,13 @@ bash Scripts/deploy.sh                                # 交互式：列出现状
 ```
 
 确认后脚本会写 `.env`（`HDW_ONLINE_LLM_*`、`HDW_LLM_MODE=online`、
-`HDW_SKIP_LOCAL_LLM=true`），并且**还会改 `HDW_Security/auth/auth.csv`**
-里每个用户的 `default_inference_mode`。
+`HDW_SKIP_LOCAL_LLM=true`）、**同步 `config.json` 的 `online.model` / `online.base_url`**，
+并且**还会改 `HDW_Security/auth/auth.csv`** 里每个用户的 `default_inference_mode`。
+
+**中间那一步（同步 config.json）是 2026-09-18 补上的**。此前只写 `.env`，
+而 qa-api 读的是 config.json——`config.json` 从首次部署起就一直存在，
+所以在新机器上输入的在线模型**根本不会生效**，脚本却照样打印
+「在线 API 已配置：X / Y」。原因与维护入口见 §16.1。
 
 最后这一处不改的话前面全白做：每次问答的默认模式取自 auth.csv 里该用户的那一列，
 **不是** `.env` 的 `HDW_LLM_MODE`（`main.py:2222 → _user_default_inference_mode`）。
@@ -2163,10 +2168,10 @@ Qwen + RAG + reranker + Zvec + Neo4j + MinerU + WebUI + 文件会话
 | `HDW_LLM_GPU` | FreeToken 旧方案使用的 GPU |
 | `HDW_LLM_MEMORY_RATIO` | LLM 显存比例 |
 | `HDW_LLM_MODE` | 默认推理模式：`online` 或 `offline` |
-| `HDW_LOCAL_LLM_BASE_URL` | 本地 FreeToken OpenAI 兼容地址 |
-| `HDW_LOCAL_LLM_MODEL` | 本地模型名称 |
-| `HDW_ONLINE_LLM_BASE_URL` | 在线模型供应商地址 |
-| `HDW_ONLINE_LLM_MODEL` | 在线模型名称 |
+| `HDW_LOCAL_LLM_BASE_URL` | 本地 FreeToken OpenAI 兼容地址。**生成 config.json 时写入；之后 config.json 优先**，改这里要跑 `deploy.sh --sync-model-config` |
+| `HDW_LOCAL_LLM_MODEL` | 本地模型名称。同上——**config.json 优先** |
+| `HDW_ONLINE_LLM_BASE_URL` | 在线模型供应商地址。同上 |
+| `HDW_ONLINE_LLM_MODEL` | 在线模型名称。同上；也可以在 WebUI 模型管理页改（那会写 config.json 并立即生效） |
 | `HDW_ONLINE_LLM_API_KEY` | 在线模型密钥，只放在被忽略的 `Configs/.env` |
 | `HDW_ONLINE_GRAPH_TOP_K` | 在线问答送入 LLM 的图谱上下文上限，默认 40 |
 | `HDW_LOCAL_GRAPH_TOP_K` | 离线问答送入 LLM 的图谱上下文上限，默认 10；先由 reranker 排序，再取前 10 条 |
@@ -2207,6 +2212,32 @@ Qwen + RAG + reranker + Zvec + Neo4j + MinerU + WebUI + 文件会话
 | `HDW_SIS_USERNAME` | SIS 用户名，必须放本地环境变量 |
 | `HDW_SIS_PASSWORD` | SIS 密码，必须放本地环境变量 |
 | `MINERU_API_MAX_CONCURRENT_REQUESTS` | MinerU 请求并发上限，当前固定为 1 |
+
+### 16.1 模型/地址：`.env` 与 `config.json` 谁说了算
+
+**`config.json` 优先。** qa-api 的 `_effective_profile` 先读
+`HDW_Runtime/model-config/config.json`，只在它缺字段时才回落到 `.env` 的
+`settings.*`。所以**改 `.env` 的模型名或 base_url 不会生效，而且没有任何提示**——
+容器 `/health` 全绿、模型页看起来也正常。
+
+约定（2026-09-18 定）：
+
+```text
+生成时     deploy.sh 从 .env 取这 4 个字段写入 config.json
+           （此前是写死的字面量，根本读 .env）
+运行时     config.json 权威。WebUI 模型管理页的改动立即生效并持久
+重新同步   bash Scripts/deploy.sh --sync-model-config
+           只改这 4 个字段，mtp / mmproj / 权限 / 检索模型等其他设置原样保留
+```
+
+四个字段：`local.model`、`local.base_url`、`online.model`、`online.base_url`。
+
+**为什么不做「启动时自动同步」**：那会让 WebUI 里的改动在每次重启后静默丢失，
+等于把「改了不生效」换个方向再犯一次。现在两边都不会被对方静默压掉。
+
+**注意 `config.json` 通常归 root**——qa-api 容器以 root 身份写它（在 UI 里保存
+一次就会这样），所以宿主机用户直接编辑会 `Permission denied`。
+`--sync-model-config` 会自动借容器写入，不需要 sudo。
 
 ## 17. 最后检查清单
 
