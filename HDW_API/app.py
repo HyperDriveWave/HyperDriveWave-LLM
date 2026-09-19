@@ -21,6 +21,7 @@ import hmac
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 import httpx
@@ -101,9 +102,24 @@ app = FastAPI(title="HyperDriveWave Public QA API", version="0.1.0")
 # 只说 "invalid session id"，调用方（尤其用中文当会话名时）无从下手。
 _SESSION_ID_HINT = "invalid session id：只允许字母、数字、下划线和连字符（A-Za-z0-9_-），1-64 字符，不能含中文或空格"
 
+# 本服务容器**没有 TZ**，`datetime.now()` 走 UTC。下游 qa-api 用这个时刻换算
+# 「今天」「白班」，所以不能把 UTC 直接发过去——那会让整天的问答偏 8 小时。
+_BEIJING_OFFSET_HOURS = float(os.getenv("HDW_LIVE_TIME_OFFSET_HOURS", "8"))
+
+
+def _beijing_now() -> str:
+    """本服务认为的北京时间（ISO-8601，带 +08:00）。"""
+    moment = datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=_BEIJING_OFFSET_HOURS)))
+    return moment.isoformat(timespec="seconds")
+
+
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8000)
+    # 可选。调用方自己的本地时刻（ISO-8601）。故障诊断等系统按告警触发查询时，
+    # 带上它最准；不传就用本服务换算的北京时间（见 _beijing_now）。
+    client_time: str | None = Field(default=None, max_length=64)
     # 可选。不传则自动生成，并把生成的 id 回给调用方，下次带上就能续到同一份留档。
     session_id: str | None = None
     inference_mode: Literal["online", "offline"] | None = None
@@ -175,6 +191,9 @@ async def ask(
     payload: dict[str, Any] = {"question": question, "top_k": req.top_k}
     if req.inference_mode:
         payload["inference_mode"] = req.inference_mode
+    # 调用方自带就用它的，否则用本服务换算的北京时间。**总要传一个**——
+    # 留空的话 qa-api 回落它自己的时钟，而它同样在无 TZ 容器里。
+    payload["client_time"] = req.client_time or _beijing_now()
 
     started = time.monotonic()
     try:
@@ -316,6 +335,14 @@ def _self_check() -> None:
     finally:
         API_KEYS = saved
     store.self_check()
+
+    # 发给下游的时刻必须是北京时间。容器没有 TZ，裸 datetime.now() 会走 UTC——
+    # 实测 qa-api 侧就是这么把 15:24 报成 07:24（夜班）的。发错时刻不会报错，
+    # 只会让「今天」「白班」整天偏 8 小时，所以这里量一下偏移。
+    _offset = (datetime.fromisoformat(_beijing_now()).replace(tzinfo=None)
+               - datetime.now(timezone.utc).replace(tzinfo=None))
+    assert timedelta(hours=7) < _offset < timedelta(hours=9), \
+        f"_beijing_now() 不在 UTC+8：偏移 {_offset}"
 
 
 _self_check()

@@ -28,6 +28,30 @@ EMBED_DIM = 1024
 EMBED_MAX_LENGTH = int(os.getenv("HDW_EMBED_MAX_LENGTH", "1024"))
 RERANK_MAX_LENGTH = int(os.getenv("HDW_RERANK_MAX_LENGTH", "512"))
 RERANK_CANDIDATES = int(os.getenv("HDW_RERANK_CANDIDATES", "50"))
+# ── 混合检索（稠密向量 + 全文）────────────────────────────────
+# 只走稠密向量时有两类查询召不回来：
+#   1. **任意标识符**——`P.GAS.11`、`02MBR20CP101XQ01` 这种，稠密向量对它
+#      没有"语义"可言。实测「运维手册中 P.GAS.11 对应的值是多少」：
+#      含答案的分块余弦 0.7302，而召回的块 0.8162~0.8585——差 0.09 就永远
+#      进不了 top-40，重排连看都看不到它。
+#   2. **与文档标题近乎逐字重合的问题**——实测「轴封系统投运的注意事项」，
+#      纯向量 top-1 得分 4.89，而标题就叫《轴封系统启机前投运注意事项》的
+#      两块压根没进候选；补上全文通道后这两块升到 6.19 / 6.16 并置顶。
+#
+# `content` 字段上**早就建好了 FTS 索引**（见 `_create_zvec_collection`），
+# 只是从来没查过。这里补上全文通道，两路排名用 RRF 融合后仍交给交叉编码器定序。
+# 关掉它就退回原来的纯向量行为（改 .env 即可，不用回滚镜像）。
+_LEXICAL_ENABLED = os.getenv("HDW_RAG_LEXICAL", "true").lower() != "false"
+# 融合后进入重排的候选数。默认与重排候选数一致——**不额外抬高**：
+# 交叉编码器是整条检索链的瓶颈（实测每篇约 10 ms），抬一倍就多花一倍时间，
+# 而实测融合后目标块的排名已经很靠前（见上）。
+FUSED_CANDIDATES = int(os.getenv("HDW_RAG_FUSED_CANDIDATES", str(RERANK_CANDIDATES)))
+# 全文通道的运行状态，供 /health 暴露。
+# **回落必须是可见的**：集合建得早、没有 FTS 索引时，混合检索会静默退回
+# 纯向量——那就等于这次改动没生效，而 /health 上一切正常。这个项目已经
+# 栽过好几次「看着成功、实际没生效」的坑，所以状态要报出来。
+_LEXICAL_STATE = "unknown" if _LEXICAL_ENABLED else "disabled"
+_LEXICAL_FALLBACK_WARNED = False
 ZVEC_EMBED_BATCH_SIZE = max(1, int(os.getenv("HDW_ZVEC_EMBED_BATCH_SIZE", "8")))
 RAG_ADMIN_TOKEN = os.getenv("HDW_RAG_ADMIN_TOKEN", "").strip()
 _ZVEC_INIT_DONE = False
@@ -371,14 +395,52 @@ def _reindex_zvec(job_id: str = "") -> dict[str, Any]:
     return {"backend": "zvec+bge-m3", "indexed": indexed, "collection_path": str(ZVEC_PATH)}
 
 
+def _mark_lexical_ok() -> None:
+    global _LEXICAL_STATE
+    if _LEXICAL_STATE != "ok":
+        _LEXICAL_STATE = "ok"
+
+
+def _warn_lexical_fallback(exc: BaseException) -> None:
+    """全文通道不可用时提示一次（不刷屏），并把状态留给 /health。"""
+    global _LEXICAL_FALLBACK_WARNED, _LEXICAL_STATE
+    _LEXICAL_STATE = f"unavailable: {type(exc).__name__}: {exc}"
+    if _LEXICAL_FALLBACK_WARNED:
+        return
+    _LEXICAL_FALLBACK_WARNED = True
+    print(
+        f"[warn] 全文通道不可用，已回落到纯向量检索：{type(exc).__name__}: {exc}",
+        flush=True,
+    )
+
+
 def _search_zvec(query: str, top_k: int) -> list[RerankResult]:
     if not ZVEC_PATH.exists():
         raise RuntimeError("zvec index not found; run POST /admin/reindex")
     coll = _open_zvec_collection()
-    docs = coll.query(
-        zvec.VectorQuery("embedding", vector=_embed([query])[0]),
-        topk=max(top_k, RERANK_CANDIDATES),
-    )
+    limit = max(top_k, RERANK_CANDIDATES, FUSED_CANDIDATES)
+    # 用 `Query` 而不是原来的 `VectorQuery`：后者已被 zvec 标记为 deprecated
+    # （运行时会打 DeprecationWarning），且它是 `Query` 的子类，行为一致。
+    dense = zvec.Query("embedding", vector=_embed([query])[0])
+
+    docs = None
+    if _LEXICAL_ENABLED:
+        # 整句直接当字面查询丢进去即可，**不需要先拆词**：实测
+        # 「P.GAS.11对应的值是多少」与只喂「P.GAS.11」，目标块都排全文通道第 1。
+        lexical = zvec.Query("content", fts=zvec.Fts(match_string=query))
+        try:
+            docs = coll.query(
+                [dense, lexical], topk=limit, reranker=zvec.RrfReRanker()
+            )
+            _mark_lexical_ok()
+        except Exception as exc:  # noqa: BLE001
+            # 集合建得早、schema 里还没带上 FTS 索引时会走到这里。
+            # **必须回落到纯向量**：混合检索是为了多召回，不能因为它
+            # 把原本能用的检索整个弄挂——那比召不全严重得多。
+            _warn_lexical_fallback(exc)
+    if docs is None:
+        docs = coll.query(dense, topk=limit)
+
     candidates = [
         RerankDocument(
             id=doc.id,
@@ -388,6 +450,9 @@ def _search_zvec(query: str, top_k: int) -> list[RerankResult]:
                 "chunk_index": doc.field("chunk_index"),
                 "source_file": doc.field("source_file"),
                 "security_level": doc.field("security_level"),
+                # 召回的原始分。**混合检索下这是 RRF 融合分**（约 1/60 量级），
+                # 不再是向量距离——两者量纲不同，别拿它跟历史值比大小。
+                # 下游定序用的是外层 `score`（交叉编码器分），不是这个。
                 "retrieval_score": float(doc.score or 0.0),
             },
         )
@@ -409,6 +474,10 @@ def health() -> dict[str, Any]:
         "zvec_collection_path": str(ZVEC_PATH),
         "zvec_index_exists": ZVEC_PATH.exists(),
         "dim": EMBED_DIM,
+        # 全文通道是否真的在用。`unknown` = 还没查过（服务刚起），
+        # `ok` = 混合检索生效，`unavailable: ...` = 已静默回落到纯向量——
+        # 看到这个就说明本次改动没生效，要重建集合（POST /admin/reindex）。
+        "lexical": _LEXICAL_STATE,
     }
 
 

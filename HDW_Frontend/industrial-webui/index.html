@@ -7340,6 +7340,11 @@
               : modes[selectedMode].effort,
             inference_mode: inferenceMode,
             conversation_id: conversation?.id || null,
+            // 提问时刻（浏览器本地时钟，UTC ISO）。服务端容器走 UTC、没有 TZ，
+            // 光靠它自己的时钟会把「今天」「白班」整体算偏 8 小时——而这个偏差
+            // 从答案表面看不出来，只表现为「有时候答的是别的班次的事」。
+            // 服务端拿它当基准，偏差过大时会回落自己的时钟并留下来源标记。
+            client_time: new Date().toISOString(),
             messages: (conversation?.messages || []).map(({ role, content }) => ({
               role,
               content,

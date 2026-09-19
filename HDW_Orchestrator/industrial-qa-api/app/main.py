@@ -61,6 +61,10 @@ class QARequest(BaseModel):
     conversation_id: str | None = None
     messages: list[ChatMessage] = Field(default_factory=list)
     images: list[ImageAttachment] = Field(default_factory=list, max_length=4)
+    # 提问方的本地时刻（ISO-8601）。**可选**：老调用方不传就回落服务端时钟。
+    # 前端在用户手边，它的时钟才是用户看到的那个——容器时钟走 UTC 时
+    # 「今天几点」「哪个班次」会整体偏 8 小时，而这个偏差从答案表面看不出来。
+    client_time: str | None = Field(default=None, max_length=64)
     # 默认 False：老的调用方（含 /v1/chat/completions 的内部转发）行为不变。
     stream: bool = False
 
@@ -76,6 +80,8 @@ class InternalQARequest(BaseModel):
     question: str = Field(min_length=1, max_length=8000)
     top_k: int = Field(default=40, ge=1, le=40)
     inference_mode: Literal["online", "offline"] | None = None
+    # 同上：调用方若知道自己的本地时刻就带上。
+    client_time: str | None = Field(default=None, max_length=64)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -772,13 +778,13 @@ async def _mcp_call_tool(name: str, arguments: dict[str, Any]) -> Any:
 
 
 _PLANNER_PROMPT = (
-    "你是检索规划器。今天是 {today}（北京时间）。\n"
+    "你是检索规划器。现在是 {now}（北京时间，{shift}）。\n"
     "针对用户问题输出五行，不要解释、不要多余文字。用不到的写「无」：\n"
     "检索: yes 或 no   —— 是否需要查工业文档知识库（规程、参数、故障、操作、标准）\n"
     "测点: <关键词>[、<关键词>] 或 无   —— 是否需要读测点**当前值**\n"
     "历史: <关键词>|<起始日期>|<结束日期> 或 无   —— 是否需要测点**历史序列**\n"
     "趋势: <关键词>|<起始日期>|<结束日期>|<采样间隔秒> 或 无   —— 是否需要测点**变化趋势**\n"
-    "日志: <起始日期>|<结束日期>[|重大] 或 无   —— 是否需要查**运行日志**\n"
+    "日志: <起始日期>|<结束日期>|<重大或->|<班次或-> 或 无   —— 是否需要查**运行日志**\n"
     "\n"
     "判断依据（按语意，不要按关键词硬匹配）：\n"
     "· 「现在多少」「当前值」→ 测点；「昨天/过去三天/这段时间的变化」→ 历史；\n"
@@ -786,10 +792,14 @@ _PLANNER_PROMPT = (
     "  「有什么操作」「值班日志」「重大事件」「交接班记录」→ 日志。\n"
     "· 一个问句可以同时命中多项（例如「看看汽包水位的趋势，再结合规程说说」）。\n"
     "· 只要当前值就不要填历史或趋势，它们会各自触发一次数据查询。\n"
-    "· 日期一律写成 YYYY-MM-DD，相对时间按上面的今天换算；不确定结束日期就用今天。\n"
+    "· 日期一律写成 YYYY-MM-DD，相对时间按上面的当前时刻换算；不确定结束日期就用今天。\n"
     "· 趋势的采样间隔按问题的时间跨度选：一天用 300，三天用 900，一周用 1800。\n"
     "· 日志只在对方明确问运行记录时填；问规程、原理、参数含义时填「无」。\n"
-    "· 只说「重大」「重要」时在日志第三段写「重大」。\n"
+    "· **班次**：白班 08:30~16:30、中班 16:30~23:30、夜班 前日23:30~今日08:30。\n"
+    "  对方说「今天白班」「昨晚夜班」这类**带班次**的说法时，日期照常按日期段写，\n"
+    "  班次写在第四段（白班／中班／夜班）；不指定班次就写「-」。\n"
+    "  「昨天」若紧接「夜班」，指的是昨天 23:30 起、延续到今天 08:30 的那一段。\n"
+    "· 只说「重大」「重要」时在日志第三段写「重大」，否则写「-」。\n"
     # 关键词要短，但**不能丢掉区分性限定词**。
     # 踩过的坑：早先写的是「只描述物理量本身，不要带修饰语」，模型据此把
     # 「轴封供气压力」简化成「轴封压力」——而「供气」不是修饰语，是区分
@@ -823,7 +833,13 @@ _PLANNER_PROMPT = (
     "  测点: 无\n"
     "  历史: 无\n"
     "  趋势: 无\n"
-    "  日志: {yesterday}|{yesterday}|重大\n"
+    "  日志: {yesterday}|{yesterday}|重大|-\n"
+    "  问：今天白班有什么事\n"
+    "  检索: no\n"
+    "  测点: 无\n"
+    "  历史: 无\n"
+    "  趋势: 无\n"
+    "  日志: {today}|{today}|-|白班\n"
 )
 # 规划开关：模型判错时可不重建镜像直接关掉，退回「一律检索、不读测点」
 _ROUTER_ENABLED = os.getenv("HDW_RETRIEVAL_ROUTER", "true").lower() != "false"
@@ -833,8 +849,21 @@ _LIVE_POINT_CANDIDATES = int(os.getenv("HDW_LIVE_POINT_CANDIDATES", "5"))
 # 日志注入上限：一次抓取实测 118 条，全塞进上下文会挤占文档证据。
 # 按严重程度排序后取前 N 条，重大事件优先。
 _LOGS_MAX = int(os.getenv("HDW_LOGS_MAX", "40"))
+# 日志类问题（本轮不检索文档，日志就是答案主体）的上限。**0 = 不截断**。
+# 这类问题没有文档证据可挤占，截断只是让答案凭空少掉内容——实测抓 161 条
+# 只给 40 条时，用户看到的就是「总结太简略」。
+_LOGS_MAX_FULL = int(os.getenv("HDW_LOGS_MAX_FULL", "0"))
+# 向 MCP 日志工具要多少条。**不传 limit 会落到工具自己的默认值**
+# （log_query_recent 80 / log_query_range 120），再被上面的 _LOGS_MAX 截一刀——
+# 所以「抓 161 条只注入 40 条」里的 161，在中途已经先被压到 120 了。
+# 工具侧钳制上限是 500（recent / major_events）/ 800（range），取 500 用满。
+_LOGS_FETCH_LIMIT = int(os.getenv("HDW_LOGS_FETCH_LIMIT", "500"))
+# 班次刚开始的这段宽限期里，「还没有记录」是正常的，不算缺失。
+# 实测 16:34 查当天：中班 16:30 才开始 4 分钟，却被报成「缺中班记录」。
+_SHIFT_GRACE_MINUTES = int(os.getenv("HDW_SHIFT_GRACE_MINUTES", "30"))
 # 逐日工作摘要的行数上限。明细受 _LOGS_MAX 截断（实测一次抓 161 条、只注入 40 条），
 # 摘要负责体现全量规模，所以**条数统计来自全部事件**而不是截断后的那批。
+# 全量注入时明细已经给全了，逐日分栏会与它重复，此时只留计数行（见 _prompt）。
 _LOGS_DIGEST_LINES = int(os.getenv("HDW_LOGS_DIGEST_LINES", "120"))
 _LOGS_DIGEST_ITEMS = int(os.getenv("HDW_LOGS_DIGEST_ITEMS", "6"))
 
@@ -867,21 +896,126 @@ _LOG_COMPLETENESS_RULE = (
 )
 
 
-def _shift_context() -> str:
-    """当前时间 + 班次划分。
+# ── 班次划分。**现场交接在半点，不是整点**（实测班次表为 08:30 / 16:30 / 23:30），
+# 写成整点会让边界前后半小时的日志落到隔壁班次去。
+# 元组是 (名称, 起始分钟, 结束分钟)；跨零点的夜班起始 > 结束。
+_SHIFT_BOUNDS: tuple[tuple[str, int, int], ...] = (
+    ("夜班", 23 * 60 + 30, 8 * 60 + 30),
+    ("白班", 8 * 60 + 30, 16 * 60 + 30),
+    ("中班", 16 * 60 + 30, 23 * 60 + 30),
+)
+_WEEKDAYS = ("一", "二", "三", "四", "五", "六", "日")
+
+
+def _shift_of(moment: datetime) -> str:
+    """给定时刻属于哪个班次。"""
+    minute = moment.hour * 60 + moment.minute
+    for name, start, end in _SHIFT_BOUNDS:
+        if start > end:                       # 跨零点：落在 [start, 24h) 或 [0, end)
+            if minute >= start or minute < end:
+                return name
+        elif start <= minute < end:
+            return name
+    return "夜班"                             # 只可能是结束那一分钟，归夜班
+
+
+def _shift_window(shift: str, day: date) -> tuple[datetime, datetime]:
+    """某天某班次的起止时刻。夜班跨零点，结束落在次日。"""
+    for name, start, end in _SHIFT_BOUNDS:
+        if name != shift:
+            continue
+        midnight = datetime.combine(day, datetime.min.time())
+        begin = midnight + timedelta(minutes=start)
+        finish = midnight + timedelta(minutes=end)
+        if start > end:
+            finish += timedelta(days=1)
+        return begin, finish
+    raise ValueError(f"未知班次：{shift}")
+
+
+# 客户端时间戳与服务端时刻的最大容许偏差。**不能无条件信客户端**：
+# 浏览器时钟错乱（机器休眠后漂移、用户改过系统时间）会让「今天」「白班」
+# 整体偏掉，而答案表面看不出来——比服务端时区错更难排查。
+_CLIENT_TIME_MAX_SKEW = timedelta(
+    minutes=int(os.getenv("HDW_CLIENT_TIME_MAX_SKEW_MIN", "120"))
+)
+
+
+def _server_now() -> datetime:
+    """服务端北京时间（带 +08:00）。
+
+    容器**没有 TZ**，实测 `datetime.now()` 走 UTC（比北京时间慢 8 小时）。
+    所以这里显式加偏移，与 `_local_today()`、`_format_live_time()` 同一口径。
+    **不要退回裸 `datetime.now()`**——本文件此前唯一那样写的地方就是
+    `_shift_context()`，它把 15:24 报成了 07:24（夜班）。
+    """
+    return datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=_LIVE_TIME_OFFSET_HOURS))
+    )
+
+
+def _clock_now(client_time: str | None = None) -> tuple[datetime, str]:
+    """本次提问的「现在」+ 这个时刻的来源。
+
+    优先取客户端时间戳：浏览器就在提问的人手边，它的时钟才是用户看到的时间。
+    偏差超过 `_CLIENT_TIME_MAX_SKEW` 就回落服务端——见该常量的注释。
+
+    返回来源是为了**让回落这件事看得见**：静默改用服务端时钟的话，
+    「客户端时钟偏了 3 小时」从答案表面完全看不出来，只会表现为
+    「今天/白班偶尔答错」。诊断信息里带上它，下次一眼就能定位。
+    """
+    server = _server_now()
+    text = str(client_time or "").strip()
+    if not text:
+        return server, "server"
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return server, "server(客户端时间无法解析)"
+    # 不带时区的按 UTC 解释：前端发的是 `toISOString()`，本来就是 UTC 带 Z，
+    # 真出现裸时间时按本地时间解释反而会多算 8 小时。
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    moment = moment.astimezone(server.tzinfo)
+    if abs(moment - server) > _CLIENT_TIME_MAX_SKEW:
+        return server, "server(客户端时间偏差过大)"
+    return moment, "client"
+
+
+def _local_now(client_time: str | None = None) -> datetime:
+    """本次提问的「现在」，北京时间。只需要时刻时用它；要来源用 `_clock_now`。"""
+    return _clock_now(client_time)[0]
+
+
+def _now_context(now: datetime) -> str:
+    """把「现在」告诉模型。**与日志无关，每轮都要给**。
+
+    此前这段时间只在有日志时才注入，于是没日志的问答既不知道今天几号、
+    也不知道现在几点，「昨天」「今天上午」只能靠猜。
+    """
+    return (
+        f"\n\n当前时间：{now.strftime('%Y-%m-%d %H:%M')}"
+        f"（星期{_WEEKDAYS[now.weekday()]}，{_shift_of(now)}）。"
+        "用户说「今天」「昨天」「现在」时一律以这个时刻为准换算。"
+    )
+
+
+def _shift_context(now: datetime) -> str:
+    """班次划分 + 「未到来的班次没有记录是正常的」。
 
     日志按班次逐段产生：现在是白班，当天的中班记录自然还不存在。
-    不告诉模型这一点，它会把「还没发生」报成「数据缺失」。
+    不告诉模型这一点，它会把「还没发生」报成「数据缺失」——实测每次问
+    「今天有什么事」，答案开头都会挂一句「缺中班记录」，而那是正常的。
+
+    **只在有日志时注入**：它解释的是日志为什么缺段。
     """
-    now = datetime.now()
-    hour = now.hour
-    shift = "白班" if 8 <= hour < 16 else ("中班" if 16 <= hour < 23 else "夜班")
     return (
-        f"\n当前时间：{now.strftime('%Y-%m-%d %H:%M')}（{shift}）。"
-        "班次划分：夜班 前日23:00~今日08:00，白班 08:00~16:00，中班 16:00~23:00。"
+        "\n班次划分：夜班 前日23:30~今日08:30，白班 08:30~16:30，"
+        f"中班 16:30~23:30（现在是{_shift_of(now)}）。"
         "**当天的日志按班次逐段产生，尚未到来的班次没有记录是正常的**，"
         "不要当成数据缺失报出来。"
     )
+
 # 单次查询的时间跨度上限，防止规划器给出离谱区间导致 LIEMS 端长时间抓取
 _QUERY_MAX_DAYS = int(os.getenv("HDW_QUERY_MAX_DAYS", "7"))
 # 历史/趋势注入上下文时的压缩点数上限。实测单次可达 11063 点，
@@ -979,6 +1113,22 @@ def _plan_date(text: str) -> str:
         return ""
 
 
+def _plan_shift(text: str) -> str:
+    """把模型给的班次写法认成标准名；认不出或不限班次返回空串。
+
+    「-」「无」是提示词要求的「不限班次」写法，不是错误，不能当解析失败处理。
+    """
+    text = (text or "").strip()
+    if not text or text.lower() in _PLAN_EMPTY:
+        return ""
+    if any(word in text for word in ("全部", "不限", "所有", "全天", "整天")):
+        return ""
+    for name, _, _ in _SHIFT_BOUNDS:
+        if name in text:
+            return name
+    return ""
+
+
 def _clamp_range(start: str, end: str) -> tuple[str, str]:
     """把时间区间收进允许范围，并保证 start <= end。
 
@@ -998,7 +1148,8 @@ def _clamp_range(start: str, end: str) -> tuple[str, str]:
 
 
 def _local_today() -> date:
-    return (datetime.now(timezone.utc) + timedelta(hours=_LIVE_TIME_OFFSET_HOURS)).date()
+    """服务端的「今天」（北京时间）。与 `_local_now()` 同源，避免两处口径分叉。"""
+    return _server_now().date()
 
 
 def _fit_series(points: list[tuple[float, float]]) -> list[dict[str, Any]]:
@@ -1470,9 +1621,22 @@ def _parse_plan(text: str) -> dict[str, Any]:
                     _plan_date(parts[0] if parts else ""),
                     _plan_date(parts[1] if len(parts) > 1 else ""),
                 )
+                # 后两段是「重大」与「班次」，顺序固定但模型可能写少一段。
+                # 实测最容易出的错是把班次直接顶到第三段（`today|today|白班`）——
+                # 那样会被当成 major_only 的标记，班次就丢了、还白拿一批重大事件。
+                # 所以第三段按**内容**认：认得出是班次就挪到班次位。
+                tail = parts[2:]
+                shift = ""
+                for index, part in enumerate(tail):
+                    name = _plan_shift(part)
+                    if name:
+                        shift = name
+                        del tail[index]
+                        break
                 plan["logs"] = {
                     "start": start, "end": end,
-                    "major_only": any("重大" in part or "重要" in part for part in parts[2:]),
+                    "major_only": any("重大" in part or "重要" in part for part in tail),
+                    "shift": shift,
                 }
             continue
 
@@ -1566,7 +1730,11 @@ def _unsupported_numbers(answer: str, evidence_text: str) -> list[str]:
 _VISION_FORCE_RAG = os.getenv("HDW_VISION_FORCE_RAG", "true").lower() != "false"
 
 
-async def _plan_retrieval(question: str, mode: Literal["online", "offline"]) -> dict[str, Any]:
+async def _plan_retrieval(
+    question: str,
+    mode: Literal["online", "offline"],
+    now: datetime | None = None,
+) -> dict[str, Any]:
     """一次调用同时决定「要不要查文档」和「要取哪些实时数据」，判断发生在检索之前。
 
     极小调用：无证据、只出五行，实测约 200-400ms。
@@ -1576,8 +1744,13 @@ async def _plan_retrieval(question: str, mode: Literal["online", "offline"]) -> 
     """
     if not _ROUTER_ENABLED:
         return _empty_capabilities()
-    today = _local_today()
+    # 规划器此前只知道「今天是几号」，「今天白班」这类说法最多只能落到整天。
+    # 现在把时刻与班次一并给它，日期段照旧、班次落到新加的第四段。
+    moment = now or _local_now()
+    today = moment.date()
     prompt = _PLANNER_PROMPT.format(
+        now=moment.strftime("%Y-%m-%d %H:%M"),
+        shift=_shift_of(moment),
         today=today.isoformat(),
         yesterday=(today - timedelta(days=1)).isoformat(),
     )
@@ -1938,6 +2111,22 @@ async def _plan_rag(
 
 
 
+# 测点**不存在**（而不是取数失败）时的标记。生产处与消费处共用同一个常量——
+# 调用方要据此把「不检索」掰回「检索」，若各自 match 文案，改一次措辞就静默失效。
+_POINT_NOT_FOUND = "测点不存在"
+
+
+def _point_absent(realtime: dict[str, Any], errors: list[str]) -> bool:
+    """本轮要了测点、但一个都没取到，且原因是**这个测点不存在**。
+
+    区分「测点不存在」与「取数失败」很重要：后者重试一次可能就好，
+    前者重试多少次都一样，该换条路走（去知识库里找）。
+    """
+    if realtime.get("live_points"):
+        return False        # 取到了，问题本来就是问测点
+    return any(_POINT_NOT_FOUND in str(item) for item in errors)
+
+
 async def _resolve_point(
     keyword: str, mode: Literal["online", "offline"] = "offline"
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -1954,13 +2143,13 @@ async def _resolve_point(
     """
     candidates, error = await _search_point_candidates(keyword, mode)
     if error or not candidates:
-        return None, error or f"{keyword}: 测点表中无匹配项"
+        return None, error or f"{keyword}: {_POINT_NOT_FOUND}（测点表中无匹配项）"
 
     picked = await _pick_live_point(keyword, candidates, mode)
     for item in candidates:
         if str(item.get("kks")) == picked:
             return item, None
-    return None, f"{keyword}: 候选中无相关测点"
+    return None, f"{keyword}: {_POINT_NOT_FOUND}（候选中无相关测点）"
 
 
 def _shape_series(data: dict[str, Any], keyword: str, kind: str) -> dict[str, Any]:
@@ -2007,26 +2196,67 @@ async def _fetch_series(
     return _shape_series(data, keyword, kind), None
 
 
-def _logs_completeness_line(completeness: dict[str, Any]) -> str:
+def _shift_expected(shift: str, day: date, now: datetime) -> bool:
+    """`day` 那天的该班次是否**应该已经有记录**了。
+
+    上游的完整性判据是「三个班次全齐才算 complete」，**完全不看现在几点**——
+    白班时段查当天，中班和夜班尚未发生，于是每个日志类型都被判为不完整。
+    实测每次问「今天有什么事」，答案开头都挂着「缺中班记录」，而那段时间
+    根本还没到。这里按班次开始时刻把「还没到」摘出去。
+
+    **还要一段宽限期**：班次刚开始的几分钟里没有记录同样是正常的。
+    实测 16:34 查当天，中班 16:30 才开始 4 分钟，仍旧被报成「缺中班记录」——
+    摘掉「还没到」还不够，得摘掉「刚到」。
+    """
+    try:
+        begin, _ = _shift_window(shift, day)
+    except ValueError:
+        return True          # 认不出的名字就当它该有，照常报缺失
+    # 两边都是北京时间的墙上时钟，去掉时区直接比。
+    return now.replace(tzinfo=None) >= begin + timedelta(minutes=_SHIFT_GRACE_MINUTES)
+
+
+def _logs_completeness_line(completeness: dict[str, Any], now: datetime) -> str:
     """把日志完整性渲染成一行。
 
     结构：每天 → 各日志类型（值长／#1主值／#2主值／化学）→ 缺哪些班次。
     **只报缺失项**：全拿到的逐条念出来，这一行会比日志本身还长，
     而它唯一的作用就是提示「哪块数据不可信」。
+
+    「尚未到来的班次」不算缺失——见 `_shift_started`。
     """
     parts: list[str] = []
     for day in completeness.get("dates") or []:
         if not isinstance(day, dict):
             continue
+        date_text = str(day.get("date") or "").strip()
+        try:
+            day_date = date.fromisoformat(date_text)
+        except ValueError:
+            day_date = None          # 日期认不出就不过滤，宁可多报
         missing: list[str] = []
+        suppressed = 0
         for program in day.get("byProgram") or []:
             if not isinstance(program, dict) or program.get("complete"):
                 continue
             label = str(program.get("programLabel") or "日志").strip()
-            gone = "、".join(str(item) for item in (program.get("missingShifts") or []))
-            missing.append(f"{label}缺{gone or '部分班次'}")
-        date_text = str(day.get("date") or "").strip()
-        parts.append(f"{date_text} " + ("、".join(missing) if missing else "各类型各班次齐全"))
+            gone: list[str] = []
+            for item in program.get("missingShifts") or []:
+                name = str(item)
+                if day_date is not None and not _shift_expected(name, day_date, now):
+                    suppressed += 1
+                    continue
+                gone.append(name)
+            if gone:
+                missing.append(f"{label}缺{'、'.join(gone)}")
+        if missing:
+            parts.append(f"{date_text} " + "、".join(missing))
+        elif suppressed:
+            # 该报的都到了，只是还有班次没开始——说清楚，别让读的人
+            # 以为「齐全」是指一整天都齐了。
+            parts.append(f"{date_text} 截至当前班次已到的各类型齐全")
+        else:
+            parts.append(f"{date_text} 各类型各班次齐全")
     return "；".join(parts)
 
 
@@ -2059,23 +2289,107 @@ def _logs_failure_reason(data: dict[str, Any]) -> str:
     return ""
 
 
-async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-    """取运行日志。按规划给出的区间选择工具，只取重大事件时走 major_events。"""
+# 日志事件的班次代码 → 中文名。与 Log_Fetching 侧的 SHIFT_LABELS 一致。
+_SHIFT_CODES = {"YXBB": "白班", "YXZB": "中班", "YXYB": "夜班"}
+
+# 事件时刻的候选格式。LIEMS 返回的 `time` 是原样字符串，没有归一化：
+# 可能带日期、可能只有时刻、也可能为空。
+_EVENT_TIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+    "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M",
+)
+
+
+def _event_moment(event: dict[str, Any]) -> datetime | None:
+    """事件时刻；解析不出返回 None（**不猜**）。
+
+    `time` 可能自带日期，也可能只有 `HH:MM`——后者要用事件自带的 `date` 补。
+    """
+    text = str(event.get("time") or "").strip()
+    if not text:
+        return None
+    day = str(event.get("date") or "").strip()
+    candidates = [text] if re.search(r"\d{4}[-/.]\d{1,2}", text) else []
+    if day:
+        candidates.append(f"{day} {text}")
+    for candidate in candidates:
+        for fmt in _EVENT_TIME_FORMATS:
+            try:
+                return datetime.strptime(candidate, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def _event_shift(event: dict[str, Any]) -> str:
+    """事件属于哪个班次；判不出返回空串。
+
+    **两条腿，缺一不可**（实测）：
+    1. `shiftCode` 是**日志表主行**的班次（YXBB白／YXZB中／YXYB夜），
+       这正是「白班有什么事」想问的口径——一条 07:50 的事记在白班表里，
+       它就属于白班。但它只出现在**值班记事**与**主表关键字段**两类事件上。
+    2. **运行交代**与**接地线记录**的字典里根本没有这个键，而接地线全部标为
+       major——纯按 shiftCode 过滤会把这两类整体丢掉。对它们退回按时刻判定。
+
+    第 2 步同样不可尽信：主表关键字段的 `time` 是整张日志表的时间戳
+    （BFFORM_DTM），不是逐字段时间。所以判不出就返回空串，由调用方 fail-open。
+    """
+    code = str(event.get("shiftCode") or "").strip()
+    name = _SHIFT_CODES.get(code, "")
+    if name:
+        return name
+    moment = _event_moment(event)
+    return _shift_of(moment) if moment is not None else ""
+
+
+def _filter_events_by_shift(
+    events: list[dict[str, Any]], shift: str
+) -> tuple[list[dict[str, Any]], int]:
+    """只留指定班次的事件。返回 (保留的, 其中判不出班次的条数)。
+
+    **判不出的一律保留**（fail-open）：静默丢弃比多给更危险——接地线记录
+    全是重大事件，被过滤掉之后用户看到的是「这天没什么事」，
+    而缺的那块从答案表面完全看不出来。`unknown` 回传给提示词明示。
+    """
+    kept: list[dict[str, Any]] = []
+    unknown = 0
+    for event in events:
+        name = _event_shift(event)
+        if not name:
+            unknown += 1
+            kept.append(event)
+        elif name == shift:
+            kept.append(event)
+    return kept, unknown
+
+
+async def _fetch_logs(
+    spec: dict[str, Any],
+    full: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """取运行日志。按规划给出的区间选择工具，只取重大事件时走 major_events。
+
+    `full=True`（本轮不检索文档，日志就是答案主体）时不截断明细。
+    """
     start, end = str(spec.get("start") or ""), str(spec.get("end") or "")
     major_only = bool(spec.get("major_only"))
-    # 区间内天数决定用哪个工具：单日走 recent，跨日走 range。
-    # **不给 fetch_if_missing 以外的参数**——该参数默认已是 True，
-    # 日志模块不缓存，每次都是真实抓取（实测约 5.8 s）。
+    shift = _plan_shift(str(spec.get("shift") or ""))
+    # **必须显式传 limit**。不传就落到工具自己的默认值——实测
+    # log_query_recent 默认 80、log_query_range 默认 120，于是「抓 161 条」
+    # 在中途已经先被压到 120，再被 _LOGS_MAX 截到 40。工具侧钳制上限是
+    # 500（recent / major_events）/ 800（range），这里按 500 要。
+    limit = {"limit": max(1, _LOGS_FETCH_LIMIT)}
     try:
         today = _local_today().isoformat()
         if major_only:
             # major_events 只接受天数，不接受区间，按区间长度折算
             span = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
             data = await _mcp_call_tool(
-                "log_query_major_events", {"days": max(1, min(_QUERY_MAX_DAYS, span))}
+                "log_query_major_events",
+                {"days": max(1, min(_QUERY_MAX_DAYS, span)), **limit},
             )
         elif start == end and end == today:
-            data = await _mcp_call_tool("log_query_recent", {"days": 1})
+            data = await _mcp_call_tool("log_query_recent", {"days": 1, **limit})
         else:
             # **必须传 start_date / end_date，不能传 days**。
             # `log_query_range` 的签名是 (query_text, start_date, end_date, ...)，
@@ -2090,7 +2404,7 @@ async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
                     date.fromisoformat(end) - timedelta(days=_QUERY_MAX_DAYS - 1)
                 ).isoformat()
             data = await _mcp_call_tool(
-                "log_query_range", {"start_date": start, "end_date": end}
+                "log_query_range", {"start_date": start, "end_date": end, **limit}
             )
     except Exception as exc:
         return None, f"日志: {_exc_text(exc)}"
@@ -2102,11 +2416,48 @@ async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
     events = data.get("events") or []
     if not events:
         return None, "日志: 该时段无记录"
+    # 先在筛选**之前**记下原始规模：筛完班次之后仍要能看出「这一天一共多少条」。
+    raw_total = len(events)
+
+    # 班次筛选发生在截断**之前**：截断要作用在用户真正要看的那个班次上。
+    shift_unknown = 0
+    if shift:
+        events, shift_unknown = _filter_events_by_shift(events, shift)
+        if not events:
+            return None, f"日志: {start}~{end} 无{shift}记录（该时段其余事件均属其他班次）"
+
+    # 全量模式（日志类问题）不截断；其余维持 _LOGS_MAX，避免挤占文档证据。
+    # _LOGS_MAX_FULL 留了正值就可以收紧，便于不改代码回退。
+    cap = 0
+    if not full:
+        cap = max(0, _LOGS_MAX)
+    elif _LOGS_MAX_FULL > 0:
+        cap = _LOGS_MAX_FULL
+    ordered = sorted(
+        events,
+        key=lambda item: {"major": 0, "important": 1}.get(str(item.get("severity")), 2),
+    )
+    if cap > 0:
+        ordered = ordered[:cap]
+
     return {
         "kind": "logs",
         "start": start,
         "end": end,
         "major_only": major_only,
+        # 本次是否全量注入。提示词按它决定措辞与是否再渲染逐日分栏。
+        "full": full,
+        "shift": shift,
+        # 班次筛选时判不出班次、因而被保留的条数。**要明示**：
+        # 不说明的话，「白班」的答案里混进别班条目也看不出来。
+        "shift_unknown": shift_unknown,
+        "truncated": bool(cap) and len(ordered) < len(events),
+        # 本时段（**筛班次之前**）的总条数，与 summary.total_events 同源。
+        # 与 injected 分开是为了让「白班筛出 61 条」这句话里的分母
+        # （全厂合计 91 条）随时可查——合成一个数就说不清了。
+        "total_events": raw_total,
+        # 实际进入提示词的条数。截断与班次筛选之后的结果。
+        "injected": len(ordered),
         "summary": data.get("summary") or {},
         # 按天分好类的全量工作摘要。**工具已经算好了，之前一直没用**——
         # 明细受 _LOGS_MAX 截断（实测一次抓取 161 条、只注入 40 条），
@@ -2118,10 +2469,7 @@ async def _fetch_logs(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str 
         # 实测「最近五天」那次，模型根本不知道它只拿到了一天。
         "log_completeness": data.get("log_completeness") or {},
         # 118 条全量注入会挤占文档证据，按严重程度排序后截断
-        "events": sorted(
-            events,
-            key=lambda item: {"major": 0, "important": 1}.get(str(item.get("severity")), 2),
-        )[:_LOGS_MAX],
+        "events": ordered,
     }, None
 
 
@@ -2271,6 +2619,7 @@ async def _fetch_realtime(
     plan: dict[str, Any],
     mode: Literal["online", "offline"],
     progress: ProgressFn = _noop_progress,
+    logs_full: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     """并行取齐规划要求的全部实时数据。
 
@@ -2296,8 +2645,12 @@ async def _fetch_realtime(
     if plan.get("logs"):
         spec = plan["logs"]
         span = f"{spec.get('start')} ~ {spec.get('end')}"
-        tasks["logs"] = _fetch_logs(spec)
-        labels["logs"] = f"查询运行日志：{span}" + ("（仅重大事件）" if spec.get("major_only") else "")
+        tasks["logs"] = _fetch_logs(spec, full=logs_full)
+        labels["logs"] = (
+            f"查询运行日志：{span}"
+            + ("（仅重大事件）" if spec.get("major_only") else "")
+            + (f"（{spec['shift']}）" if spec.get("shift") else "")
+        )
     # 先报「要查什么」，再报「查到什么」。只报后者的话，在日志那 30 秒里
     # 用户看到的是上一句话停着不动——那正是最需要他看见在做事的时候。
     for name in tasks:
@@ -2372,11 +2725,12 @@ async def _retrieve_planned(
     *,
     has_images: bool = False,
     progress: ProgressFn = _noop_progress,
+    now: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     # 规划在检索之前：一次调用同时决定要不要查文档，以及要取哪几类实时数据
     # （测点当前值／历史序列／趋势／运行日志）。
     progress("plan", "分析问题、规划检索范围")
-    intent = await _plan_retrieval(_truncate_for_planner(question), mode)
+    intent = await _plan_retrieval(_truncate_for_planner(question), mode, now)
     # 把规划结论先报出来：后面几秒到几十秒的动作都是由它决定的，
     # 先说「打算做什么」，再看「做成了什么」，出问题时才知道该找哪一步。
     progress(
@@ -2401,25 +2755,44 @@ async def _retrieve_planned(
         forced_reason = "本轮带图"
         intent["needs_rag"] = True
 
+    preloaded: tuple[dict[str, Any], list[str]] | None = None
     if not intent["needs_rag"]:
-        realtime, rt_errors = await _fetch_realtime(intent, mode, progress)
-        plan = {
-            "rounds": 0,
-            "queries": [],
-            "top_k": 0,
-            "base_top_k": _graph_top_k(mode, top_k),
-            "reason": "模型判定无需检索知识库",
-            "planner": "model-router",
-            "no_retrieval": True,
-        }
-        return [], {
-            "plan": plan,
-            "rounds": [],
-            "deduplicated_count": 0,
-            "no_retrieval": True,
-            "live_errors": _live_errors(intent, rt_errors),
-            **realtime,
-        }
+        # 不检索文档，日志就是答案主体（问「今天有什么事」这类）——
+        # 截断只会让答案凭空少掉内容，全量给。
+        realtime, rt_errors = await _fetch_realtime(
+            intent, mode, progress, logs_full=True
+        )
+        if _point_absent(realtime, rt_errors):
+            # 规划器把它当成了「读某个测点的当前值」，而那个标识符**根本不是
+            # 本厂测点**——实测「P.GAS.11是多少」：「是多少」被判成读测点，而
+            # P.GAS.11 是运维手册里的参数名（SIS 映射表 607 个测点里没有这种
+            # 形式）。此时直接返回等于这次问答**什么都没查**：用户拿到一句
+            # 「没有取到实时值」，而手册里明明写着 >30 barg。
+            #
+            # 所以把「不检索」**单向掰回「检索」**，再走一遍正常链路。
+            # 判据是取数的**实际结果**，不是提问的措辞——本文件另一处
+            # （`_VISION_FORCE_RAG`）已写明：不用关键词启发式。
+            intent["needs_rag"] = True
+            forced_reason = "测点不存在，回退检索知识库"
+            preloaded = (realtime, rt_errors)
+        else:
+            plan = {
+                "rounds": 0,
+                "queries": [],
+                "top_k": 0,
+                "base_top_k": _graph_top_k(mode, top_k),
+                "reason": "模型判定无需检索知识库",
+                "planner": "model-router",
+                "no_retrieval": True,
+            }
+            return [], {
+                "plan": plan,
+                "rounds": [],
+                "deduplicated_count": 0,
+                "no_retrieval": True,
+                "live_errors": _live_errors(intent, rt_errors),
+                **realtime,
+            }
     plan, planning_error = await _plan_rag(question, mode, top_k)
     if forced_reason:
         # 覆写要留痕：否则「模型判了不检索、被网关拉回来」这件事在响应里看不出来，
@@ -2428,7 +2801,9 @@ async def _retrieve_planned(
     if plan.get("no_retrieval"):
         # 不检索也不查图谱：下游拿到空 contexts 会自然产出空 citations / graph_context，
         # 前端 addEvidence() 在两者都空时不渲染依据面板。
-        realtime, rt_errors = await _fetch_realtime(intent, mode, progress)
+        realtime, rt_errors = await _fetch_realtime(
+            intent, mode, progress, logs_full=True
+        )
         return [], {
             "plan": plan,
             "rounds": [],
@@ -2441,7 +2816,13 @@ async def _retrieve_planned(
     # **实时数据与检索并行**。二者互不依赖，且日志/历史抓取实测约 5.8 s，
     # 与检索轮次的 6 s 同量级——串行会让时延直接叠加，并发则相互掩盖，
     # 总耗时取决于较慢的一项而不是两者之和。
-    realtime_task = asyncio.create_task(_fetch_realtime(intent, mode))
+    if preloaded is not None:
+        # 上面已经取过一次（测点未命中的那次），**直接复用**：再跑一遍只会
+        # 得到同样的错误，白等一次测点/MCP 查询。
+        realtime_task: asyncio.Future = asyncio.get_running_loop().create_future()
+        realtime_task.set_result(preloaded)
+    else:
+        realtime_task = asyncio.create_task(_fetch_realtime(intent, mode))
 
     # **回退路径要压路数**。`_rag_route_order` 会把多路轮询分到两个远端节点，
     # 但**每个节点内部是完全串行的**：`_search_zvec` 每次请求都要拿
@@ -3647,6 +4028,7 @@ def _prompt(
     series: list[dict[str, Any]] | None = None,
     logs: dict[str, Any] | None = None,
     live_errors: list[str] | None = None,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     evidence = _evidence_block(contexts)
     graph = _graph_block(graph_rows)
@@ -3803,12 +4185,35 @@ def _prompt(
         ) or "无"
         head = (
             f"\n\n运行日志（{logs.get('start')} ~ {logs.get('end')}"
-            f"{'，仅重大事件' if logs.get('major_only') else ''}）：\n"
+            f"{'，仅重大事件' if logs.get('major_only') else ''}"
+            f"{'，' + str(logs.get('shift')) if logs.get('shift') else ''}）：\n"
             f"  合计 {summary.get('total_events', len(events))} 条，"
             f"其中重大 {summary.get('major_events', 0)} 条；分类：{categories}\n"
         )
+        # 班次筛选的口径与残留。**必须明示**：判不出班次而保留的事件混在
+        # 「白班」的答案里，不说明就看不出来。
+        if logs.get("shift"):
+            window = ""
+            try:
+                begin, finish = _shift_window(
+                    str(logs["shift"]), date.fromisoformat(str(logs.get("start")))
+                )
+                window = (
+                    f"（{begin.strftime('%m-%d %H:%M')}~{finish.strftime('%m-%d %H:%M')}）"
+                )
+            except ValueError:
+                # 日期缺失或格式不对时只省掉时段，**不能让拼提示词抛异常**——
+                # 那会把一次能答的问答变成 500。
+                pass
+            head += f"  班次筛选：已按{logs['shift']}{window}筛出 {len(events)} 条"
+            unknown = int(logs.get("shift_unknown") or 0)
+            if unknown:
+                head += f"，其中 {unknown} 条无明确班次信息、一并给出"
+            head += "。\n"
         # 完整性：哪些日志类型缺哪些班次。**不说清 = 把不完整的讲成完整的**。
-        completeness = _logs_completeness_line(logs.get("log_completeness") or {})
+        completeness = _logs_completeness_line(
+            logs.get("log_completeness") or {}, now or _local_now()
+        )
         if completeness:
             head += f"  日志完整性：{completeness}\n"
         # brief 与逐日分栏是两套说法，同时给会互相打架；有分栏时以分栏为准。
@@ -3819,6 +4224,11 @@ def _prompt(
         # 逐日分栏。**这段承载「全量」**：下面明细受 _LOGS_MAX 截断（实测抓 161 条
         # 只注入 40 条），看不到的那部分只能靠这里的条数体现——按天给，
         # 分「主要工作／两票／重要事件」三栏，与交接班口径一致。
+        #
+        # 全量注入时明细已经给全了，再逐条列分栏就是同一批内容出现两次，
+        # 白白占上下文。此时只留每天的计数行。
+        full = bool(logs.get("full"))
+        items_per_bucket = 0 if full else _LOGS_DIGEST_ITEMS
         day_lines: list[str] = []
         for day in days:
             if len(day_lines) >= _LOGS_DIGEST_LINES:
@@ -3834,7 +4244,7 @@ def _prompt(
                 ("ticket_work", "两票"),
                 ("main_work", "主要工作"),
             ):
-                for item in (day.get(bucket) or [])[:_LOGS_DIGEST_ITEMS]:
+                for item in (day.get(bucket) or [])[:items_per_bucket]:
                     if len(day_lines) >= _LOGS_DIGEST_LINES:
                         break
                     text = " ".join(
@@ -3856,12 +4266,14 @@ def _prompt(
                 f"{event.get('source') or ''}／{event.get('category') or ''}："
                 f"{str(event.get('content') or '').strip()}"
             )
-        logs_block = (
-            head
-            + "\n".join(day_lines)
-            + "\n\n  明细（按严重程度排序，受上限截断；完整条数以「合计」为准）：\n"
-            + "\n".join(detail_lines)
+        # 明细口径按模式写准：全量时再说「受上限截断」会让模型以为还有没看到的，
+        # 于是把「列出的这些」讲成「一部分」。
+        detail_note = (
+            "  全部明细（按严重程度排序）：\n"
+            if full
+            else "  明细（按严重程度排序，受上限截断；完整条数以「合计」为准）：\n"
         )
+        logs_block = head + "\n".join(day_lines) + "\n\n" + detail_note + "\n".join(detail_lines)
 
     # 未检索时不拼证据段落：一旦出现「检索证据：无」这类框架，模型会顺着去说
     # 「证据中没有」，而不是直接依据自身设定回答。
@@ -3909,6 +4321,9 @@ def _prompt(
         else ""
     )
 
+    # 本次提问的「现在」。上游没传就自己取服务端时钟——自检与旧调用方都走这条。
+    moment = now or _local_now()
+
     # 日志归纳规范。只在**本轮确实有日志**时注入：没日志还挂着这段，
     # 模型会去找根本不存在的日志内容（同样的道理见 image_rule）。
     log_rule = ""
@@ -3918,7 +4333,7 @@ def _prompt(
         if logs.get("log_completeness"):
             log_rule += _LOG_COMPLETENESS_RULE
         # 班次上下文跟着日志走：它解释的是「当天的日志为什么某几段没记录」。
-        log_rule += _shift_context()
+        log_rule += _shift_context(moment)
 
     if skip_retrieval:
         user = f"问题：{question}{image_block}{realtime_block}{live_error_block}"
@@ -3951,6 +4366,18 @@ def _prompt(
             "**某个具体定值在证据里没有时**，直接写「证据中未给出该定值」，"
             "不要用其它章节里数值相近的参数代替，也不要按经验估一个——"
             "替代值看起来和真值一模一样，读的人分辨不出来。"
+            # 实测：参数表被解析器压平成一行一串字段（见下），模型据此把
+            # `P.GAS.11 | * | PRESSURE | 燃气压力过高，报警 | >30-0.2 | barg`
+            # 读成「数值栏为空」，反而答「证据中未给出该定值」——数据明明在。
+            # 光有「不许挪用」的约束不够，还要告诉它**这张表该怎么对齐**。
+            "**参数表在证据里是被压平的**：形如 "
+            "`标识符 | * | 类型 | 描述 | 值 | 单位` 的一串字段，用 | 或换行分隔，"
+            "`*` 那段有时没有、各段宽度也不固定。"
+            "按**字段顺序**对齐：值就是紧跟在**描述**之后、**单位之前**的那一个。"
+            "例如 `P.GAS.11 | * | PRESSURE | 燃气压力过高，报警 | >30-0.2 | barg` "
+            "读作 P.GAS.11 的值为 >30-0.2 barg。"
+            "若某行描述之后直接就是单位（如 `P.GAS.17 | * | PRESSURE | ESV阀上游燃气压力过低，跳机 | barg`），"
+            "说明**那一行本身没有给值**，此时仍不许把相邻行的值挪过来。"
             "**证据之间数值不一致时**，把分歧原样列出来（各自的值与出处），"
             "不要自行挑一个当成唯一答案。"
             # 实测：问「滚动轴承温度最高不允许超过__℃，滑动轴承…__℃」，
@@ -3978,6 +4405,10 @@ def _prompt(
                 f"{live_error_rule}"
                 # 日志归纳规范同理放在主体之后：skip_retrieval 分支和正常分支都要有。
                 f"{log_rule}"
+                # 「现在几点」与日志无关，**两个分支都要有**。此前它藏在
+                # _shift_context 里、跟着 `if logs:` 走，于是没日志的问答
+                # 既不知道今天几号也不知道现在几点，「昨天」只能靠猜。
+                f"{_now_context(moment)}"
                 + (
                     "实时测点的采集时间已换算为北京时间，照抄即可，"
                     "不要附加时区后缀、不要另做时区换算或补充说明。"
@@ -4038,6 +4469,7 @@ async def _llm_answer(
     logs: dict[str, Any] | None = None,
     live_errors: list[str] | None = None,
     progress: ProgressFn = _noop_progress,
+    now: datetime | None = None,
 ) -> tuple[str, str, Any, str | None, dict[str, Any]]:
     if image_attachments:
         candidates, capability_errors = await _vision_candidates(
@@ -4093,6 +4525,7 @@ async def _llm_answer(
                 series=series,
                 logs=logs,
                 live_errors=live_errors,
+                now=now,
             )
             target_context_window = int(
                 candidate.get("context_window") or _context_window(selected_mode)
@@ -4265,6 +4698,7 @@ async def _answer(
     live_errors: list[str] | None = None,
     evidence_budget: int | None = None,
     progress: ProgressFn = _noop_progress,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     selected_mode = _resolve_inference_mode(inference_mode)
     llm_contexts = _llm_contexts(selected_mode, contexts, evidence_budget)
@@ -4289,6 +4723,7 @@ async def _answer(
         series=series,
         logs=logs,
         live_errors=live_errors,
+        now=now,
         progress=progress,
     )
     # 数字核对：把答案里的数与送进提示词的那批证据对一遍。
@@ -4731,6 +5166,8 @@ async def _qa_pipeline(
     req: "QARequest",
     image_attachments: list[dict[str, str]],
     selected_mode: Literal["online", "offline"],
+    now: datetime,
+    clock_source: str = "server",
 ) -> AsyncIterator[dict[str, Any]]:
     """跑完整条链路，途中 yield 进度事件，最后 yield `{"result": ...}`。
 
@@ -4772,6 +5209,7 @@ async def _qa_pipeline(
             req.top_k,
             has_images=bool(image_attachments),
             progress=progress,
+            now=now,
         )
     )
     async for event in _stream_until(retrieval_task, queue):
@@ -4780,6 +5218,10 @@ async def _qa_pipeline(
         else:
             yield event
     rag_info["vision"] = _vision_diagnostics(vision_info)
+    # 把「这次按哪个时刻理解相对时间」留在诊断里。答错「今天」「白班」时，
+    # 第一个要看的就是它——客户端时钟偏了会静默回落服务端，不留痕就查不出来。
+    rag_info["clock"] = {"now": now.strftime("%Y-%m-%d %H:%M:%S"),
+                         "shift": _shift_of(now), "source": clock_source}
     history, conversation_data = _conversation_messages(user["code"], req.conversation_id, req.messages)
     if history and history[-1]["role"] == "user" and history[-1]["content"] == question:
         history = history[:-1]
@@ -4810,6 +5252,7 @@ async def _qa_pipeline(
                 selected_mode, len((rag_info.get("plan") or {}).get("queries") or []) or 1
             ),
             progress=progress,
+            now=now,
         )
     )
     # 生成阶段本身没有中间产物，但图谱查询和历史选留都在这个任务里，
@@ -4852,12 +5295,16 @@ async def qa_query(
         )
     # 校验全部留在生成器**外面**：这样 403/422 仍是真实的 HTTP 状态码，
     # 而不会变成流里的一个错误事件（前端处理前者要简单得多）。
+    # 提问时刻在这里定一次，往下只传结果——「现在几点」全链路只能有一个答案。
+    now, clock_source = _clock_now(req.client_time)
     pipeline = _qa_pipeline(
         question=question,
         user=user,
         req=req,
         image_attachments=image_attachments,
         selected_mode=selected_mode,
+        now=now,
+        clock_source=clock_source,
     )
 
     if not req.stream:
@@ -4916,9 +5363,16 @@ async def internal_qa_query(
     pipeline = _qa_pipeline(
         question=question,
         user=_API_SERVICE_IDENTITY,
-        req=QARequest(question=question, top_k=req.top_k, inference_mode=selected_mode),
+        req=QARequest(
+            question=question,
+            top_k=req.top_k,
+            inference_mode=selected_mode,
+            client_time=req.client_time,
+        ),
         image_attachments=[],
         selected_mode=selected_mode,
+        now=_local_now(req.client_time),
+        clock_source="server",
     )
     async for event in pipeline:
         if "result" in event:
@@ -5023,20 +5477,94 @@ def _self_check() -> None:
     # 日志归纳规范：有日志才注入，且完整性/班次上下文跟着走。
     _sys_with_logs = _prompt("q", [], logs=_logs_fixture)[0]["content"]
     assert "按下面的口径归纳" in _sys_with_logs, "日志归纳规范没注入"
-    assert "当前时间：" in _sys_with_logs and "夜班 前日23:00~今日08:00" in _sys_with_logs, "班次上下文没注入"
+    assert "当前时间：" in _sys_with_logs, "当前时刻没进提示词"
+    assert "白班 08:30~16:30" in _sys_with_logs, "班次划分没注入"
     assert "缺哪些日志类型、缺哪些班次必须如实说明" not in _sys_with_logs, "没有完整性数据时不该加完整性专项"
     _no_logs_sys = _prompt("q", [])[0]["content"]
     assert "按下面的口径归纳" not in _no_logs_sys, "没日志时不该注入日志规范"
-    assert "当前时间：" not in _no_logs_sys, "没日志时不该注入班次上下文"
-    # 完整性行：只报缺失项
-    _comp = _logs_completeness_line({"dates": [
+    # 「现在几点」与日志无关，**两个分支都要有**：没日志的问答同样要能换算
+    # 「昨天」「今天上午」。此前它藏在 _shift_context 里跟着 `if logs:` 走，
+    # 于是没有日志时模型既不知道今天几号也不知道现在几点。
+    assert "当前时间：" in _no_logs_sys, "没日志时也该注入当前时刻"
+    assert "班次划分：" not in _no_logs_sys, "没日志时不该注入班次划分"
+
+    # 班次判定：半点交接，跨零点的夜班不能算错
+    assert _shift_of(datetime(2026, 9, 15, 8, 29)) == "夜班", "08:29 应属夜班"
+    assert _shift_of(datetime(2026, 9, 15, 8, 30)) == "白班", "08:30 应属白班"
+    assert _shift_of(datetime(2026, 9, 15, 16, 29)) == "白班", "16:29 应属白班"
+    assert _shift_of(datetime(2026, 9, 15, 16, 30)) == "中班", "16:30 应属中班"
+    assert _shift_of(datetime(2026, 9, 15, 23, 29)) == "中班", "23:29 应属中班"
+    assert _shift_of(datetime(2026, 9, 15, 23, 30)) == "夜班", "23:30 应属夜班"
+    assert _shift_of(datetime(2026, 9, 16, 0, 30)) == "夜班", "跨零点后仍是夜班"
+    assert _shift_window("夜班", date(2026, 9, 15))[1].day == 16, "夜班结束落次日"
+    assert _plan_shift("白班") == "白班" and _plan_shift("-") == "" and _plan_shift("全部") == ""
+
+    # 班次筛选：有 shiftCode 的按码判，没有的退回按时刻判，**判不出的一律保留**
+    _ev = [
+        {"shiftCode": "YXBB", "time": "07:50:00", "date": "2026-09-15"},   # 表属白班
+        {"shiftCode": "YXZB", "time": "17:00:00", "date": "2026-09-15"},   # 表属中班
+        {"time": "10:00:00", "date": "2026-09-15"},                        # 无码，按时刻→白班
+        {"time": "", "date": "2026-09-15"},                                # 判不出→保留
+        {"time": "03:00:00", "date": "2026-09-15"},                        # 无码，按时刻→夜班
+    ]
+    _kept, _unknown = _filter_events_by_shift(_ev, "白班")
+    assert len(_kept) == 3 and _unknown == 1, f"班次筛选不对：留 {len(_kept)}、未知 {_unknown}"
+
+    # 完整性行：只报缺失项，且**尚未到来的班次不算缺失**
+    _completeness = {"dates": [
         {"date": "2026-09-15", "byProgram": [
             {"programLabel": "值长日志", "complete": True, "missingShifts": []},
             {"programLabel": "化学日志", "complete": False, "missingShifts": ["夜班"]},
         ]},
-    ]})
+    ]}
+    _comp = _logs_completeness_line(_completeness, datetime(2026, 9, 16, 2, 0))
     assert _comp == "2026-09-15 化学日志缺夜班", _comp
-    assert _logs_completeness_line({}) == ""
+    # 10:00 是白班：中班（16:30 开始）与夜班（23:30 开始）都还没到，不该报成缺失
+    _comp = _logs_completeness_line(
+        {"dates": [{"date": "2026-09-15", "byProgram": [
+            {"programLabel": "化学日志", "complete": False,
+             "missingShifts": ["白班", "中班", "夜班"]},
+        ]}]},
+        datetime(2026, 9, 15, 10, 0),
+    )
+    assert _comp == "2026-09-15 化学日志缺白班", _comp
+    # 该到齐的都到齐、只是还有班次没开始——不能写成「各类型各班次齐全」
+    _comp = _logs_completeness_line(
+        {"dates": [{"date": "2026-09-15", "byProgram": [
+            {"programLabel": "化学日志", "complete": False, "missingShifts": ["中班", "夜班"]},
+        ]}]},
+        datetime(2026, 9, 15, 10, 0),
+    )
+    assert _comp == "2026-09-15 截至当前班次已到的各类型齐全", _comp
+    assert _logs_completeness_line({}, datetime(2026, 9, 15, 10, 0)) == ""
+    # 班次**刚到**也不能算缺失。实测踩到：16:34 查当天，中班 16:30 才开始
+    # 4 分钟，照样被报成「缺中班记录」——只摘「还没到」不够，还要摘「刚到」。
+    assert not _shift_expected("中班", date(2026, 9, 15), datetime(2026, 9, 15, 16, 34)), \
+        "中班刚开始几分钟不该算缺失"
+    assert _shift_expected("中班", date(2026, 9, 15), datetime(2026, 9, 15, 17, 5)), \
+        "过了宽限期就该算缺失"
+    assert not _shift_expected("夜班", date(2026, 9, 15), datetime(2026, 9, 15, 23, 40)), \
+        "夜班刚到也不算缺失"
+
+    # 客户端时间戳：正常用客户端，偏差过大回落服务端并**留下痕迹**。
+    # 基准取「服务端现在」——写死日期的话，脚本放到几天后跑就成了偏差过大，
+    # 断言会莫名其妙地红。
+    _client = _server_now() + timedelta(minutes=30)
+    _cnow, _csrc = _clock_now(_client.isoformat())
+    assert _csrc == "client", f"客户端时刻没被采纳：{_csrc}"
+    assert abs(_cnow - _client) < timedelta(seconds=1), f"采纳的时刻不对：{_cnow}"
+    _, _csrc = _clock_now((_server_now() + timedelta(hours=5)).isoformat())
+    assert _csrc.startswith("server"), f"偏差过大应回落服务端：{_csrc}"
+    _, _csrc = _clock_now((_server_now() - timedelta(hours=5)).isoformat())
+    assert _csrc.startswith("server"), f"偏差过大（偏慢）也应回落：{_csrc}"
+    _, _csrc = _clock_now("不是时间")
+    assert _csrc.startswith("server"), f"解析失败应回落服务端：{_csrc}"
+    # 服务端时钟必须是北京时间：容器没有 TZ，裸 datetime.now() 会走 UTC。
+    # 这正是本次「15:24 被报成 07:24（夜班）」的根因。
+    _now_offset = (_server_now().replace(tzinfo=None)
+                   - datetime.now(timezone.utc).replace(tzinfo=None))
+    assert timedelta(hours=7) < _now_offset < timedelta(hours=9), \
+        f"服务端时刻不在 UTC+8：偏移 {_now_offset}"
     _with_comp = dict(_logs_fixture)
     _with_comp["log_completeness"] = {"dates": [{"date": "2026-09-15", "byProgram": []}]}
     assert "日志完整性：" in _prompt("q", [], logs=_with_comp)[-1]["content"], "完整性行没渲染"
@@ -5063,12 +5591,43 @@ def _self_check() -> None:
     try:
         asyncio.run(_fetch_logs({"start": "2026-09-11", "end": "2026-09-16", "major_only": False}))
         assert _sent[0][0] == "log_query_range", _sent
-        assert _sent[0][1] == {"start_date": "2026-09-11", "end_date": "2026-09-16"}, _sent
+        # **limit 必须显式传**：不传就落到工具默认值（range 是 120），
+        # 「抓 161 条」在中途已经先被压到 120，再被 _LOGS_MAX 截到 40。
+        # 参数少传一个同样不报错、只是结果变少，只能靠断言拦。
+        assert _sent[0][1] == {"start_date": "2026-09-11", "end_date": "2026-09-16",
+                               "limit": _LOGS_FETCH_LIMIT}, _sent
         _sent.clear()
         asyncio.run(_fetch_logs({"start": "2026-09-11", "end": "2026-09-16", "major_only": True}))
-        assert _sent[0][0] == "log_query_major_events" and _sent[0][1] == {"days": 6}, _sent
+        assert _sent[0][0] == "log_query_major_events", _sent
+        assert _sent[0][1] == {"days": 6, "limit": _LOGS_FETCH_LIMIT}, _sent
     finally:
         globals()["_mcp_call_tool"] = _orig_mcp
+
+    # 全量模式：日志类问题不截断，且提示词不再说「受上限截断」
+    _many = [{"time": f"{h:02d}:00:00", "date": "2026-09-15", "source": "运行",
+              "category": "启停", "severity": "normal", "content": f"第 {h} 条"}
+             for h in range(_LOGS_MAX + 5)]
+    _full_fixture = dict(_logs_fixture)
+    _full_fixture["events"] = _many
+    _full_fixture["full"] = True
+    _full_fixture["work_digest"] = {}
+    _full_body = _prompt("q", [], logs=_full_fixture)[-1]["content"]
+    assert f"[日志 {len(_many)}]" in _full_body, "全量模式漏事件"
+    assert "受上限截断" not in _full_body, "全量模式不该再说被截断"
+    # 非全量：截断说明必须在，且逐日分栏照旧渲染
+    _part_fixture = dict(_logs_fixture)
+    _part_fixture["full"] = False
+    _part_body = _prompt("q", [], logs=_part_fixture)[-1]["content"]
+    assert "受上限截断" in _part_body, "非全量模式要说清被截断"
+    assert "〔主要工作〕08:00 运行：循环水泵启动" in _part_body, "非全量模式分栏明细应保留"
+
+    # 班次筛选的措辞：命中条数与「无班次信息」都要说出来
+    _shift_fixture = dict(_logs_fixture)
+    _shift_fixture["shift"] = "白班"
+    _shift_fixture["shift_unknown"] = 2
+    _shift_body = _prompt("q", [], logs=_shift_fixture)[-1]["content"]
+    assert "班次筛选：已按白班" in _shift_body, "班次口径没进提示词"
+    assert "2 条无明确班次信息" in _shift_body, "保留下来的未知班次条数没说明"
     # 规划解析：检索无法判定返回 None（调用方保守按「需要检索」），测点无法判定返回空列表
     # 规划解析：返回结构化意图字典。检索无法判定为 None（调用方保守按「需要检索」），
     # 各项无法判定为 None 或空列表。
@@ -5239,6 +5798,29 @@ def _self_check() -> None:
     ).days < _QUERY_MAX_DAYS
     _p = _parse_plan("检索: no\n测点: 无\n历史: 无\n趋势: 无\n日志: 2026-09-13|2026-09-10")
     assert _p["logs"]["start"] <= _p["logs"]["end"]
+    # 日志行的后两段：重大 / 班次。旧的三段式（无班次）必须照常解析。
+    _p = _parse_plan("检索: no\n测点: 无\n历史: 无\n趋势: 无\n日志: 2026-09-13|2026-09-13|-|白班")
+    assert _p["logs"]["shift"] == "白班" and _p["logs"]["major_only"] is False, _p["logs"]
+    _p = _parse_plan("检索: no\n测点: 无\n历史: 无\n趋势: 无\n日志: 2026-09-13|2026-09-13|重大|-")
+    assert _p["logs"]["shift"] == "" and _p["logs"]["major_only"] is True, _p["logs"]
+    _p = _parse_plan("检索: no\n测点: 无\n历史: 无\n趋势: 无\n日志: 2026-09-13|2026-09-13|重大")
+    assert _p["logs"]["shift"] == "" and _p["logs"]["major_only"] is True, _p["logs"]
+    # 模型偶尔会把班次顶到第三段。**按内容认，不能按位置认**——
+    # 当成长标记的话班次丢了，还白拿一批重大事件（结果变少又不报错的老毛病）。
+    _p = _parse_plan("检索: no\n测点: 无\n历史: 无\n趋势: 无\n日志: 2026-09-13|2026-09-13|白班")
+    assert _p["logs"]["shift"] == "白班" and _p["logs"]["major_only"] is False, _p["logs"]
+
+    # 测点不存在 → 把「不检索」掰回「检索」。**只在「一个都没取到」且原因是
+    # 「不存在」时触发**：取数失败不触发（重试可能就好）、取到了更不触发。
+    assert _point_absent({}, [f"P.GAS.11: {_POINT_NOT_FOUND}（测点表中无匹配项）"])
+    assert _point_absent({}, [f"x: {_POINT_NOT_FOUND}（候选中无相关测点）"])
+    assert not _point_absent({"live_points": [{"kks": "A"}]},
+                             [f"x: {_POINT_NOT_FOUND}"])
+    assert not _point_absent({}, ["x: ReadTimeout"])
+    assert not _point_absent({}, [])
+    # 标记必须真的出现在 _resolve_point 的两条失败路径上——文案改了断言才会红
+    _src = __file__ and open(__file__, encoding="utf-8").read()
+    assert _src.count(f"{{_POINT_NOT_FOUND}}") >= 2, "测点不存在的两条路径没打标记"
     # 序列抽稀必须保留首尾两点——它们最能说明「现在处于什么水平」
     _samples = [{"time": f"t{i}", "value": i} for i in range(644)]
     _thin = _thin_samples(_samples, _SERIES_MAX_POINTS)

@@ -8,7 +8,7 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
 <项目根>
 ```
 
-本文档以当前代码和 Compose 配置为准，更新时间：2026-09-18。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
+本文档以当前代码和 Compose 配置为准，更新时间：2026-09-19。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
 
 ## 1. 设计原则
 
