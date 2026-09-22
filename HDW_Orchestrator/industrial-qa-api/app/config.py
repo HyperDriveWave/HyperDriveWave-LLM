@@ -72,7 +72,7 @@ class Settings:
     # 明写「MinerU may spend many minutes on large OCR PDFs; do not impose a
     # client deadline」——那是批处理，调用方是任务队列，没人在等。问答路径
     # **有用户在等**，且一次挂起的请求会占住一个 httpx 连接和一个 asyncio 任务。
-    # 实测单页卷子图约 17 s，180 s 留了充足余量又不至于挂死。
+    # 实测单页材料图约 17 s，180 s 留了充足余量又不至于挂死。
     mineru_timeout = float(os.getenv("HDW_MINERU_TIMEOUT", "180"))
     # MinerU 是单并发（max_concurrent_requests=1）。队列里已有任务时直接放弃
     # 这个候选，而不是排在知识库入库任务后面等几分钟——失败快、可预期。

@@ -1713,7 +1713,7 @@ def _unsupported_numbers(answer: str, evidence_text: str) -> list[str]:
 
 # ── 检索闸门：带图必须走知识库 ──
 #
-# 实测：用户传一张试卷照片问「做一下这张卷子」，规划器只看到这句纯文本，
+# 实测：用户传一张材料照片问「做一下这份材料」，规划器只看到这句纯文本，
 # 判不出知识需求 → `检索: no` → `_retrieve_planned` 直接返回空 contexts，
 # `_plan_rag` 与多轮检索根本不执行。6/6 次都这样，是确定性误判不是抖动。
 # 后果不是「答得糙」，是模型手里一份证据都没有，只能用自己的常识答题——
@@ -1723,11 +1723,31 @@ def _unsupported_numbers(answer: str, evidence_text: str) -> list[str]:
 # 修法是**只向「要检索」单向覆写**：带图时把 False 改成 True。
 # 反向不成立，所以「你好」「今天天气怎么样」这类正确跳过在结构上不可能被破坏。
 #
-# **刻意不按关键词判断提问类型**。曾经写过一份「试卷专有词」表，
-# 但那是错的方向：本系统要的是「判断该不该检索」这个**能力**，试卷只是它的
+# **刻意不按关键词判断提问类型**。曾经写过一份「材料专有词」表，
+# 但那是错的方向：本系统要的是「判断该不该检索」这个**能力**，材料只是它的
 # 一个用例。词表对换种问法就失效，而且规则散落在这里长不了。
 # README 的「设计要点」里已经为路由写过同样的结论：不用关键词启发式。
 _VISION_FORCE_RAG = os.getenv("HDW_VISION_FORCE_RAG", "true").lower() != "false"
+
+
+def _no_thinking_kwargs(mode: str) -> dict[str, Any]:
+    """给「要逐行解析的结构化输出」这类调用的**关思考**参数。
+
+    规划检索意图、挑测点、拆检索查询、转写图片——这五处要的都是**确定的、
+    能被逐行解析的输出**，思考过程对它们只有害处：解析器会把推理当成正文收下。
+    在线档尤其严重（见下）。
+
+    **两种模式都必须关，这正是此前漏掉的那一半**：这五处原来一律写
+    `chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None`，
+    离线关、在线传 None 等于不关。而在线模型默认开着思考，于是它的推理直接
+    进了下游解析器。实测一次处理长材料：拆查询那一步返回 60 条，其中
+    36 条是「我们需要生成查询列表…」「二、简答：」这类自述，被当成检索查询
+    发了出去——把 120 条证据预算占满、把真正的题目挤到每路只剩 2 个名额，
+    表现为「准确率下降」。离线档一直没这个问题，所以此前没被发现。
+    """
+    if mode == "offline":
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {"thinking_enabled": False}
 
 
 async def _plan_retrieval(
@@ -1767,7 +1787,7 @@ async def _plan_retrieval(
                 # 五行实测约 40-60 个令牌，留一倍余量。
                 max_tokens=160,
                 temperature=0.0,
-                chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
+                **_no_thinking_kwargs(mode),
             )
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"
@@ -1821,7 +1841,7 @@ async def _pick_live_point(
             ],
             max_tokens=24,
             temperature=0.0,
-            chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
+            **_no_thinking_kwargs(mode),
         )
     except Exception:
         return None
@@ -1855,7 +1875,7 @@ async def _point_aliases(keyword: str, mode: Literal["online", "offline"]) -> li
             ],
             max_tokens=64,
             temperature=0.0,
-            chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
+            **_no_thinking_kwargs(mode),
         )
     except Exception:
         return []
@@ -1961,7 +1981,7 @@ def _round_robin_by_round(contexts: list[dict[str, Any]]) -> list[dict[str, Any]
     """按检索轮次轮转取一条，组内保持原（分数）顺序。
 
     为什么需要：合并后的排序键是 `(score, -round, -position)`，纯按分数。
-    简答题那组往往条数多、分数高，会把填空题那组的证据整体挤出窗口——
+    某一路往往条数多、分数高，会把别路的证据整体挤出窗口——
     而 `_llm_contexts` 是**头切**，所以只要重排，头 N 条自然组组有份。
     重排而不新增截断点，是为了不动既有那两条对 `_llm_contexts` 的断言。
     """
@@ -1992,11 +2012,11 @@ def _round_robin_by_round(contexts: list[dict[str, Any]]) -> list[dict[str, Any]
 #
 # 之前这里是两条启发式（MCP 的 `rag_query_plan` 用关键词表 + 正则切分），
 # 都换掉了。原因不是它们不准，是**方向错了**：本系统要的是「判断该怎么检索」
-# 这个能力，而不是「识别试卷」这个特例。规则对换种问法就失效，而且散落在
+# 这个能力，而不是「识别材料类型」这个特例。规则对换种问法就失效，而且散落在
 # 代码里长不了——README 的「设计要点」早已为路由写过同样的结论。
 #
 # 由模型决定的好处是它天然按**内容**切：一段材料里有一个问题就出一条，
-# 有一份含多道题的卷子就按题出，一份并列的小问就按小问出。
+# 一份含多个问题的材料就按问题出，一份并列的小问就按小问出。
 # 不需要任何人预先定义「什么算多问」。
 _RAG_QUERY_PLAN_PROMPT = (
     "你在为知识库检索拆查询。把用户要回答的内容拆成若干条**各自独立**的"
@@ -2023,8 +2043,20 @@ _RAG_MAX_QUERIES = int(os.getenv("HDW_RAG_MAX_QUERIES", "60"))
 # 每一路取几条证据。总量靠 `_retrieval_evidence_budget` 兜底。
 _RAG_QUERY_TOP_K = int(os.getenv("HDW_RAG_QUERY_TOP_K", "8"))
 # 证据总预算的上限。一路约 400 字，80 条约 3 万字，离上下文上限还很远。
-_RAG_ONLINE_EVIDENCE_CAP = int(os.getenv("HDW_RAG_ONLINE_EVIDENCE_CAP", "120"))
-_RAG_LOCAL_EVIDENCE_CAP = int(os.getenv("HDW_RAG_LOCAL_EVIDENCE_CAP", "80"))
+# 证据总条数上限。**它们只在路数很多时才生效**：预算公式是
+# `max(base, min(cap, 轮数 × _RAG_QUERY_TOP_K))`，单路时取 base、几路时取
+# 轮数×8，都远低于 cap。实测：离线档 cap=80 时，10 路以内完全不受影响，
+# 11 路起才被卡住。
+#
+# **原来卡得太死**：一份 24 路的材料（每个问题一路），80 条只能给每路 3.3 个
+# 名额，而 `_llm_contexts` 是头切——每路第 4 条之后全被切掉。实测第 10 题
+# 「发电机碳刷最高温度」的证据在它那一路排第 5，就此丢失，答案成了
+# 「证据中未给出该定值」，而库里写着「碳刷最高温度不得超过100℃」。
+#
+# 上调后仍受模型上下文约束（离线 262k、在线 1M），且**多路才受影响**，
+# 是可控的取舍：一份长材料本来就该拿到成比例的证据。
+_RAG_ONLINE_EVIDENCE_CAP = int(os.getenv("HDW_RAG_ONLINE_EVIDENCE_CAP", "240"))
+_RAG_LOCAL_EVIDENCE_CAP = int(os.getenv("HDW_RAG_LOCAL_EVIDENCE_CAP", "160"))
 # 落到本机 CPU RAG（串行，实测 7.5 s/路）时，最多保留几路检索。
 # 远端 GPU 节点可用时不生效——那边 8 路并发只要 3.7 s，没必要压。
 _RAG_FALLBACK_ROUTE_CAP = int(os.getenv("HDW_RAG_FALLBACK_ROUTE_CAP", "2"))
@@ -2032,6 +2064,41 @@ _RAG_FALLBACK_ROUTE_CAP = int(os.getenv("HDW_RAG_FALLBACK_ROUTE_CAP", "2"))
 # 模型偶尔会加行首编号，或者在行尾带解释。剥掉编号；解释留着也无害
 # （检索器对长句本来就有截断），所以不做更激进的清洗。
 _QUERY_PREFIX = re.compile(r"^\s*(?:[-*·]\s*|\d{1,2}\s*[.、．)）]\s*)")
+# 判定「这一行是不是思考」的阈值。见 `_looks_like_query`。
+_QUERY_MAX_CHARS = int(os.getenv("HDW_RAG_QUERY_MAX_CHARS", "60"))
+# 查询是短名词短语，不会以句末标点或冒号结尾；自述会。
+_QUERY_TAIL_REJECT = "。！？!?：:"
+
+
+# 行内被引号括起来的那一段。在线档会把查询写在引号里，前后裹着自述。
+_QUERY_QUOTED = re.compile(r'[“"「]([^”"」]{4,60})[”"」]')
+# 句号与叹号只出现在自述里，查询不会有。
+_QUERY_PROSE_CHARS = "。！"
+
+
+def _extract_query(line: str) -> str:
+    """从一行里取出真正的查询；取不出返回空串。
+
+    **只看长度和标点，不匹配「我们」「需要」这类词**——那是词表，换种问法就
+    失效，本文件另一处（`_VISION_FORCE_RAG` 上方）已经写过同样的结论。
+
+    在线档的模型会把推理和查询写在**同一行**，形如
+    `220kV线路运行时电压控制范围 kV。查询：“衡东气电 220kV线路…调度规定”`。
+    这种行整行不能用，但**引号里那一段才是查询**，优先取它。
+    """
+    text = (line or "").strip()
+    if not text:
+        return ""
+    quoted = _QUERY_QUOTED.search(text)
+    if quoted:
+        text = quoted.group(1).strip()
+    if not text or len(text) > _QUERY_MAX_CHARS:
+        return ""
+    if any(ch in text for ch in _QUERY_PROSE_CHARS):
+        return ""
+    if text[-1] in _QUERY_TAIL_REJECT:
+        return ""
+    return text
 
 
 def _parse_query_plan(text: str) -> list[str]:
@@ -2040,6 +2107,7 @@ def _parse_query_plan(text: str) -> list[str]:
     for raw in str(text or "").splitlines():
         line = _QUERY_PREFIX.sub("", raw.strip()).strip()
         line = line.strip("`\"' ").strip()
+        line = _extract_query(line)
         if not line or line in queries:
             continue
         queries.append(line)
@@ -2065,7 +2133,7 @@ async def _plan_queries(
                 # 60 条查询每条约 20-40 字，4096 够用；再多说明拆得过细了。
                 max_tokens=4096,
                 temperature=0.0,
-                chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
+                **_no_thinking_kwargs(mode),
             )
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"
@@ -2749,7 +2817,7 @@ async def _retrieve_planned(
 
     # 单向覆写：只在模型判了「不检索」时把它拉回 True，永不反向。
     # 唯一依据是**本轮带了图片**——上传图片在这个系统里永远是「要处理的材料」
-    # （试卷、图纸、仪表照片、铭牌），不存在「闲聊配图」这个场景。
+    # （材料、图纸、仪表照片、铭牌），不存在「闲聊配图」这个场景。
     forced_reason: str | None = None
     if _VISION_FORCE_RAG and has_images and not intent["needs_rag"]:
         forced_reason = "本轮带图"
@@ -3335,22 +3403,22 @@ async def _llm_health() -> dict[str, Any]:
 # ── 图片转写：把图片变成可检索的文本 ──
 #
 # 为什么需要这一步：检索链（规划器、分组、RAG）只吃文本，图片一个字节都到不了。
-# 用户传一张试卷照片问「做一下这张卷子」，检索拿到的 query 就是**这句指令本身**，
+# 用户传一张材料照片问「做一下这份材料」，检索拿到的 query 就是**这句指令本身**，
 # 拿去查知识库什么也查不到。于是模型手里一份证据都没有，只能凭常识答——答出
 # 满篇「（或10，视电厂具体要求）」这类猜测。
 #
-# 所以：作答前先把图片转成文字，**用题面去检索**。图片本身仍照常发给答题模型
+# 所以：作答前先把图片转成文字，**用原文去检索**。图片本身仍照常发给作答模型
 # （它能看懂图），转写的唯一职责是解锁检索。
 _VISION_TRANSCRIBE_MAX_TOKENS = int(os.getenv("HDW_VISION_TRANSCRIBE_MAX_TOKENS", "4096"))
 _VISION_TRANSCRIBE_TIMEOUT = float(os.getenv("HDW_VISION_TRANSCRIBE_TIMEOUT", "180"))
 
-# 规划器出参只有 160 tokens、目标是 200-400ms。整张卷子的题面（几千字）喂进去
+# 规划器出参只有 160 tokens、目标是 200-400ms。整份材料的原文（几千字）喂进去
 # 只会拖慢它，判断质量并不会更好——它要判的是「要不要查文档」，不是读懂每道题。
 _PLANNER_INPUT_MAX_CHARS = int(os.getenv("HDW_PLANNER_INPUT_MAX_CHARS", "2000"))
 
 _TRANSCRIBE_PROMPT = (
     "你在做文字识别。逐字转写图片里的全部文字，只输出转写结果。\n"
-    "· 保留题号、题型标题（如「一、填空题」）、空格、下划线、括号、选项和单位\n"
+    "· 保留编号、标题、空格、下划线、括号、选项和单位\n"
     "· **不要作答、不要解释、不要补全**——只转写你看到的字\n"
     "· 看不清的字用「?」代替，不要猜\n"
     "· 如果图片不是文字材料（仪表盘、设备铭牌、现场照片），"
@@ -3376,7 +3444,7 @@ def _ordered_vision_candidates(
 ) -> list[dict[str, Any]]:
     """按 `vision_priority` 排出可用于**图片转写**的候选。纯函数，不发请求。
 
-    与 `_vision_candidates` 的分工：那个决定「**答题**用哪个视觉模型」，
+    与 `_vision_candidates` 的分工：那个决定「**作答**用哪个视觉模型」，
     只接受 `kind=chat`；这个决定「**转写**用哪个来源」，还接受 `kind=mineru`。
     两者读同一份配置，只是视图不同——这样界面上一个优先级列表就能同时管两件事。
     """
@@ -3490,10 +3558,10 @@ async def _transcribe_with_chat(
         [{"role": "user", "content": content}],
         max_tokens=_VISION_TRANSCRIBE_MAX_TOKENS,
         temperature=0.0,
-        chat_template_kwargs={"enable_thinking": False} if mode == "offline" else None,
+        **_no_thinking_kwargs(mode),
     )
-    # 被 max_tokens 截断：转写不完整。**不能当成失败**——前半张卷子仍有用；
-    # 但也必须让调用方知道，否则「后半张卷子凭空消失」无人察觉。
+    # 被 max_tokens 截断：转写不完整。**不能当成失败**——前半份材料仍有用；
+    # 但也必须让调用方知道，否则「后半份材料凭空消失」无人察觉。
     return result.content, result.finish_reason == "length"
 
 
@@ -3539,7 +3607,7 @@ async def _mineru_transcribe(images: list[dict[str, str]]) -> str:
     题型标题会带 `## `。这对下游没有影响：转写文本只用来给检索规划器看，
     它读得懂 markdown。
 
-    实测单页卷子图约 17 s，比在线视觉慢一个量级，所以它更适合当兜底来源。
+    实测单页材料图约 17 s，比在线视觉慢一个量级，所以它更适合当兜底来源。
     """
     base = settings.mineru_base_url.rstrip("/")
     async with httpx.AsyncClient(timeout=httpx.Timeout(settings.mineru_timeout, connect=5)) as client:
@@ -4449,6 +4517,118 @@ def _prompt(
     return prompt
 
 
+# ── 回答被截断时的自动续写 ────────────────────────────────────
+# `LLMResult.finish_reason` 当初就是为「整份材料后半部分全丢了却毫无征兆」
+# 这个场景加的，但只接到了图片转写那条路，**主答案路径从来没读过它**。
+# 后果实测过：一份材料答到「SFC选择成功，发命令给」就断了，全篇 1839 token，
+# 离 8192 的上限差得远，而答案被当作完整结果写进留档、谁都不知道少了东西。
+_ANSWER_CONTINUE_MAX = int(os.getenv("HDW_ANSWER_CONTINUE_MAX", "3"))
+# 明确表示「被长度截断」的 finish_reason。上游不给这个字段时是空串——
+# **未知不等于截断**，看到空串就去续写会把每次正常回答都续一遍。
+_TRUNCATED_FINISH = (
+    "length", "max_tokens", "max_output_tokens", "max_completion_tokens",
+)
+# 能收尾的符号（中英）。答案以别的字符结尾时，多半是被打断了。
+_TERMINAL_CHARS = "。！？；：”’）】》〉」』.!?;:)]}\"'"
+# 短于这个长度的答案不做「结尾没标点」的判断：本来就可能不带标点。
+_UNFINISHED_MIN_CHARS = int(os.getenv("HDW_UNFINISHED_MIN_CHARS", "400"))
+# 续写请求。**必须明确说「不要重复」**：模型被要求接着写时常常回溯重写一段，
+# 直接拼接会在答案中间出现重复句子，而那种重复用户一眼就能看到。
+_CONTINUE_PROMPT = (
+    "上面是你写到一半的回答，因长度上限被截断了。请**紧接着最后一个字继续写**：\n"
+    "· 不要重复已经写过的任何内容，不要重新开头，不要加任何前言或说明；\n"
+    "· 直接从断点处接着写，保持原有的编号与格式；\n"
+    "· 如果其实已经写完，只回复「（完）」两个字，不要写别的。"
+)
+_CONTINUE_DONE = "（完）"
+
+
+def _looks_unfinished(answer: str, finish_reason: str) -> bool:
+    """答案是不是写一半被掐了。
+
+    **两个信号都要，缺一不可**：
+      1. `finish_reason` 明确说被长度截断——权威信号；
+      2. 结尾不是收尾标点——上游有时只回 "stop"，而内容明明没写完
+         （实测那次整份材料断在「发命令给」，没有任何异常信号）。
+    只对足够长的答案做第 2 条判断，短答案本来就可能不带标点。
+    """
+    text = (answer or "").rstrip()
+    if not text:
+        return False
+    if str(finish_reason or "").strip().lower() in _TRUNCATED_FINISH:
+        return True
+    return len(text) >= _UNFINISHED_MIN_CHARS and text[-1] not in _TERMINAL_CHARS
+
+
+def _join_continuation(previous: str, addition: str, max_overlap: int = 240) -> str:
+    """把续写片段接到已有答案上，**去掉接口处可能重复的那一段**。
+
+    模型被要求「接着写」，但它常常会回溯重写一小段。直接相加会让同一句
+    在答案里出现两遍——用户一眼就能看到，而这类重复靠人删很烦。
+    """
+    head = (previous or "").rstrip()
+    tail = (addition or "").lstrip()
+    if not tail or tail.startswith(_CONTINUE_DONE):
+        return head
+    # 从长到短找接口处的重复。**下限 6 个字**：一两个字的「重合」多半是巧合，
+    # 按它裁掉会真的丢字。（另注：区间上界取三者最小，短输入才不会落成空区间——
+    # 自检抓到过这个写法错误。）
+    upper = min(max_overlap, len(head), len(tail))
+    for size in range(upper, 5, -1):
+        if head.endswith(tail[:size]):
+            return head + tail[size:]
+    return head + "\n" + tail
+
+
+async def _answer_to_the_end(
+    client: Any,
+    prompt: list[dict[str, Any]],
+    first: Any,
+    *,
+    temperature: float,
+    reasoning_effort: str | None,
+    max_tokens: int,
+    chat_template_kwargs: dict[str, Any] | None,
+    thinking_budget_tokens: int | None,
+    thinking_enabled: bool | None,
+    progress: ProgressFn,
+) -> tuple[str, str, int]:
+    """拿到回答后，若没写完就接着写，直到写完或到轮数上限。
+
+    返回 (完整答案, 最后一次的 finish_reason, 续写了几轮)。
+
+    **为什么是自动续写而不只是提示「被截断了」**：用户的原话是「我不希望答不完」。
+    只提示等于把活儿推回去让人手动重发一次，而重发大概率断在同一个地方——
+    同样的问题、同样的证据、同样的长度。
+    """
+    content = first.content
+    finish = first.finish_reason
+    continues = 0
+    while _looks_unfinished(content, finish) and continues < _ANSWER_CONTINUE_MAX:
+        continues += 1
+        progress("generate", f"回答未完，续写第 {continues} 次")
+        result = await client.complete(
+            [
+                *prompt,
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": _CONTINUE_PROMPT},
+            ],
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            max_tokens=max_tokens,
+            chat_template_kwargs=chat_template_kwargs,
+            thinking_budget_tokens=thinking_budget_tokens,
+            thinking_enabled=thinking_enabled,
+        )
+        joined = _join_continuation(content, result.content)
+        finish = result.finish_reason
+        if joined == content:
+            # 模型回「（完）」、或没给出任何新内容——再续也是白续。
+            break
+        content = joined
+    return content, finish, continues
+
+
 async def _llm_answer(
     question: str,
     contexts: list[dict[str, Any]],
@@ -4640,8 +4820,24 @@ async def _llm_answer(
                     thinking_enabled if selected_mode == "online" else None
                 ),
             )
+            # 写一半被掐就接着写。**放在这里而不是调用方**：续写要用同一份
+            # prompt、同一组采样参数，换一层就得把这些参数再传一遍。
+            answer_text, finish_reason, continues = await _answer_to_the_end(
+                client,
+                prompt,
+                result,
+                temperature=0.2,
+                reasoning_effort=completion_reasoning_effort,
+                max_tokens=settings.llm_max_tokens,
+                chat_template_kwargs=chat_template_kwargs,
+                thinking_budget_tokens=thinking_budget_tokens,
+                thinking_enabled=(
+                    thinking_enabled if selected_mode == "online" else None
+                ),
+                progress=progress,
+            )
             return (
-                result.content,
+                answer_text,
                 selected_mode,
                 preparation,
                 compression_provider,
@@ -4662,6 +4858,11 @@ async def _llm_answer(
                     "attempts": len(errors) + 1,
                     "context_window": target_context_window,
                     "thinking_enabled": thinking_enabled,
+                    # 上游给的结束原因，以及为此续写了几轮。
+                    # **这两项是排查「答一半就没了」的唯一线索**——终稿长度
+                    # 正常但里面少了半份材料时，只看答案是看不出来的。
+                    "finish_reason": finish_reason,
+                    "continued_rounds": continues,
                     # 历史相关性选留的结果：选了几轮、丢了哪几轮、花了多久、
                     # 有没有失败。出问题时要能一眼分清「选错了」和「选择器挂了」。
                     "history_select": select_stats,
@@ -5671,7 +5872,7 @@ def _self_check() -> None:
     _transcribe_view = _ordered_vision_candidates(_mineru_only, {"chat", "mineru"})
     assert len(_transcribe_view) == 1 and _transcribe_view[0]["kind"] == "mineru"
     assert _transcribe_view[0]["model"] == "mineru", "mineru 项缺 model 时应补成标签"
-    assert _ordered_vision_candidates(_mineru_only, {"chat"}) == [], "答题视图必须排除 mineru"
+    assert _ordered_vision_candidates(_mineru_only, {"chat"}) == [], "作答视图必须排除 mineru"
     # kind 缺省为 chat：老配置里没有 kind 字段，必须当 chat 用，否则升级后视觉整体失效
     _legacy = {"vision_priority": [{"priority": 1, "mode": "online", "model": "deepseek-flash"}]}
     assert _ordered_vision_candidates(_legacy, {"chat"})[0]["kind"] == "chat"
@@ -5683,7 +5884,7 @@ def _self_check() -> None:
         {"vision_priority": [{"priority": 1, "kind": "chat", "mode": "", "model": "x"}]}, {"chat"}) == []
 
     # 坏转写比没转写更糟——它会把检索引到无关文档上，而下游看不出区别。
-    assert _usable_transcript("一、填空题\n1. 汽轮机额定转速为 3000 r/min")
+    assert _usable_transcript("一、设备规范\n1. 汽轮机额定转速为 3000 r/min")
     assert not _usable_transcript("")
     assert not _usable_transcript("短")
     assert not _usable_transcript("抱歉，我无法识别这张图片里的文字")
@@ -5692,10 +5893,10 @@ def _self_check() -> None:
     assert _usable_transcript("1. 当发现仪表看不清时，应先核对照明与镜面，再联系热工。")
 
     # 原指令必须保留：它带着用户意图（「只给答案」「按题号给」），规划器要靠它判类别
-    assert _compose_retrieval_question("做卷子", None) == "做卷子"
-    assert _compose_retrieval_question("做卷子", {"text": "   "}) == "做卷子"
-    _cq = _compose_retrieval_question("做卷子", {"text": "1. 主蒸汽温度"})
-    assert _cq.startswith("做卷子") and "1. 主蒸汽温度" in _cq
+    assert _compose_retrieval_question("看看这份材料", None) == "看看这份材料"
+    assert _compose_retrieval_question("看看这份材料", {"text": "   "}) == "看看这份材料"
+    _cq = _compose_retrieval_question("看看这份材料", {"text": "1. 主蒸汽温度"})
+    assert _cq.startswith("看看这份材料") and "1. 主蒸汽温度" in _cq
 
     assert _truncate_for_planner("短问题") == "短问题"
     _long = _truncate_for_planner("题" * (_PLANNER_INPUT_MAX_CHARS + 500))
@@ -5703,7 +5904,7 @@ def _self_check() -> None:
 
     # 提示词：转写块与「别把 OCR 当证据」的规则必须同时出现或同时不出现。
     # 少了规则，模型会拿 OCR 去跟检索证据打对台，比不转写还糟。
-    _ip = _prompt("q", [], image_text="一、填空题 1. 额定转速 3000 r/min")
+    _ip = _prompt("q", [], image_text="一、设备规范 1. 额定转速 3000 r/min")
     assert "图片文字" in _ip[-1]["content"] and "额定转速" in _ip[-1]["content"]
     assert "不要把它当作证据引用" in _ip[0]["content"], "缺了这条会拿 OCR 跟证据打对台"
     _np = _prompt("q", [])
@@ -5744,7 +5945,16 @@ def _self_check() -> None:
     assert _retrieval_evidence_budget("offline", 20) > _retrieval_evidence_budget("offline", 1)
     assert _retrieval_evidence_budget("offline", 10_000) <= _RAG_LOCAL_EVIDENCE_CAP, "预算要有上限"
     assert _retrieval_evidence_budget("online", 10_000) <= _RAG_ONLINE_EVIDENCE_CAP
-    assert _retrieval_evidence_budget("online", 20) > _retrieval_evidence_budget("offline", 20)
+    # 在线档上下文大得多（1M vs 262k），同样路数下**不能给得比离线少**；
+    # 路数足够多、上限开始生效之后，应当严格更多。
+    #
+    # 原来这里只写 `online,20 > offline,20`。它成立是因为两个上限都低于线性项
+    # （80/120 < 20×8=160），上限先咬住、差距由上限体现。抬高上限之后
+    # （160/240）线性项在 20 路时占主导，两者都是 160 —— 于是那条断言测的
+    # 其实是「上限够不够低」，而不是它想表达的「在线档给得更多」。
+    assert _retrieval_evidence_budget("online", 20) >= _retrieval_evidence_budget("offline", 20)
+    assert _retrieval_evidence_budget("online", 30) > _retrieval_evidence_budget("offline", 30), \
+        "上限生效后在线档必须比离线档给得多——它扛得住，离线档扛不住"
 
     # 组间轮转：高分小组不能吃光窗口。这条是「分组到底有没有用」的直接判据。
     _rr = _round_robin_by_round([
@@ -5818,6 +6028,51 @@ def _self_check() -> None:
                              [f"x: {_POINT_NOT_FOUND}"])
     assert not _point_absent({}, ["x: ReadTimeout"])
     assert not _point_absent({}, [])
+
+    # 结构化调用一律关思考，**两种模式都要关**。在线档此前传 None（等于不关），
+    # 模型的推理直接落进解析器——这是「准确率下降」的根因，不能只关一半。
+    assert _no_thinking_kwargs("offline") == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert _no_thinking_kwargs("online") == {"thinking_enabled": False}
+
+    # 拆查询：**模型的思考不能被当成检索查询**。用实测泄漏出来的原文当反例。
+    _leak = (
+        "我们需要回答用户？用户说“解释一下这份材料”然后贴了内容。我们需要为他们作答。\n"
+        "我们列材料内容：\n"
+        "输变电设备电气状态 运行状态 热备用 冷备用 检修 定义\n"
+        "220kV线路运行时电压控制范围 kV。查询：“衡东气电 220kV线路运行电压控制范围 kV 调度规定”\n"
+        "二、简答："
+    )
+    _lq = _parse_query_plan(_leak)
+    assert "输变电设备电气状态 运行状态 热备用 冷备用 检修 定义" in _lq, _lq
+    # 推理与查询写在同一行时，**引号里那一段才是查询**
+    assert "衡东气电 220kV线路运行电压控制范围 kV 调度规定" in _lq, _lq
+    assert not any("。" in x or "我们" in x for x in _lq), _lq
+    assert not any(x.endswith("：") for x in _lq), _lq
+    # 正常输出不该被误滤（离线档实测的那种干净输出）
+    assert _parse_query_plan("汽轮机主保护有哪些\n轴封系统投运注意事项") == [
+        "汽轮机主保护有哪些", "轴封系统投运注意事项",
+    ], _parse_query_plan("汽轮机主保护有哪些\n轴封系统投运注意事项")
+
+    # 回答被截断 → 自动续写。判定要认两个信号，且**不能误判正常回答**——
+    # 误判的代价是每次问答都白续一轮（在线模型每轮重发整个提示词，很贵）。
+    assert _looks_unfinished("写了一半", "length"), "finish_reason=length 必须判未完"
+    assert _looks_unfinished("写了一半", "max_tokens")
+    assert _looks_unfinished("很长一段话" * 100 + "，断在这里", "stop"), \
+        "够长且结尾无标点 → 判未完"
+    assert not _looks_unfinished("写完了。", "stop"), "正常收尾不该续写"
+    assert not _looks_unfinished("短答案", "stop"), "短答案不带标点不算未完"
+    assert not _looks_unfinished("", "")
+    assert not _looks_unfinished("很长一段话" * 100 + "这样收尾。", ""), \
+        "finish_reason 空串是「未知」不算截断"
+    # 续写拼接：接口处重复的那段要去掉，回「（完）」不加东西
+    _jh = "前文若干。燃气压力过高，报警阈值"
+    _jt = "燃气压力过高，报警阈值为 30barg，另需注意"
+    assert _join_continuation(_jh, _jt) == _jh + "为 30barg，另需注意", \
+        _join_continuation(_jh, _jt)
+    assert _join_continuation("已经写完。", "（完）") == "已经写完。"
+    # 没有重复时按换行接上（**短输入也要走到这一步**，不能因为区间取错而跳过检测）
+    assert _join_continuation("甲", "乙") == "甲\n乙"
+    assert _join_continuation("甲", "") == "甲"
     # 标记必须真的出现在 _resolve_point 的两条失败路径上——文案改了断言才会红
     _src = __file__ and open(__file__, encoding="utf-8").read()
     assert _src.count(f"{{_POINT_NOT_FOUND}}") >= 2, "测点不存在的两条路径没打标记"
