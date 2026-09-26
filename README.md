@@ -8,7 +8,7 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
 <项目根>
 ```
 
-本文档以当前代码和 Compose 配置为准，更新时间：2026-09-22。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
+本文档以当前代码和 Compose 配置为准，更新时间：2026-09-26。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
 
 ## 1. 设计原则
 
@@ -226,6 +226,11 @@ HyperDriveWave/
 - `start.sh`：按 Compose profile 启动服务。**项目唯一的启动入口**，`deploy.sh` 也调它。
 - `stop.sh`：停止当前 Compose 项目，不删除数据卷目录。
 - `restart.sh`：停止后重新启动全套服务。
+- **机器重启后不用手动拉起**：compose 里每个服务都带 `restart: unless-stopped`，
+  Docker 随开机起来时会把它们一并恢复。2026-09-26 之前这条漏了，机器重启后
+  十个容器一个都没回来，且不会有任何报错。
+  例外是用 `stop.sh` 主动停过的——`unless-stopped` 的定义就是「除非被手动停过」，
+  这种要 `start.sh` 才会再起来。
 - `status.sh`：查看 Compose 容器状态。
 - `logs.sh`：查看全部服务或指定服务日志。
 - `healthcheck.sh`：日常巡检。**已知缺陷**：查的是 `${HDW_LLM_PORT:-8000}`

@@ -2,6 +2,8 @@ name: hyperdrivewave
 
 services:
   hdw-postgres:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     image: postgres:17
     profiles: ["base"]
     environment:
@@ -20,6 +22,8 @@ services:
       retries: 10
 
   hdw-redis:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     image: redis:7
     profiles: ["base"]
     environment:
@@ -36,6 +40,8 @@ services:
       retries: 10
 
   hdw-neo4j:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     image: neo4j:5
     profiles: ["base"]
     environment:
@@ -54,6 +60,8 @@ services:
       retries: 20
 
   hdw-llm:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     build:
       context: ../HDW_Inference/FreeToken
       args:
@@ -84,6 +92,8 @@ services:
       --sampling-defaults model
 
   hdw-rag:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     build:
       context: ../HDW_Inference/RAG_Service
       args:
@@ -108,6 +118,8 @@ services:
       - "127.0.0.1:${HDW_RAG_PORT:-8001}:8001"
 
   hdw-mineru:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     image: hyperdrivewave-hdw-mineru:latest
     build:
       context: ../HDW_Knowledge/MinerU
@@ -128,6 +140,8 @@ services:
     command: ["mineru-api", "--host", "0.0.0.0", "--port", "8002"]
 
   hdw-qa-api:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     build:
       context: ../HDW_Orchestrator/industrial-qa-api
       args:
@@ -217,6 +231,8 @@ services:
         condition: service_started
 
   hdw-ingest:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     build:
       context: ../HDW_Orchestrator/industrial-ingest-api
       args:
@@ -266,6 +282,8 @@ services:
         condition: service_healthy
 
   hdw-api:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     build:
       context: ../HDW_API
       args:
@@ -300,6 +318,8 @@ services:
         condition: service_started
 
   hdw-mcp:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     build:
       context: ../HDW_DataFoundation/MCP
       dockerfile: Dockerfile
@@ -334,6 +354,8 @@ services:
       - "127.0.0.1:${HDW_MCP_PORT:-8766}:8766"
 
   hdw-webui:
+    # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
+    restart: unless-stopped
     image: nginx:1.27-alpine
     profiles: ["web"]
     volumes:
