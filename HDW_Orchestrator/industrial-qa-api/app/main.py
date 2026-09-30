@@ -3440,13 +3440,22 @@ _VISION_KINDS = ("chat", "mineru")
 
 
 def _ordered_vision_candidates(
-    config: dict[str, Any], kinds: set[str]
+    config: dict[str, Any],
+    kinds: set[str],
+    preferred_mode: str | None = None,
 ) -> list[dict[str, Any]]:
     """按 `vision_priority` 排出可用于**图片转写**的候选。纯函数，不发请求。
 
     与 `_vision_candidates` 的分工：那个决定「**作答**用哪个视觉模型」，
     只接受 `kind=chat`；这个决定「**转写**用哪个来源」，还接受 `kind=mineru`。
     两者读同一份配置，只是视图不同——这样界面上一个优先级列表就能同时管两件事。
+
+    `preferred_mode` 传了 `"online"` / `"offline"` 时，**只保留该模式的 chat
+    候选**（另一个模式被排除，不是排到后面）。理由是图片比文字敏感：用户选了
+    本地推理，却因为"在线那档恰好也配着"而把图发到了外部 API，这种越界从答案
+    表面完全看不出来。宁可这次转写失败（退回纯文本作答，图仍会给本地模型看），
+    也不能静默把图发出去。
+    `mineru` 不受影响——它是本机的解析服务，不涉及出网。
     """
     output: list[dict[str, Any]] = []
     for item in config.get("vision_priority") or []:
@@ -3460,6 +3469,8 @@ def _ordered_vision_candidates(
         if kind == "chat":
             # chat 必须有合法的 mode 与模型名，否则这一项无法调用。
             if mode not in ("online", "offline") or not model:
+                continue
+            if preferred_mode and mode != preferred_mode:
                 continue
         else:
             # mineru 不区分在线/本地，模型名只是界面上的标签。
@@ -3665,16 +3676,22 @@ async def _transcribe_images(
     images: list[dict[str, str]],
     *,
     allow_online: bool,
+    preferred_mode: str | None = None,
 ) -> dict[str, Any] | None:
     """把图片转成可检索的文本。**失败一律返回 None，绝不抛异常。**
 
     与 `_vision_candidates` 刻意不同：那里选不出候选会让 `_llm_answer` 抛 503，
     因为答题**必须要**视觉；而转写失败只是让检索退回现状（模型仍能看图，
     只是没有知识库证据），不该把「能答」变成「答不了」。
+
+    `preferred_mode` 见 `_ordered_vision_candidates`：转写也要跟着用户选的
+    推理模式走，否则会出现「选了本地、图却经在线 API 转写」。
     """
     if not images:
         return None
-    candidates = _ordered_vision_candidates(_read_model_config(), {"chat", "mineru"})
+    candidates = _ordered_vision_candidates(
+        _read_model_config(), {"chat", "mineru"}, preferred_mode
+    )
     attempts: list[dict[str, str]] = []
     started = time.monotonic()
     for candidate in candidates:
@@ -3708,14 +3725,19 @@ async def _transcribe_images(
     return None
 
 
-def _has_chat_vision_candidate() -> bool:
+def _has_chat_vision_candidate(preferred_mode: str | None = None) -> bool:
     """配置里有没有启用中的 chat 类视觉候选。**不探测可用性**，只看配置。
 
     只用来决定「要不要把原图发给答题模型」。真正的可用性判断仍在
     `_vision_candidates`——那里失败会抛 503，这里只负责别把一个注定失败的
     请求发出去（例如用户只配了 MinerU 时）。
+
+    `preferred_mode` 见 `_ordered_vision_candidates`：判定也要按用户选的模式来，
+    否则"本地没配视觉、在线配了视觉"时会把原图发给本地模型，而它读不懂。
     """
-    return bool(_ordered_vision_candidates(_read_model_config(), {"chat"}))
+    return bool(
+        _ordered_vision_candidates(_read_model_config(), {"chat"}, preferred_mode)
+    )
 
 
 def _vision_diagnostics(vision: dict[str, Any] | None) -> dict[str, Any]:
@@ -3762,6 +3784,15 @@ async def _vision_candidates(
     *,
     allow_online: bool = True,
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    """**已被取代，不要再用。** 保留仅为减少一次大改动的风险。
+
+    它按 `vision_priority` 那个固定优先级列表挑视觉模型，**完全无视用户选的
+    推理模式**——于是「界面选本地、图却发到在线 API」这种事会静默发生。
+    现在带图提问和纯文本提问走同一条规则：由 `inference_mode` 决定用哪个
+    后端（见 `_llm_answer` 的 `image_attachments` 分支）。
+
+    确认线上跑稳之后可以删掉（无调用者）。
+    """
     config = _read_model_config()
     candidates: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -4652,12 +4683,48 @@ async def _llm_answer(
     now: datetime | None = None,
 ) -> tuple[str, str, Any, str | None, dict[str, Any]]:
     if image_attachments:
-        candidates, capability_errors = await _vision_candidates(
-            allow_online=allow_online,
-        )
-        if not candidates:
-            detail = "；".join(capability_errors) or "没有配置可用的视觉模型"
-            raise HTTPException(status_code=503, detail=f"多模态不可用：{detail}")
+        # 带图提问**按用户选的推理模式走**，与纯文本提问同一条规则。
+        #
+        # 原先这里走 `_vision_candidates`，也就是 `vision_priority` 那个固定
+        # 优先级列表，完全无视 `inference_mode`。后果是「界面选的是本地推理，
+        # 图却被发到了在线 API」——用户的意图被一份配置列表覆盖了，而且从答案
+        # 表面看不出来，只有翻日志才知道。图片比文字敏感得多，这种越界不能接受。
+        selected_mode, client = _llm_client(inference_mode)
+        if selected_mode == "online" and not allow_online:
+            raise HTTPException(
+                status_code=403,
+                detail="在线推理仅管理员可用，请联系管理员开放在线推理",
+            )
+        runtime_context_window = _context_window(selected_mode)
+        if selected_mode == "offline":
+            local_runtime = await _local_runtime_info(client.base_url)
+            if local_runtime["available"] and local_runtime["model"]:
+                client = _llm_client(
+                    selected_mode,
+                    model_override=local_runtime["model"],
+                    base_url_override=client.base_url,
+                )[1]
+            if local_runtime["context_window"]:
+                runtime_context_window = int(local_runtime["context_window"])
+            # 本地这条路必须真的有视觉能力（llama 得带 mmproj）才走得通。
+            # 不检查的话，模型会对着一张它读不懂的图编出自信的答案——
+            # 那比直接报错难发现得多。
+            available, reason = _local_vision_status(local_runtime, client.model)
+            if not available:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"本地推理未启用视觉：{reason}。"
+                        "请改用在线推理，或为本地模型配置 mmproj 后重启 llama。"
+                    ),
+                )
+        candidates = [{
+            "mode": selected_mode,
+            "model": client.model,
+            "base_url": client.base_url,
+            "context_window": runtime_context_window,
+        }]
+        capability_errors: list[str] = []
     else:
         selected_mode, client = _llm_client(inference_mode)
         if selected_mode == "online" and not allow_online:
@@ -5381,7 +5448,11 @@ async def _qa_pipeline(
     # 失败返回 None 而不是抛异常——检索退回现状，但答题照常。
     vision_info = (
         await _transcribe_images(
-            image_attachments, allow_online=_online_inference_allowed(user)
+            image_attachments,
+            allow_online=_online_inference_allowed(user),
+            # 转写也按用户选的推理模式走：选了本地就不该把图发去在线 API，
+            # 哪怕在线那档还配着、还可用。
+            preferred_mode=selected_mode,
         )
         if image_attachments
         else None
@@ -5393,7 +5464,9 @@ async def _qa_pipeline(
     # 没有 chat 类候选时不把原图发给答题模型：那样 `_vision_candidates` 会找不到
     # 候选而抛 503。题面已经在转写文本里，纯文本作答一样能答——
     # 这顺带修掉了「只配了 MinerU 的用户传图必 503」。
-    answer_images = image_attachments if _has_chat_vision_candidate() else []
+    answer_images = (
+        image_attachments if _has_chat_vision_candidate(selected_mode) else []
+    )
 
     # 进度队列：链路深处（_retrieve_planned / _answer）通过 progress 回调往里塞，
     # 这里边等边转发。**必须并发地等**——MCP 取数最慢的一项要等 LIEMS 30 秒，
