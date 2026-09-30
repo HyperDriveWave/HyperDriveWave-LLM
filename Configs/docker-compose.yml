@@ -1,5 +1,30 @@
 name: hyperdrivewave
 
+# ── llama.cpp 实例的公共参数 ─────────────────────────────────────
+# hdw-llama 与 hdw-llama-2 共用这一份，**刻意不做成两份拷贝**：负载均衡的两个
+# 后端一旦配置漂移，症状是「同一个问题问两次表现不一样」——排查时会一路怀疑到
+# 网络、缓存、采样、模型量化，极难定位到配置上去。
+#
+# 端口不在这里，也不由 .env 决定：两份实例各自在自己的网络命名空间里都监听
+# 1919，靠 compose 的端口映射区分（宿主上的 1921 / 1920）。这样"实例 A/B"的
+# 定义里除了显卡编号没有任何差别。
+#
+# 写成字符串而不是列表：compose 会对字符串做分词，${HDW_LLAMA_EXTRA_ARGS}
+# 展开成的 `--spec-type draft-mtp` 才会被拆成两个参数。写成 YAML 列表的话
+# 它就成了**一个**带空格的参数，llama-server 会直接报未知选项。
+x-hdw-llama-args: &hdw-llama-args >-
+  --model /models/LLM_Models/Qwen3.8-27B-GSQ/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+  --host 0.0.0.0
+  --port 1919
+  --device CUDA0
+  --ctx-size ${HDW_LLAMA_CTX:-262144}
+  --gpu-layers all
+  --timeout ${HDW_LLAMA_TIMEOUT:-3600}
+  --cache-type-k ${HDW_LLAMA_CACHE_TYPE_K:-q4_0}
+  --cache-type-v ${HDW_LLAMA_CACHE_TYPE_V:-q4_0}
+  --flash-attn auto
+  ${HDW_LLAMA_EXTRA_ARGS:---spec-type draft-mtp}
+
 services:
   hdw-postgres:
     # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
@@ -120,10 +145,13 @@ services:
         # 编错了不会报错，只会**一路回落到 CPU**（约 1 token/s），所以别猜。
         CUDA_ARCH: ${HDW_LLAMA_CUDA_ARCH:-89}
     profiles: ["llama-container"]
-    # host 网络：qa-api 连的是 ${HDW_LOCAL_LLM_BASE_URL}（host.docker.internal:1919），
-    # 容器直接监听宿主 1919 最省事。改成端口映射的话，映射到 127.0.0.1 反而会让
-    # host.docker.internal 连不上。
-    network_mode: host
+    # **刻意不用 host 网络。** 端口映射到宿主**回环**（127.0.0.1:1921），
+    # 只有负载均衡器对外监听 0.0.0.0:1919。
+    # 之前 llama 直接绑 0.0.0.0:1919，整个局域网都能打它 —— 而这个端口
+    # **没有任何鉴权**。收敛成「只有 LB 可达」是顺带的收益。
+    # qa-api 走的 host.docker.internal:1919 照样通，那正是 LB。
+    ports:
+      - "127.0.0.1:${HDW_LLAMA_A_PORT:-1921}:1919"
     # 只挂一张卡 —— 共享机器上别把 4 张全占了。
     #
     # **必须走 deploy.resources 这一套，不能只设 NVIDIA_VISIBLE_DEVICES。**
@@ -141,24 +169,69 @@ services:
               capabilities: [gpu]
     volumes:
       - ../HDW_Engines:/models:ro
-    # 参数与宿主路径的 start.sh 对齐。差异只有两处，都是刻意的：
-    #   --device CUDA0  —— 容器里用 NVIDIA_VISIBLE_DEVICES 限卡后，对容器而言
-    #                      只有一张卡，编号必然是 0。
-    #   --spec-type     —— 宿主 start.sh 会先探测再决定加不加；容器里跑的就是
-    #                      我们自己编的二进制，已确认支持，直接给。
-    #                      不想要 MTP 就把 HDW_LLAMA_EXTRA_ARGS 置空。
-    command: >
-      --model /models/LLM_Models/Qwen3.8-27B-GSQ/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
-      --host 0.0.0.0
-      --port ${HDW_LLAMA_PORT:-1919}
-      --device CUDA0
-      --ctx-size ${HDW_LLAMA_CTX:-262144}
-      --gpu-layers all
-      --timeout ${HDW_LLAMA_TIMEOUT:-3600}
-      --cache-type-k ${HDW_LLAMA_CACHE_TYPE_K:-q4_0}
-      --cache-type-v ${HDW_LLAMA_CACHE_TYPE_V:-q4_0}
-      --flash-attn auto
-      ${HDW_LLAMA_EXTRA_ARGS:---spec-type draft-mtp}
+    # 参数在文件顶部的 x-hdw-llama-args 锚点里，与 hdw-llama-2 同源。
+    command: *hdw-llama-args
+
+  hdw-llama-2:
+    # 第二份 llama.cpp 实例 —— 用来**提高并发**，不是提高单路速度。
+    #
+    # 实测一台 L20：单路 80.9 t/s；4 路并发时总吞吐 145 t/s，但每人只剩 44.3。
+    # 加一份实例后，同样的 4 个人变成每人 63.0 t/s（+42%），可并发数 4 → 8。
+    # **单路速度不变**（两边都是 80.9）——想要单路更快得走 --split-mode，
+    # 那是另一回事。
+    #
+    # 默认不启用：只有一张卡时它起不来。要启用三件事一起做：
+    #   1) HDW_LLAMA_GPU_2 指到另一张卡
+    #   2) 把 llama-scale 加进 HDW_COMPOSE_PROFILES
+    #   3) 确保 hdw-llama-lb 在跑（它属于 llama-container），
+    #      否则 1919 上没有任何东西在听
+    restart: unless-stopped
+    image: hyperdrivewave-hdw-llama:latest
+    profiles: ["llama-scale"]
+    ports:
+      - "127.0.0.1:${HDW_LLAMA_B_PORT:-1920}:1919"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${HDW_LLAMA_GPU_2:-1}"]
+              capabilities: [gpu]
+    volumes:
+      - ../HDW_Engines:/models:ro
+    command: *hdw-llama-args
+
+  hdw-llama-lb:
+    # 两份 llama 实例前面的负载均衡，监听客户端真正连的那个端口。
+    #
+    # 有了它，qa-api / start.sh / deploy_verify.sh **一行都不用改**：它们连的
+    # 还是 host.docker.internal:1919（或 127.0.0.1:1919），感知不到后面有一份
+    # 还是两份实例。
+    #
+    # host 网络：上游是宿主回环上的两个端口，用 host 网络最直接；也顺带避开
+    # 「上游容器不存在时 nginx 因解析不到域名而**起不来**」这个问题 ——
+    # 上游写成静态的 127.0.0.1:port，nginx 启动时不需要解析任何名字，
+    # 第二份实例没开也只是那台上游不可用，由 max_fails 摘掉。
+    #
+    # 端口与上游列表通过模板 envsubst 注入，
+    # 见 HDW_Inference/llama/nginx-lb.conf.template。
+    restart: unless-stopped
+    image: nginx:1.27-alpine
+    profiles: ["llama-container"]
+    network_mode: host
+    environment:
+      HDW_LLAMA_A_PORT: ${HDW_LLAMA_A_PORT:-1921}
+      HDW_LLAMA_B_PORT: ${HDW_LLAMA_B_PORT:-1920}
+      HDW_LLAMA_LB_PORT: ${HDW_LLAMA_PORT:-1919}
+      # 只替换这几个键。不设的话 envsubst 会去动 $host / $remote_addr 这类
+      # nginx 自己的变量 —— envsubst 分不清「环境变量」和「nginx 变量」，
+      # 它只是把环境里出现的名字全替换掉。
+      NGINX_ENVSUBST_FILTER: "^HDW_LLAMA_"
+    volumes:
+      - ../HDW_Inference/llama/nginx-lb.conf.template:/etc/nginx/templates/default.conf.template:ro
+      # 覆盖镜像自带的 worker_processes auto。**必须单 worker**，原因见该文件注释
+      # —— 多 worker 时 least_conn 的计数不共享，负载均衡会静默失效。
+      - ../HDW_Inference/llama/nginx-lb-main.conf:/etc/nginx/nginx.conf:ro
 
   hdw-rag:
     # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。

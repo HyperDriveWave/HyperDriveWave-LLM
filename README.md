@@ -1832,8 +1832,47 @@ HDW_COMPOSE_PROFILES="base knowledge web llama-container"
 HDW_SKIP_LOCAL_LLM=true
 ```
 
-`hdw-llama` 用 host 网络直接监听宿主 `${HDW_LLAMA_PORT}`，所以 qa-api 里
-`HDW_LOCAL_LLM_BASE_URL=http://host.docker.internal:1919/v1` 不用改。
+`hdw-llama` 实例本身**只绑回环**（`127.0.0.1:${HDW_LLAMA_A_PORT}`），真正对外
+监听 `${HDW_LLAMA_PORT}`（默认 1919）的是负载均衡器 `hdw-llama-lb`。所以 qa-api 里
+`HDW_LOCAL_LLM_BASE_URL=http://host.docker.internal:1919/v1` 不用改，start.sh 和
+deploy_verify.sh 探的 `127.0.0.1:1919` 也不用改——它们都感知不到后面有几份实例。
+
+顺带一个收益：以前 `hdw-llama` 直接绑 `0.0.0.0:1919`，**整个局域网都能打它，
+而这个端口没有任何鉴权**。现在只有 LB 那一个口对外。
+
+#### 并发不够时：加第二份实例
+
+一份 llama 实例是 4 个槽位。实测一台 L20：单路 80.9 t/s，4 路并发时总吞吐
+145 t/s、但每人只剩 44.3。再加一份实例（另一张卡）后：
+
+| 同时提问 | 单实例 | 双实例 |
+| --- | --- | --- |
+| 2 人 | 63.0 t/s/人 | **80.7 t/s/人** |
+| 4 人 | 44.3 t/s/人 | **63.0 t/s/人** |
+| 8 人 | 排队 | 43.6 t/s/人 |
+
+**单路速度不变**——这是买并发，不是买单路。启用三步：
+
+```bash
+HDW_LLAMA_GPU_2=1                                        # 第二份用哪张卡
+HDW_COMPOSE_PROFILES="base knowledge web llama-container llama-scale"
+# 然后只重建 llama 相关服务
+```
+
+两份实例的参数来自 compose 顶部的**同一个锚点**，只有显卡编号不同。
+
+⚠ **nginx 的 `least_conn` 计数是按 worker 独立的。** 官方镜像默认
+`worker_processes auto`，64 核机器上会开 64 个 worker，每个 worker 都以为
+"两台后端都闲着"，于是把请求全塞给同一台——实测 8 个并发请求 A 吃了 7 个、
+B 只拿到 1 个，总吞吐和单实例一模一样，**看起来却像是配好了**。
+所以 `nginx-lb-main.conf` 把 worker 压到 1，并且 upstream 里声明了 `zone`
+（跨 worker 共享计数）。两个都别删。
+
+#### 让单次回答更快（另一回事）
+
+上面的双实例只提高并发，单路速度不变。要让**单次回答**更快得走模型切分——
+llama.cpp 的 `--split-mode layer` 把一份实例摊到两张卡上，权重读取分摊到两条
+显存总线。这和双实例是两个方向，不要混着调。
 
 编 llama.cpp 需要 cmake，而 `nvidia/cuda:*-devel-*` 镜像里**没有 cmake**；
 无外网又装不了。所以先用 `Scripts/fetch_offline_toolchain.sh` 从 PyPI 取一个

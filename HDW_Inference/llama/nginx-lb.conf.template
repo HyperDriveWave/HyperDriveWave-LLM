@@ -1,0 +1,67 @@
+# hdw-llama-lb 的反向代理配置 —— 两份 llama.cpp 实例前面的负载均衡。
+#
+# 这个文件挂在 nginx 官方镜像的 /etc/nginx/templates/default.conf.template：
+# 镜像的 entrypoint 会跑 envsubst，把 ${...} 替换成**容器环境变量**，产出
+# /etc/nginx/conf.d/default.conf 覆盖镜像自带的那个。
+#
+# 两个容易踩的点：
+#   1. 文件名必须以 .template 结尾、且放在 templates/ 目录下，否则根本不会被处理。
+#   2. 替换发生在**容器启动时**，不是 nginx 解析配置时。所以这里的
+#      ${HDW_LLAMA_A_PORT} 不是 nginx 变量，别指望能用 nginx 的方式覆盖它。
+#
+# compose 里设了 NGINX_ENVSUBST_FILTER=^HDW_LLAMA_，只替换这几个键 ——
+# 否则 envsubst 会去动 $host / $remote_addr 这类 nginx 自己变量（envsubst 分不清
+# 二者，它只管替换所有出现在环境里的名字）。
+
+upstream hdw_llama {
+    # 共享内存 zone。**这条不是可选的**：不声明 zone 时，每个 worker 各算各的
+    # 连接计数，互相看不见，`least_conn` 会退化成「每个 worker 都以为后端全空」，
+    # 于是把请求往同一台塞。实测 8 并发时 A 吃 7 个、B 只拿 1 个。
+    # （主配置里已经把 worker 压到 1 了，这里是第二道保险——有人调大 worker
+    #   也不会再退化。）zone 必须写在 upstream 的第一条。
+    zone hdw_llama 64k;
+
+    # least_conn，不是默认的轮询。
+    # QA 请求耗时差异很大（有的几秒、有的几十秒），轮询会把新请求派给一个
+    # 正忙着的后端，而另一个闲着 —— 表现成「同一个人一会儿快一会儿慢」。
+    least_conn;
+
+    # 上游写成**静态的 127.0.0.1:port**（LB 在 host 网络里），不写服务名：
+    # nginx 启动时不需要解析任何域名，所以「第二份实例没开」不会让 nginx
+    # 起不来，只是那台上游不可用而已。
+    server 127.0.0.1:${HDW_LLAMA_A_PORT} max_fails=2 fail_timeout=15s;
+    server 127.0.0.1:${HDW_LLAMA_B_PORT} max_fails=2 fail_timeout=15s;
+
+    keepalive 32;
+}
+
+server {
+    # 客户端真正连的端口。qa-api 用 host.docker.internal:1919 访问的就是它。
+    listen ${HDW_LLAMA_LB_PORT};
+
+    # **必须关缓冲。** WebUI 的问答是 SSE 流式返回的，被 nginx 缓冲住的话
+    # 前端要等整段回答生成完才一次性看到，表现成「卡很久然后唰地全出来」，
+    # 而不是逐字出现。这个症状很容易被误判成模型慢。
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    # llama-server 那边 --timeout 是 3600。反向代理的读超时不能比它短，
+    # 否则长回答会在中途被 nginx 掐成 504，而 llama 其实还在正常生成。
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    # 一台后端出问题立刻换另一台，而不是把 502 甩给用户。
+    proxy_next_upstream error timeout http_502 http_503 http_504;
+
+    location / {
+        proxy_pass http://hdw_llama;
+        proxy_http_version 1.1;
+
+        # keepalive 要求把 Connection 置空（置成 close 的话长连接就白设了）。
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
