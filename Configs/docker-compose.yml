@@ -91,6 +91,75 @@ services:
       --reasoning-parser ${HDW_LOCAL_REASONING_PARSER:-qwen3}
       --sampling-defaults model
 
+  hdw-llama:
+    # **容器化的 llama.cpp** —— 给「宿主跑不了预编译二进制」的机器用。
+    #
+    # HDW_Inference/llama/start.sh 走的是 build-cuda-multi/ 里的预编译二进制，
+    # 那是在新版发行版上编的，依赖 GLIBC_2.43 / GLIBCXX_3.4.32 / libssl.so.3。
+    # 麒麟 V10、RHEL8 这类机器只有 glibc 2.28 + OpenSSL 1.1.1，**补 .so 也没用**
+    # （glibc 是 C 库本体，不能外挂）。实测在麒麟 V10 上：
+    #   `error while loading shared libraries: libssl.so.3` → 退出码 127。
+    # 更坑的是 start.sh 里 `--spec-type` 的探测会拿一个跑不起来的二进制去问
+    # --help，于是**误报「不支持 MTP」**，把人的注意力引到 MTP 上。
+    #
+    # 容器自带新版 glibc，把这一整类问题挡在外面；源码在容器里按目标卡的算力
+    # 重编一次即可，不需要宿主装 CUDA toolkit。
+    #
+    # 默认**不启用**：宿主能直接跑时仍走 systemd 的
+    # hyperdrivewave-llama.service，少一层容器、也少 11 GB 镜像。
+    # 要启用：把 llama-container 加进 HDW_COMPOSE_PROFILES，
+    # 并**先停掉宿主那个 llama 服务**，否则两边抢同一个端口。
+    restart: unless-stopped
+    image: hyperdrivewave-hdw-llama:latest
+    build:
+      context: ../HDW_Inference/llama
+      dockerfile: Dockerfile.container
+      args:
+        # 目标卡的算力：L20 = 89，A100 = 80，H100 = 90，RTX 5090 = 120。
+        # 混合部署写成 "80;89"（分号分隔，CMake 的语法）。
+        # 编错了不会报错，只会**一路回落到 CPU**（约 1 token/s），所以别猜。
+        CUDA_ARCH: ${HDW_LLAMA_CUDA_ARCH:-89}
+    profiles: ["llama-container"]
+    # host 网络：qa-api 连的是 ${HDW_LOCAL_LLM_BASE_URL}（host.docker.internal:1919），
+    # 容器直接监听宿主 1919 最省事。改成端口映射的话，映射到 127.0.0.1 反而会让
+    # host.docker.internal 连不上。
+    network_mode: host
+    # 只挂一张卡 —— 共享机器上别把 4 张全占了。
+    #
+    # **必须走 deploy.resources 这一套，不能只设 NVIDIA_VISIBLE_DEVICES。**
+    # 后者只是给 nvidia runtime 读的变量；容器如果没选 nvidia runtime，驱动
+    # 根本不会被注入，表现是
+    #     error while loading shared libraries: libcuda.so.1
+    # 而且容器会一直 Restarting —— 不 docker logs 就看不出是这个原因。
+    # （2026-10-01 实测踩到。）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${HDW_LLAMA_GPU:-0}"]
+              capabilities: [gpu]
+    volumes:
+      - ../HDW_Engines:/models:ro
+    # 参数与宿主路径的 start.sh 对齐。差异只有两处，都是刻意的：
+    #   --device CUDA0  —— 容器里用 NVIDIA_VISIBLE_DEVICES 限卡后，对容器而言
+    #                      只有一张卡，编号必然是 0。
+    #   --spec-type     —— 宿主 start.sh 会先探测再决定加不加；容器里跑的就是
+    #                      我们自己编的二进制，已确认支持，直接给。
+    #                      不想要 MTP 就把 HDW_LLAMA_EXTRA_ARGS 置空。
+    command: >
+      --model /models/LLM_Models/Qwen3.8-27B-GSQ/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+      --host 0.0.0.0
+      --port ${HDW_LLAMA_PORT:-1919}
+      --device CUDA0
+      --ctx-size ${HDW_LLAMA_CTX:-262144}
+      --gpu-layers all
+      --timeout ${HDW_LLAMA_TIMEOUT:-3600}
+      --cache-type-k ${HDW_LLAMA_CACHE_TYPE_K:-q4_0}
+      --cache-type-v ${HDW_LLAMA_CACHE_TYPE_V:-q4_0}
+      --flash-attn auto
+      ${HDW_LLAMA_EXTRA_ARGS:---spec-type draft-mtp}
+
   hdw-rag:
     # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
     restart: unless-stopped
@@ -128,7 +197,17 @@ services:
         # 构建期 pip 源。docker build 不读宿主机的 pip.conf，只能这样注入。
         # 改 Configs/.env 里的 PIP_INDEX_URL 即可切换；要回官方源填 https://pypi.org/simple
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
-    profiles: ["knowledge"]
+    # 同时挂在 base 和 knowledge 下。
+    #
+    # 原本只有 knowledge，但 hdw-ingest（在 base 里）depends_on 它 ——
+    # compose 只解析**被启用 profile** 里的服务，于是 `--profile base` 会直接报
+    #     service "hdw-ingest" depends on undefined service "hdw-mineru"
+    # 整个项目起不来。也就是说 knowledge 这个"门"从来就关不上：想用 ingest
+    # 就必须连带 knowledge，而默认配置恰好三个 profile 全开，所以一直没暴露。
+    # 拆出 knowledge 本意是让不想装 MinerU（16.7 GB）的人也能跑问答，
+    # 但 ingest 就是知识入库的入口，两者拆不开——挂两个 profile 既恢复了
+    # `--profile base` 单独可用，也不影响原有 `base knowledge web` 的写法。
+    profiles: ["base", "knowledge"]
     environment:
       MINERU_MODEL_SOURCE: local
       MINERU_API_OUTPUT_ROOT: /data/api_output

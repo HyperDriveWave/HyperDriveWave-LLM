@@ -119,7 +119,26 @@ fi
 
 if [ -z "$GPU_LAYERS" ]; then
   if command -v nvidia-smi >/dev/null 2>&1; then
-    FREE_VRAM_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -n1 | tr -d ' ')"
+    # 一次读完所有卡，取**最空闲的那张**。这里原来写的是
+    #   `nvidia-smi --query-gpu=memory.free ... | head -n1`
+    # 有两个问题，都只在多卡机器上才暴露：
+    #
+    #   1. **脚本会静默自杀**。`head -n1` 读完一行就关闭管道，nvidia-smi 写
+    #      第二行时收到 SIGPIPE；文件开头是 `set -euo pipefail`，整条管道
+    #      返回 141，命令替换失败 → `set -e` 直接结束脚本。
+    #      后果是**一行输出都没有**、退出码 141，看起来像"什么都没发生"。
+    #      主站只有 1 张 5090，nvidia-smi 恰好只输出一行、写完就正常退出，
+    #      所以这个 bug 一直藏着；4×L20 的服务器上一装就起不来。
+    #      （2026-10-01 在一台麒麟 V10 服务器上实测：加 pipefail → 141，
+    #        去掉 → 正常。）
+    #   2. **只看第 0 张卡**。共享机器上别人占了 GPU 0，这里就会判成
+    #      "显存不足"，把 GPU_LAYERS 设成 0 —— 也就是**静默退化成纯 CPU
+    #      推理**（27B 约 1 token/s，实际不可用）。而 detect.sh 里的
+    #      detect_gpu() 早就在按空闲显存挑卡了，两边口径不一致。
+    #
+    # 用 awk 一趟读完取最大值：不产生任何会提前退出的管道。
+    FREE_VRAM_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits \
+      | awk 'BEGIN { m = -1 } { v = $1 + 0; if (v > m) m = v } END { if (m >= 0) print m }')"
     if [ "${FREE_VRAM_MIB:-0}" -ge 20000 ]; then
       GPU_LAYERS=all
     else
@@ -128,6 +147,28 @@ if [ -z "$GPU_LAYERS" ]; then
   else
     GPU_LAYERS=0
   fi
+fi
+
+# 阈值按"最空闲的卡"判定，但 --device 仍是配置里写死的那张（默认 CUDA0）。
+# 两张不是同一张时会出事：判成显存够 → 到被占的卡上分配 → OOM。
+# 与其让人去猜，不如在这里把设备挪到最空闲的卡，并明确说一句。
+if [ "$GPU_LAYERS" != "0" ] && command -v nvidia-smi >/dev/null 2>&1; then
+  case "$DEVICE" in
+    CUDA[0-9]*)
+      _dev_idx="${DEVICE#CUDA}"
+      _dev_free="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits \
+        | awk -v n="$((_dev_idx + 1))" 'NR == n { print $1 + 0; exit }')"
+      if [ -n "$_dev_free" ] && [ "$_dev_free" -lt 20000 ]; then
+        _best_idx="$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits \
+          | awk -F, 'BEGIN { m = -1 } { f = $2 + 0; if (f > m) { m = f; i = $1 + 0 } } END { if (m >= 0) print i }')"
+        if [ -n "$_best_idx" ] && [ "$_best_idx" != "$_dev_idx" ]; then
+          echo "警告：$DEVICE 只剩 ${_dev_free} MiB 显存（别人在用？），" >&2
+          echo "      已改用最空闲的 CUDA${_best_idx}。要固定用某张卡就设 HDW_LLAMA_DEVICE。" >&2
+          DEVICE="CUDA${_best_idx}"
+        fi
+      fi
+      ;;
+  esac
 fi
 
 if [ "$GPU_LAYERS" = "0" ]; then

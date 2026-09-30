@@ -6,6 +6,12 @@ ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="$ROOT/Configs/docker-compose.yml"
 ENV_FILE="$ROOT/Configs/.env"
 
+# 单元安装要用到 common.sh 里的 install_hdw_units / systemd_path /
+# write_if_different。它被 source 时不依赖项目变量（自己带加载保护），
+# 所以放在最前面也不会和下面的 .env 打架。
+# shellcheck source=lib/common.sh
+. "$SCRIPT_DIR/lib/common.sh"
+
 if [ ! -f "$ENV_FILE" ]; then
   echo "missing $ENV_FILE; create it from Configs/.env.example first" >&2
   exit 1
@@ -29,8 +35,11 @@ if ! command -v systemctl >/dev/null 2>&1 || ! systemctl --user show-environment
   echo "systemd user manager is required for the GPU resource coordinator" >&2
   exit 1
 fi
-systemctl --user link "$SCRIPT_DIR/hyperdrivewave-resource-coordinator.service" >/dev/null 2>&1 || true
-systemctl --user daemon-reload
+# 按**本机实际路径**生成单元，而不是 link 仓库里那份。
+# 原来那行 `systemctl --user link "$SCRIPT_DIR/...service"` 只在项目位于
+# ~/桌面/HyperDriveWave 时才对——单元里的路径是写死的，换个目录就指向不存在的
+# 文件，而 EnvironmentFile 的 `-` 会让 systemd 静默略过缺失的 .env。
+install_hdw_units "$ROOT"
 systemctl --user enable --now hyperdrivewave-resource-coordinator.service >/dev/null
 RUNTIME_ROOT="${HDW_RUNTIME_ROOT:-$ROOT/HDW_Runtime}"
 for _ in {1..15}; do
@@ -98,17 +107,33 @@ done
 
 echo "starting HyperDriveWave with profiles: ${profiles[*]}"
 
-# 必须先单独建 hdw-rag：hdw-mineru 的 Dockerfile 第一行是
-# `FROM hyperdrivewave-hdw-rag:latest`，但 compose 里 mineru 没有声明对 rag 的
-# depends_on，所以 `up --build` 的构建顺序没有保证——全新机器上会随机失败。
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" build hdw-rag
+# ── 要不要重新构建镜像 ──────────────────────────────────────────
+#
+# 默认构建（改了 app.py 之类重启就能生效）。但**无外网的机器构建不了**：
+# 拉不到基础镜像、pip 装不了包，`docker compose build` 会卡在第一步且
+# **一行输出都没有**，看起来像死锁。这类机器靠
+#     bash Scripts/pack_hdw.sh          # 在有网的机器上打包
+#     docker load < xxx.tar             # 搬到目标机
+# 把镜像运过去，启动时只需要 up，不需要 build。
+#
+# 所以给一个显式开关。**不做"镜像已存在就跳过"的自动判断**——那会让
+# `改了代码 → start.sh` 这个日常动作悄悄不再重建，比构建失败更难发现。
+if [ "${HDW_SKIP_BUILD:-false}" = "true" ]; then
+  dim "HDW_SKIP_BUILD=true —— 跳过镜像构建，直接用本地已有镜像"
+  BUILD_ARGS=(--no-build)
+else
+  # 必须先单独建 hdw-rag：hdw-mineru 的 Dockerfile 第一行是
+  # `FROM hyperdrivewave-hdw-rag:latest`，但 compose 里 mineru 没有声明对 rag 的
+  # depends_on，所以 `up --build` 的构建顺序没有保证——全新机器上会随机失败。
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" build hdw-rag
+  BUILD_ARGS=(--build)
+fi
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" \
-  "${args[@]}" up -d --build --remove-orphans
+  "${args[@]}" up -d "${BUILD_ARGS[@]}" --remove-orphans
 
 if wants_host_llama; then
-  systemctl --user link "$ROOT/HDW_Inference/llama/hyperdrivewave-llama.service" >/dev/null 2>&1 || true
-  systemctl --user daemon-reload
+  install_hdw_units "$ROOT"
   systemctl --user enable --now hyperdrivewave-llama.service >/dev/null
   # 轮询用 LLAMA_HEALTH_URL（由 HDW_LLAMA_PORT 推导），不再写死 1919。
   # 写死的话改了端口会在这里空等 180 秒，然后报"llama 启动失败"，

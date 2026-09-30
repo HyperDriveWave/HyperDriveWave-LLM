@@ -144,6 +144,13 @@ HDW_Inference/llama/llama.cpp-upstream/
 HDW_Inference/llama/*.bak_*
 HDW_Inference/llama/*.bak-*
 
+# 离线 cmake（Dockerfile.container 用）。是 30 MB 的 pip wheel 解压出来的，
+# 由 Scripts/fetch_offline_toolchain.sh 在**有外网**的机器上生成后带过去。
+# 只保留说明文件——它同时兼作 .dockerignore 下的构建上下文占位，
+# 缺了它 `COPY cmake-offline /opt/cmake-offline` 会直接失败。
+HDW_Inference/llama/cmake-offline/*
+!HDW_Inference/llama/cmake-offline/README.md
+
 .venv/
 venv/
 __pycache__/

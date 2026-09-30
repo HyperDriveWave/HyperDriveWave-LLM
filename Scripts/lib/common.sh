@@ -185,6 +185,49 @@ systemd_path() {
   esac
 }
 
+# 把仓库里的 systemd 单元模板装到 ~/.config/systemd/user/。
+#
+# 单元文件里写的是占位符 @HDW_ROOT@，安装时替换成本机实际路径。
+#
+# **不要改回 `systemctl --user link 仓库里那份`。** link 只是建个软链，文件内容
+# 原样生效——而仓库里那份的路径是**模板生成时那台机器**的。换一台机器、或只是把
+# 项目挪个目录，单元就指向不存在的文件，服务起不来。更隐蔽的是
+# `EnvironmentFile=-...` 前面那个 `-`：文件缺失时 systemd 不报错、静默用默认值，
+# 于是服务看着"启起来了"，跑的却是另一套配置。
+# （2026-10-01 在一台麒麟 V10 服务器上踩到：项目在 /opt/hdw/app，单元却指向
+#   %h/桌面/HyperDriveWave，ExecStart 直接 127。）
+#
+# deploy.sh 一直是**生成**单元的，所以那条路径没问题；出问题的是 start.sh
+# 走了 link。现在两边都走这个函数，只有一份实现。
+install_hdw_units() {
+  local root="${1:-}" dir sd_root name src content changed=0
+  [ -n "$root" ] || { warn "install_hdw_units 需要项目根路径"; return 1; }
+  sd_root="$(systemd_path "$root")"
+  dir="$(user_unit_dir)"
+  mkdir -p "$dir"
+
+  for name in hyperdrivewave-resource-coordinator.service hyperdrivewave-llama.service; do
+    case "$name" in
+      hyperdrivewave-resource-coordinator.service) src="$root/Scripts/$name" ;;
+      *)                                           src="$root/HDW_Inference/llama/$name" ;;
+    esac
+    [ -f "$src" ] || { dim "  跳过（模板不存在）：$src"; continue; }
+
+    content="$(<"$src")"
+    # 用 bash 的字符串替换而不是 sed：路径里出现 & 或 | 时 sed 会当成元字符。
+    content="${content//@HDW_ROOT@/$sd_root}"
+    if write_if_different "$dir/$name" "$content"$'\n'; then
+      info "已安装单元：$name"
+      changed=1
+    else
+      dim "  单元未变：$name"
+    fi
+  done
+
+  [ "$changed" = 1 ] && systemctl --user daemon-reload
+  return 0
+}
+
 # 读秒级确认，避免 curl 挂了整个脚本
 http_ok() {
   local url="$1" timeout="${2:-5}"

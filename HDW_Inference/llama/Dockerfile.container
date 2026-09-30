@@ -1,0 +1,84 @@
+# 在容器里编、也在容器里跑 llama.cpp。
+#
+# 什么时候需要它
+# ──────────────
+# 宿主跑不了 HDW_Inference/llama/llama.cpp-upstream/build-cuda-multi/ 里的预编译
+# 二进制时。那套二进制是在新版发行版上编的，依赖 GLIBC_2.43 / GLIBCXX_3.4.32 /
+# libssl.so.3；麒麟 V10、RHEL8 这类机器只有 glibc 2.28 + OpenSSL 1.1.1。
+#
+# **补 .so 是没用的**：glibc 是 C 库本体，不能外挂一份新的。实测在麒麟 V10 上
+# 的表现是
+#     error while loading shared libraries: libssl.so.3
+# 退出码 127 —— 而且 start.sh 里那段 `--spec-type` 探测会拿这个跑不起来的
+# 二进制去问 --help，于是误报「不支持 MTP，已忽略」，把人引到完全无关的方向。
+#
+# 容器自带新版 glibc，把这一整类问题挡在外面。宿主只需要有 Docker 和
+# nvidia-container-toolkit —— CUDA toolkit、gcc、cmake 全在镜像里，宿主一个
+# 都不用装。
+#
+# 怎么建
+# ──────
+#   docker compose -f Configs/docker-compose.yml build hdw-llama
+# 或手工：
+#   docker build -f Dockerfile.container --build-arg CUDA_ARCH=89 \
+#     -t hyperdrivewave-hdw-llama .
+#
+# CUDA_ARCH 必须对上目标卡
+# ────────────────────────
+# 编错了**不会报错**，只会让 ggml 回落成 CPU 后端，表现是「服务起来了、模型也
+# 加载了，但慢到不可用」（27B 约 1 token/s）。这是个安静的失败，所以别猜：
+#   L20 = 89   A100 = 80   H100 = 90   RTX 5090 = 120
+# 混合部署写成分号分隔：--build-arg CUDA_ARCH="80;89"
+
+ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
+
+# ─── 构建阶段 ────────────────────────────────────────────────────────────────
+FROM ${CUDA_IMAGE} AS build
+
+ARG CUDA_ARCH=89
+# 留个可调项：64 核机器上默认 8 太保守，但也不好写死 48 —— 这机器可能还有别人在用。
+ARG BUILD_JOBS=8
+
+# cmake 不在 CUDA 镜像里。两个来源，按顺序取：
+#   1) cmake-offline/  —— pip 的 manylinux wheel 解压而来（自包含、不挑 glibc）。
+#      无外网的机器走这条。取法见 README 的「离线部署」一节。
+#   2) 镜像自带的 cmake —— 有网时可以在上面 apt/pip 装。
+# COPY 一个只含 .gitkeep 的空目录是合法的，所以这里不需要条件判断。
+COPY cmake-offline /opt/cmake-offline
+
+# 只拷源码。.dockerignore 已经把 build*/ 那几 GB 产物挡掉了。
+COPY llama.cpp-upstream /src
+
+RUN set -eux; \
+    if [ -x /opt/cmake-offline/cmake/data/bin/cmake ]; then \
+      CM=/opt/cmake-offline/cmake/data/bin/cmake; \
+    else \
+      CM="$(command -v cmake)"; \
+    fi; \
+    "$CM" -S /src -B /build \
+      -DGGML_CUDA=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_CURL=OFF \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_SERVER=ON; \
+    "$CM" --build /build --target llama-server -j "${BUILD_JOBS}"
+
+# ─── 运行阶段 ────────────────────────────────────────────────────────────────
+# 刻意与构建阶段用同一个基础镜像：产物是链接这一版 glibc/libstdc++ 编出来的，
+# 换一个更小的基础镜像就得重新对齐版本，省下的是磁盘，付出的是一类很难查的
+# "version `GLIBC_2.xx' not found"。
+FROM ${CUDA_IMAGE}
+
+COPY --from=build /build/bin /opt/llama/bin
+
+# llama-server 本体只有十几 KB，真正的代码在同目录的 .so 里。
+# 它的 RUNPATH 是编译时的绝对路径，所以必须显式指回同目录。
+ENV LD_LIBRARY_PATH=/opt/llama/bin
+
+WORKDIR /opt/llama
+
+# 参数由 compose 的 command 给。这里只放一个最小可用的默认，
+# 好让 `docker run <镜像>` 不至于什么都不做。
+ENTRYPOINT ["/opt/llama/bin/llama-server"]

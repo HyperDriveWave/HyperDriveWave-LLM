@@ -1,0 +1,24 @@
+# Dockerfile.container 的构建上下文。
+#
+# 唯一目的是别把那几 GB 的预编译产物拖进上下文——容器里要从源码重编，
+# 它们一个都用不上，只会让 `docker build` 卡在 "Sending build context" 很久。
+
+# 预编译构建树（build-cuda-multi 约 1 GB）
+llama.cpp-upstream/build
+llama.cpp-upstream/build-cuda
+llama.cpp-upstream/build-cuda-multi
+
+# 宿主的 Vulkan / CUDA 构建目录
+build
+build-cuda
+
+# git 历史：构建只要工作树
+llama.cpp-upstream/.git
+.git
+
+# upstream 自带的测试模型（约 75 MB），构建用不到
+llama.cpp-upstream/models
+
+# 本地的 start.sh 备份、日志之类
+*.bak_*
+*.log

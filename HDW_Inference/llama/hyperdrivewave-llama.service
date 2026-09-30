@@ -1,12 +1,22 @@
+# HyperDriveWave 本地推理（llama.cpp，systemd **用户**单元）
+#
+# ⚠ 这是**模板**，不是能直接用的单元文件：@HDW_ROOT@ 由
+#   Scripts/lib/common.sh 的 install_hdw_units() 在安装时替换成实际路径。
+#   说明见 Scripts/hyperdrivewave-resource-coordinator.service 顶部的注释。
+#
+# 只在 **宿主能直接跑预编译二进制** 的机器上用。麒麟 V10 / RHEL8 那类
+# glibc 太旧的机器跑不了（依赖 GLIBC_2.43 / libssl.so.3），要改用 compose 的
+# hdw-llama 服务（见 HDW_Inference/llama/Dockerfile.container）。
+
 [Unit]
 Description=HyperDriveWave llama.cpp local inference
 After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/桌面/HyperDriveWave
-EnvironmentFile=-%h/桌面/HyperDriveWave/Configs/.env
-ExecStart=%h/桌面/HyperDriveWave/HDW_Inference/llama/start.sh
+WorkingDirectory=@HDW_ROOT@
+EnvironmentFile=-@HDW_ROOT@/Configs/.env
+ExecStart=@HDW_ROOT@/HDW_Inference/llama/start.sh
 Restart=always
 RestartSec=3
 TimeoutStopSec=60

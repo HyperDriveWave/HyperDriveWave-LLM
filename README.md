@@ -8,7 +8,7 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
 <项目根>
 ```
 
-本文档以当前代码和 Compose 配置为准，更新时间：2026-09-26。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
+本文档以当前代码和 Compose 配置为准，更新时间：2026-09-30。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
 
 ## 1. 设计原则
 
@@ -1095,6 +1095,9 @@ WebUI 行为：
 3. NVIDIA 驱动和 NVIDIA Container Toolkit，若启用 `gpu` profile。
    **不需要单独安装 CUDA toolkit** —— `HDW_Inference/llama/llama.cpp-upstream/build-cuda-multi/`
    里已随包携带所需的 CUDA runtime 库，`start.sh` 会按自身位置设好 `LD_LIBRARY_PATH`。
+   但要注意：**这条只覆盖 CUDA 那部分**。那份二进制还链了宿主的新版 glibc 和
+   OpenSSL 3，在麒麟 V10 / RHEL8 这类老发行版上照样起不来（表现为
+   `error while loading shared libraries: libssl.so.3`）。判断方法与容器化替代方案见 §10.13。
 4. systemd 用户管理器可用（`systemctl --user`）——llama 与资源协调器都是用户级服务，
    容器或精简系统里通常没有，`deploy.sh` 会前置检查并明确报错。
 5. 足够的磁盘空间：Qwen、BGE、MinerU 模型和运行索引都不小。完整部署约需 60G 以上。
@@ -1745,6 +1748,132 @@ bash Scripts/deploy.sh                                # 交互式：列出现状
 
 **以后加了显卡**：重跑 `bash Scripts/deploy.sh` 即可切回本地推理
 （把 `HDW_SKIP_LOCAL_LLM` 设回 `false`，并把 auth.csv 的默认模式改回 `offline` 或按需）。
+
+### 10.13 离线部署（目标机没有外网）
+
+内网隔离的服务器（电网、军工、工业现场很常见）装不了任何东西：拉不到镜像、
+pip 装不了包、dnf/apt 源不可达。这类机器上 `deploy.sh` 的联网阶段全部会失败，
+要换一条路走。
+
+**先在能上网的机器上准备**：
+
+```bash
+# 1) 代码（用 git 打包，不要直接 rsync 工作区——见下面的警告）
+git archive --format=tar HEAD | gzip > hdw-code.tar.gz
+
+# 2) 镜像
+bash Scripts/pack_hdw.sh                 # 产出 docker save 的 tar
+# 3) 离线 cmake（容器里编 llama.cpp 要用，见下文）
+bash Scripts/fetch_offline_toolchain.sh
+```
+
+**搬到目标机后**：
+
+```bash
+docker load < hdw-images.tar
+# .env 里加上：
+#   HDW_SKIP_BUILD=true          # 不让 start.sh 去 build（无外网必挂）
+#   HDW_SKIP_LOCAL_LLM=true      # 只在改用容器化 llama 时需要，见下
+bash Scripts/start.sh
+```
+
+#### ⚠ 搬代码时**不要直接 rsync 工作区**
+
+`rsync -a` 不带 `--exclude-from` 的话会把**工作区里的一切**搬过去，包括
+`.gitignore` 里那些**故意不随代码走**的东西：`Configs/.env`、
+`HDW_Security/auth/auth.csv`（用户凭据）、
+`HDW_DataFoundation/Mapping/Log_Fetching/config.json`（含 SIS/LIEMS 密码）、
+`HDW_Frontend/FRP/certs/server.key`。
+
+2026-10-01 实际发生过一次：rsync 用了自己手写的排除表而不是 `.gitignore`，
+上述四个文件全被搬到新服务器上，事后逐个清理。
+
+要搬工作区就用 `git` 自己算排除表：
+
+```bash
+# 把 .gitignore 翻译成 rsync 的 --exclude 参数
+git ls-files --others --ignored --exclude-standard --directory \
+  | sed 's|^|--exclude=/|' > /tmp/rsync-excludes.txt
+rsync -a --exclude-from=/tmp/rsync-excludes.txt ./ user@target:/opt/hdw/app/
+```
+
+`Configs/.env` 是唯一的例外——目标机确实需要它，但要**单独确认**里面每一条
+凭据都是这台机器该有的。
+
+#### 预编译的 llama.cpp 可能跑不起来
+
+`HDW_Inference/llama/llama.cpp-upstream/build-cuda-multi/` 里的二进制是在**新版
+发行版**上编的，依赖 `GLIBC_2.43` / `GLIBCXX_3.4.32` / `libssl.so.3`。
+麒麟 V10、RHEL8、CentOS 这类机器只有 glibc 2.28 + OpenSSL 1.1.1。
+
+**补 `.so` 是没用的**——glibc 是 C 库本体，不能外挂一份新的。表现为：
+
+```text
+llama-server: error while loading shared libraries: libssl.so.3
+# systemd 里是 status=127，且 start.sh 会**一行输出都没有**地退出
+```
+
+先花十秒确认目标机属于哪种情况：
+
+```bash
+ldd --version | head -1                    # 2.28 → 需要容器方案
+ldd HDW_Inference/llama/llama.cpp-upstream/build-cuda-multi/bin/llama-server 2>&1 | grep -c 'GLIBC_2.3[0-9]'
+```
+
+有缺失就走**容器化 llama**：容器自带新版 glibc，宿主只需要 Docker +
+nvidia-container-toolkit，CUDA toolkit 和编译器一个都不用装。
+
+```bash
+# CUDA_ARCH 必须对上目标卡：L20=89  A100=80  H100=90  RTX5090=120
+# 编错了不报错，只会回落 CPU（27B 约 1 token/s），是个安静的失败
+docker compose -f Configs/docker-compose.yml build hdw-llama
+# 把 llama-container 加进 HDW_COMPOSE_PROFILES，并关掉宿主那条路
+HDW_COMPOSE_PROFILES="base knowledge web llama-container"
+HDW_SKIP_LOCAL_LLM=true
+```
+
+`hdw-llama` 用 host 网络直接监听宿主 `${HDW_LLAMA_PORT}`，所以 qa-api 里
+`HDW_LOCAL_LLM_BASE_URL=http://host.docker.internal:1919/v1` 不用改。
+
+编 llama.cpp 需要 cmake，而 `nvidia/cuda:*-devel-*` 镜像里**没有 cmake**；
+无外网又装不了。所以先用 `Scripts/fetch_offline_toolchain.sh` 从 PyPI 取一个
+manylinux 自包含的 cmake 放进构建上下文（细节见
+`HDW_Inference/llama/cmake-offline/README.md`）。
+
+#### 搬镜像：用层摘要校验，不要用镜像 ID
+
+```bash
+docker image inspect <image> --format '{{range .RootFS.Layers}}{{println .}}{{end}}'
+```
+
+**`docker save` / `docker load` 之后镜像 ID 会变**，如果源机的 Docker 用的是
+containerd 镜像存储（`docker info` 的 Storage Driver 显示 `overlayfs` 且
+`driver-type: io.containerd.snapshotter.v1`）而目标机是经典 `overlay2`。
+config JSON 会被重新序列化，ID 必然不同——**内容其实一模一样**。
+拿 ID 比对会得到一片"搬运失败"的假警报（2026-10-01 实测：10 个镜像全部报不一致，
+逐层比对后 10/10 完全一致）。
+
+#### 其他
+
+- **无外网 = 无 DNS** 的机器上，`host.docker.internal` 仍然可用——它由 Docker
+  自己按 compose 里的 `extra_hosts: host.docker.internal:host-gateway` 解析，
+  不走宿主 DNS。但任何真的外部域名（在线 API、SIS 系统）都会失败，
+  也就是**在线模式与 SIS 测点在这类机器上不可用**。
+- `loginctl enable-linger <user>` 要开。不开的话用户级服务只在登录会话存在时
+  运行，**机器重启后 llama 和资源协调器不会自启**（`deploy.sh` 会做这一步，
+  手工部署容易漏）。
+- 目标机 Python 很旧（如 3.7）不影响容器内的服务。`Scripts/resource_coordinator.py`
+  虽然用了 `str | None` / `dict[str, object]` 这类 3.9+ 写法，但文件头有
+  `from __future__ import annotations`，标注全部延迟求值，**在 3.7 上实测可正常运行**。
+- `Scripts/ingest_knowledge.sh` 在**宿主机**上跑 ETL，要求宿主有完整的 Python
+  环境。无外网的机器通常没有，改为在 `hdw-ingest` 容器里跑同一条链路：
+
+  ```bash
+  docker cp <脚本> hyperdrivewave-hdw-ingest-1:/tmp/x.sh
+  docker exec hyperdrivewave-hdw-ingest-1 bash /tmp/x.sh
+  ```
+
+  或直接在 WebUI 的知识库页面点重建（走 ingest-api，接口需要登录）。
 
 ## 11. 日常运维命令
 
