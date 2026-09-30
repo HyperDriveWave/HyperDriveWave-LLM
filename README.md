@@ -8,7 +8,7 @@ HyperDriveWave 是一个面向工业场景的私有化知识问答系统。它�
 <项目根>
 ```
 
-本文档以当前代码和 Compose 配置为准，更新时间：2026-09-30。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
+本文档以当前代码和 Compose 配置为准，更新时间：2026-10-01。未来接手本项目的开发者或 AI 应先读本文档，再读 `架构.md`，最后以 `Configs/docker-compose.yml` 和各服务的 Dockerfile 为实际运行依据。
 
 ## 1. 设计原则
 
@@ -1928,6 +1928,17 @@ config JSON 会被重新序列化，ID 必然不同——**内容其实一模一
 
   2026-09-30 实测：修复前后差 **28489 秒**（约 7.9 小时），chrony 的 `makestep`
   一步跳正，再 `hwclock --systohc` 写入 RTC 才扛得住重启。
+
+  **改完时钟要重建在"错时间"下启动的容器。** Docker 把容器的 `StartedAt`
+  记在容器元数据里，那是**启动当时**的时钟读数。时钟往回拨 8 小时后，之前
+  启动的容器其 `StartedAt` 跑到了未来，`docker ps` 算出的 uptime 变成负数，
+  显示成 `Up Less than a second` —— 看着像全部刚崩过一遍。
+  容器其实跑得好好的，但让它们在正确时钟下重新初始化一次更干净：
+
+  ```bash
+  bash Scripts/compose.sh up -d --no-build --force-recreate \
+    hdw-mcp hdw-qa-api hdw-ingest hdw-api hdw-rag hdw-llama hdw-llama-2 hdw-mineru
+  ```
 
 - **「没有外网」和「没有 DNS」是两件事，别搞混。** 两者症状一样
   （`curl` 域名返回 `000`），修法完全不同。
