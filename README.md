@@ -1894,10 +1894,36 @@ config JSON 会被重新序列化，ID 必然不同——**内容其实一模一
 
 #### 其他
 
-- **无外网 = 无 DNS** 的机器上，`host.docker.internal` 仍然可用——它由 Docker
-  自己按 compose 里的 `extra_hosts: host.docker.internal:host-gateway` 解析，
-  不走宿主 DNS。但任何真的外部域名（在线 API、SIS 系统）都会失败，
-  也就是**在线模式与 SIS 测点在这类机器上不可用**。
+- **「没有外网」和「没有 DNS」是两件事，别搞混。** 两者症状一样
+  （`curl` 域名返回 `000`），修法完全不同。
+
+  先分清是哪一种——**用 IP 直连，绕开域名解析**：
+
+  ```bash
+  ip route show default                      # 有没有默认路由
+  timeout 5 bash -c 'echo > /dev/tcp/223.5.5.5/53' && echo DNS可达 || echo 不可达
+  grep -c '^nameserver' /etc/resolv.conf      # 有没有配解析器
+  ```
+
+  2026-10-01 实际踩过：一台机器的 `/etc/resolv.conf` 里**一个 nameserver
+  都没有**，当时只测了 `curl https://pypi.org` 得到 `000`，就判定成「没有
+  外网」——**这个判断是错的**。它的默认路由好好的，223.5.5.5 等 DNS 服务器
+  按 IP 也全可达，缺的只是一个解析器。补上 `nameserver` 之后在线 API 和
+  企业 SIS 立刻就通了。
+
+  **补完必须重启容器。** Docker 在**容器创建时**就把宿主的 `resolv.conf`
+  烤进去了，只改宿主不重启，容器里依旧解析不了。判断方法——看容器内的：
+
+  ```bash
+  docker exec <容器> cat /etc/resolv.conf
+  # 没配好： # NO EXTERNAL NAMESERVERS DEFINED
+  # 配好了： # ExtServers: [host(223.5.5.5) host(114.114.114.114)]
+  ```
+
+  真正没有外网的机器上，`host.docker.internal` 仍然可用——它由 Docker 自己
+  按 compose 里的 `extra_hosts: host.docker.internal:host-gateway` 解析，
+  不走宿主 DNS。但外部域名（在线 API、SIS 系统）会失败，也就是**在线模式与
+  SIS 测点在这类机器上不可用**。
 - `loginctl enable-linger <user>` 要开。不开的话用户级服务只在登录会话存在时
   运行，**机器重启后 llama 和资源协调器不会自启**（`deploy.sh` 会做这一步，
   手工部署容易漏）。
