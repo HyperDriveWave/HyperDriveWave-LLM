@@ -192,6 +192,16 @@ done
 # ═══ 3. llama.cpp（重点：不能只看 /health）════════════════════
 section "llama.cpp 本地推理"
 
+# 下面那段只在「本地推理启用」时才跑，但第 9 节「模型配置一致性」要拿
+# PROPS_MODEL 跟 config.json 比对。**必须先在这里初始化**：
+# 脚本开头是 `set -u`，未绑定变量会直接把脚本打死在第 9 节，
+# 第 10 节以后的检查（模型权重、备份、linger……）**一项都不会跑**，
+# 而人看到的是一份"跑了一大半、大部分是绿的"的输出，很容易以为通过了。
+# 2026-10-01 在 HDW_SKIP_LOCAL_LLM=true 的部署上实际踩到——也就是说
+# README §10.12 记录的那条「无 GPU 部署」路径，验收脚本从来没跑完整过。
+PROPS_MODEL=""
+_llama_skipped=0
+
 # 无 GPU 的部署会显式停用本地推理（deploy.sh 写 HDW_SKIP_LOCAL_LLM=true）。
 # 这时候报一堆"llama 不通"是误导——它是**按配置就该没在跑**。
 # 改为检查"在线 API 是否配好"，那才是这类部署真正该验的东西。
@@ -514,7 +524,11 @@ else
   # config.json 是真正的事实源（llama/start.sh 与 resource_coordinator 都读它），
   # .env 的 HDW_LOCAL_LLM_MODEL 只影响 qa-api 显示。两者分叉会让
   # 「界面显示的模型」和「实际跑的模型」不一致。
-  if [ -n "$PROPS_MODEL" ] && [ "$(basename "$PROPS_MODEL")" = "$CFG_MODEL" ]; then
+  if [ "${_llama_skipped:-0}" = "1" ]; then
+    # 本地推理按配置就没在跑，没有"实际加载的模型"可比。
+    # 明确说一句，而不是静默跳过——静默会让人以为这项验过了。
+    dim "  本地推理未启用，跳过「实际加载模型 vs config.json」的比对"
+  elif [ -n "$PROPS_MODEL" ] && [ "$(basename "$PROPS_MODEL")" = "$CFG_MODEL" ]; then
     pass "实际加载的模型与 config.json 一致：$CFG_MODEL"
   elif [ -n "$PROPS_MODEL" ]; then
     fail "实际加载 $(basename "$PROPS_MODEL")，但 config.json 写的是 $CFG_MODEL"
