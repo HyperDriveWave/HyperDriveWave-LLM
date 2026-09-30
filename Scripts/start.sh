@@ -105,6 +105,21 @@ for profile in "${profiles[@]}"; do
   args+=(--profile "$profile")
 done
 
+# ── compose 文件清单 ────────────────────────────────────────────
+# 默认只有主文件；要让 RAG/MinerU 上 GPU 再叠一个覆盖文件。
+#
+# 开闸条件就是 HDW_RAG_DEVICE=cuda，**不另设布尔开关**：那个键本来就是
+# 「RAG 跑在哪个设备上」，再引一个开关就会出现「开关说上 GPU、键却说 cpu」
+# 这种自相矛盾的状态，而且两种都不算错，排查时非常费劲。
+#
+# 覆盖文件给 RAG 和 MinerU 发卡，两者**默认共用 1 号**（llama 占 0 号），
+# 所以机器上两张卡就够。想拆开就把 HDW_MINERU_GPU 设成别的号。
+FILES=(-f "$COMPOSE_FILE")
+if [ "${HDW_RAG_DEVICE:-cpu}" = "cuda" ]; then
+  FILES+=(-f "$ROOT/Configs/docker-compose.rebuild-gpu.yml")
+  dim "RAG/MinerU 启用 GPU（叠加 docker-compose.rebuild-gpu.yml，卡号取自 HDW_RAG_GPU / HDW_MINERU_GPU）"
+fi
+
 echo "starting HyperDriveWave with profiles: ${profiles[*]}"
 
 # ── 要不要重新构建镜像 ──────────────────────────────────────────
@@ -125,11 +140,11 @@ else
   # 必须先单独建 hdw-rag：hdw-mineru 的 Dockerfile 第一行是
   # `FROM hyperdrivewave-hdw-rag:latest`，但 compose 里 mineru 没有声明对 rag 的
   # depends_on，所以 `up --build` 的构建顺序没有保证——全新机器上会随机失败。
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" build hdw-rag
+  docker compose --env-file "$ENV_FILE" "${FILES[@]}" build hdw-rag
   BUILD_ARGS=(--build)
 fi
 
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" \
+docker compose --env-file "$ENV_FILE" "${FILES[@]}" \
   "${args[@]}" up -d "${BUILD_ARGS[@]}" --remove-orphans
 
 if wants_host_llama; then
@@ -149,7 +164,7 @@ if wants_host_llama; then
   fi
 fi
 
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps
+docker compose --env-file "$ENV_FILE" "${FILES[@]}" ps
 
 WEBUI_HOST="${HDW_WEBUI_BIND:-127.0.0.1}"
 if [ "$WEBUI_HOST" = "0.0.0.0" ]; then

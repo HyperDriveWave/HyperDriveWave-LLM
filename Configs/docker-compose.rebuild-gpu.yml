@@ -1,12 +1,55 @@
+# 把 RAG / MinerU 放到 GPU 上。
+#
+# 两种用法，机制相同，所以共用一个文件：
+#   · **长期启用** —— RAG 每次问答都要跑嵌入 + 重排，放 GPU 上单次问答能省约 1 秒；
+#   · **知识库重建期间** —— 几万个分块的嵌入在 CPU 上要跑几十分钟（实测 9021 个
+#     分块吃掉约 32 核、半个多小时）。
+# 不加载它时两者都跑 CPU —— 架构.md 里「常态 RAG 保持 CPU 后备」说的就是这种状态。
+#
+# 用法：
+#   docker compose --env-file Configs/.env \
+#     -f Configs/docker-compose.yml -f Configs/docker-compose.rebuild-gpu.yml \
+#     --profile base up -d hdw-rag
+#   （Scripts/start.sh 在 HDW_RAG_DEVICE=cuda 时会自动带上这个文件。）
+#
+# 卡号从 .env 取，**默认是 1，不是 0**：
+# 0 号通常被 llama 占着——它用 deploy.resources 独占 CUDA0 并常驻十几 GB 模型，
+# RAG 挤上去会和它抢显存，轻则拖慢问答，重则分配失败起不来。
+# 这个文件原先把卡号写死成 "0"，在 0 号已被占用的机器上直接套用就会撞车。
+# （2026-10-01 在第二套部署上发现：那台机器 4×L20，llama 占 0 号。）
+#
+# **RAG 和 MinerU 默认共用同一张卡**（都取 HDW_RAG_GPU / HDW_MINERU_GPU，默认 1）。
+# 它们的显存需求加起来不大——bge-m3 + reranker 各约 2.3 GB，MinerU 的版面模型
+# 约 4 GB，合计不到 10 GB，一张 46 GB 的 L20 绰绰有余。而且 MinerU 只在解析
+# 文档时才加载模型，与 RAG 的常驻嵌入几乎不重叠，争用可以忽略。
+# 要拆到两张卡就把 HDW_MINERU_GPU 改成别的号。
+#
+# 为什么用 deploy.resources 而不是 `gpus: all` + `NVIDIA_VISIBLE_DEVICES`：
+# 后者那个环境变量会被 nvidia runtime 改写掉——实测容器里读到的始终是 all，
+# 限卡并不可靠。DeviceIDs 才是真正落到 HostConfig 上的东西，容器内
+# `nvidia-smi -L` 只会列出指定的卡。hdw-llama 用的就是这一套，可对照。
+
 services:
   hdw-rag:
-    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${HDW_RAG_GPU:-1}"]
+              capabilities: [gpu]
     environment:
+      # 只要设备到位，这个键必须同时是 cuda —— 光给卡不改它，服务仍按 .env 里的
+      # cpu 跑（rag 的 DEVICE 取自 HDW_RAG_DEVICE，见 RAG_Service/app.py）。
       HDW_RAG_DEVICE: cuda
-      NVIDIA_VISIBLE_DEVICES: "0"
 
   hdw-mineru:
-    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${HDW_MINERU_GPU:-1}"]
+              capabilities: [gpu]
     environment:
       MINERU_DEVICE_MODE: cuda
-      NVIDIA_VISIBLE_DEVICES: "0"
