@@ -12,6 +12,12 @@ name: hyperdrivewave
 # 写成字符串而不是列表：compose 会对字符串做分词，${HDW_LLAMA_EXTRA_ARGS}
 # 展开成的 `--spec-type draft-mtp` 才会被拆成两个参数。写成 YAML 列表的话
 # 它就成了**一个**带空格的参数，llama-server 会直接报未知选项。
+#
+# 多模态：Qwen3.8-27B 本身是原生视觉语言模型，但**视觉那部分不在语言模型的
+# GGUF 里**，而是单独一个 mmproj 文件（视觉投影器）。没有它，上传的图片对
+# 模型就是乱码 token。要关掉多模态就把 HDW_LLAMA_MMPROJ_ARGS 置空 ——
+# 两个参数必须一起给或者一起不给（--mmproj-offload 没有 --mmproj 会直接报错）。
+# mmproj 与语言模型来自同一个魔搭仓库 ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF。
 x-hdw-llama-args: &hdw-llama-args >-
   --model /models/LLM_Models/Qwen3.8-27B-GSQ/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
   --host 0.0.0.0
@@ -23,6 +29,7 @@ x-hdw-llama-args: &hdw-llama-args >-
   --cache-type-k ${HDW_LLAMA_CACHE_TYPE_K:-q4_0}
   --cache-type-v ${HDW_LLAMA_CACHE_TYPE_V:-q4_0}
   --flash-attn auto
+  ${HDW_LLAMA_MMPROJ_ARGS:---mmproj /models/LLM_Models/Qwen3.8-27B-GSQ/mmproj-Qwen3.8-27B-BF16.gguf --mmproj-offload}
   ${HDW_LLAMA_EXTRA_ARGS:---spec-type draft-mtp}
 
 services:
@@ -244,6 +251,11 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
     profiles: ["base"]
     environment:
+      # 容器默认没有 TZ，裸的 date.today() / now() 走 UTC —— 北京时间 0:00-8:00
+      # 这段时间里它们拿到的是**前一天**。实测：宿主 10-01 07:35，容器以为是 09-30 23:35，
+      # 于是「抓今天的日志」抓回来的是昨天的。.astimezone() 同理，会把 UTC 当本地时间报出去。
+      # 注意：显式写 timezone.utc 的地方不受影响（那些是 aware datetime）。
+      TZ: ${HDW_TZ:-Asia/Shanghai}
       HDW_BGE_M3_PATH: /models/RAG_Models/bge-m3
       HDW_RERANKER_PATH: /models/RAG_Models/bge-reranker-v2-m3
       HDW_RAG_INDEX_PATH: /data/rag/chunks.jsonl
@@ -304,6 +316,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      # 容器默认没有 TZ，裸的 date.today() / now() 走 UTC —— 北京时间 0:00-8:00
+      # 这段时间里它们拿到的是**前一天**。实测：宿主 10-01 07:35，容器以为是 09-30 23:35，
+      # 于是「抓今天的日志」抓回来的是昨天的。.astimezone() 同理，会把 UTC 当本地时间报出去。
+      # 注意：显式写 timezone.utc 的地方不受影响（那些是 aware datetime）。
+      TZ: ${HDW_TZ:-Asia/Shanghai}
       DATABASE_URL: ${DATABASE_URL:-postgresql://hdw:change_me@hdw-postgres:5432/hdw}
       NEO4J_URI: bolt://hdw-neo4j:7687
       HDW_NEO4J_HTTP_URL: http://hdw-neo4j:7474/db/neo4j/tx/commit
@@ -393,6 +410,11 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
     profiles: ["base"]
     environment:
+      # 容器默认没有 TZ，裸的 date.today() / now() 走 UTC —— 北京时间 0:00-8:00
+      # 这段时间里它们拿到的是**前一天**。实测：宿主 10-01 07:35，容器以为是 09-30 23:35，
+      # 于是「抓今天的日志」抓回来的是昨天的。.astimezone() 同理，会把 UTC 当本地时间报出去。
+      # 注意：显式写 timezone.utc 的地方不受影响（那些是 aware datetime）。
+      TZ: ${HDW_TZ:-Asia/Shanghai}
       HDW_KNOWLEDGE_SOURCE_ROOT: /data/knowledge_sources
       HDW_MINERU_PARSED_ROOT: /data/mineru/parsed
       HDW_RAG_INDEX_PATH: /data/rag/chunks.jsonl
@@ -444,6 +466,11 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
     profiles: ["base"]
     environment:
+      # 容器默认没有 TZ，裸的 date.today() / now() 走 UTC —— 北京时间 0:00-8:00
+      # 这段时间里它们拿到的是**前一天**。实测：宿主 10-01 07:35，容器以为是 09-30 23:35，
+      # 于是「抓今天的日志」抓回来的是昨天的。.astimezone() 同理，会把 UTC 当本地时间报出去。
+      # 注意：显式写 timezone.utc 的地方不受影响（那些是 aware datetime）。
+      TZ: ${HDW_TZ:-Asia/Shanghai}
       # 本服务自己不做问答，转发给 qa-api 的服务间入口。
       # 走服务名 + 容器内端口，与宿主映射无关（改 HDW_QA_API_PORT 不影响这里）。
       HDW_QA_API_URL: http://hdw-qa-api:8080
@@ -481,6 +508,11 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
     profiles: ["base"]
     environment:
+      # 容器默认没有 TZ，裸的 date.today() / now() 走 UTC —— 北京时间 0:00-8:00
+      # 这段时间里它们拿到的是**前一天**。实测：宿主 10-01 07:35，容器以为是 09-30 23:35，
+      # 于是「抓今天的日志」抓回来的是昨天的。.astimezone() 同理，会把 UTC 当本地时间报出去。
+      # 注意：显式写 timezone.utc 的地方不受影响（那些是 aware datetime）。
+      TZ: ${HDW_TZ:-Asia/Shanghai}
       HDW_MCP_BIND: 0.0.0.0
       HDW_MCP_PORT: 8766
       HDW_MCP_MAPPING_ROOT: /data/mapping
