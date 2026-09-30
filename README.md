@@ -1894,6 +1894,21 @@ config JSON 会被重新序列化，ID 必然不同——**内容其实一模一
 
 #### 其他
 
+- **手敲 compose 命令请走 `Scripts/compose.sh`。** 它负责拼 `-f` 与
+  `--profile`，判据只写一份：
+
+  ```bash
+  bash Scripts/compose.sh ps
+  bash Scripts/compose.sh up -d hdw-rag
+  bash Scripts/compose.sh logs -f hdw-qa-api
+  ```
+
+  2026-10-01 我因为手敲时漏了 `-f docker-compose.rebuild-gpu.yml`，让 compose
+  把 `depends_on` 链上的 `hdw-rag` 一起按**没有 GPU 的基础配置**重建了。
+  症状极具欺骗性：**容器状态全绿、`/health` 也返回 200，但一检索就是 503**。
+  配置悄悄退化成了另一个部署，而所有"看状态"的手段都看不出来。
+  `start.sh` 现在也走这个入口，两处不会再漂移。
+
 - **「没有外网」和「没有 DNS」是两件事，别搞混。** 两者症状一样
   （`curl` 域名返回 `000`），修法完全不同。
 

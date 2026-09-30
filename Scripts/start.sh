@@ -100,25 +100,14 @@ if wants_host_llama; then
 fi
 
 read -r -a profiles <<< "$HDW_COMPOSE_PROFILES"
-args=()
-for profile in "${profiles[@]}"; do
-  args+=(--profile "$profile")
-done
 
-# ── compose 文件清单 ────────────────────────────────────────────
-# 默认只有主文件；要让 RAG/MinerU 上 GPU 再叠一个覆盖文件。
-#
-# 开闸条件就是 HDW_RAG_DEVICE=cuda，**不另设布尔开关**：那个键本来就是
-# 「RAG 跑在哪个设备上」，再引一个开关就会出现「开关说上 GPU、键却说 cpu」
-# 这种自相矛盾的状态，而且两种都不算错，排查时非常费劲。
-#
-# 覆盖文件给 RAG 和 MinerU 发卡，两者**默认共用 1 号**（llama 占 0 号），
-# 所以机器上两张卡就够。想拆开就把 HDW_MINERU_GPU 设成别的号。
-FILES=(-f "$COMPOSE_FILE")
-if [ "${HDW_RAG_DEVICE:-cpu}" = "cuda" ]; then
-  FILES+=(-f "$ROOT/Configs/docker-compose.rebuild-gpu.yml")
-  dim "RAG/MinerU 启用 GPU（叠加 docker-compose.rebuild-gpu.yml，卡号取自 HDW_RAG_GPU / HDW_MINERU_GPU）"
-fi
+# ── compose 一律走 Scripts/compose.sh ───────────────────────────
+# **不要在这里自己拼 -f 和 --profile。** 2026-10-01 踩过：换 qa-api 镜像时
+# 手敲的 compose 命令漏了 `-f docker-compose.rebuild-gpu.yml`，而 qa-api
+# depends_on hdw-rag，于是 rag 被按"没有 GPU"的基础配置重建 —— 容器状态全绿、
+# /health 也 200，但一检索就 503。配置悄悄退化成了另一个部署。
+# 判据只留一份（在 compose.sh 里），两处各写一份必然会漂移。
+COMPOSE=(bash "$SCRIPT_DIR/compose.sh")
 
 echo "starting HyperDriveWave with profiles: ${profiles[*]}"
 
@@ -140,12 +129,11 @@ else
   # 必须先单独建 hdw-rag：hdw-mineru 的 Dockerfile 第一行是
   # `FROM hyperdrivewave-hdw-rag:latest`，但 compose 里 mineru 没有声明对 rag 的
   # depends_on，所以 `up --build` 的构建顺序没有保证——全新机器上会随机失败。
-  docker compose --env-file "$ENV_FILE" "${FILES[@]}" build hdw-rag
+  "${COMPOSE[@]}" build hdw-rag
   BUILD_ARGS=(--build)
 fi
 
-docker compose --env-file "$ENV_FILE" "${FILES[@]}" \
-  "${args[@]}" up -d "${BUILD_ARGS[@]}" --remove-orphans
+"${COMPOSE[@]}" up -d "${BUILD_ARGS[@]}" --remove-orphans
 
 if wants_host_llama; then
   install_hdw_units "$ROOT"
@@ -164,7 +152,7 @@ if wants_host_llama; then
   fi
 fi
 
-docker compose --env-file "$ENV_FILE" "${FILES[@]}" ps
+"${COMPOSE[@]}" ps
 
 WEBUI_HOST="${HDW_WEBUI_BIND:-127.0.0.1}"
 if [ "$WEBUI_HOST" = "0.0.0.0" ]; then
