@@ -45,6 +45,20 @@ server {
     proxy_buffering off;
     proxy_request_buffering off;
 
+    # **这一条不能省。** nginx 默认 `client_max_body_size` 只有 1 MB，
+    # 而这里过的是**带图提问**的请求体。
+    # 数量级对一下：单图上限 10 MB（qa-api 的 _MAX_IMAGE_BYTES），
+    # base64 之后 ×1.33 ≈ 13.3 MB，最多 4 张 ≈ 53 MB，再加 JSON 外壳。
+    # 用默认的 1m 会让任何一张像样的图都必然 413。
+    #
+    # 取 64m 是与 WebUI 那侧（industrial-webui/nginx.conf）保持一致的既有约定，
+    # 不是随手拍的数。
+    #
+    # 症状很有迷惑性：qa-api 会把 nginx 的 413 包成
+    #     503 多模态不可用：offline/<模型>: LLM HTTP 413
+    # 看起来像**模型**不支持多模态，其实是**反向代理**把请求挡在了门外。
+    client_max_body_size 64m;
+
     # llama-server 那边 --timeout 是 3600。反向代理的读超时不能比它短，
     # 否则长回答会在中途被 nginx 掐成 504，而 llama 其实还在正常生成。
     proxy_connect_timeout 10s;
