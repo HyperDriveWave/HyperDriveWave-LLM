@@ -991,7 +991,18 @@ def _run_ingest(
                     )
                 _update_job(
                     job_id,
-                    message=f"任务结束后恢复大模型失败：{restore_error}",
+                    # **主因必须在前。** 这里原先只写"恢复大模型失败"，会把任务
+                    # 真正的失败原因整个盖掉：明明任务在 prepare 阶段就没跑起来，
+                    # 界面却显示成"任务跑完了、只是收尾出错"，排查方向直接跑偏。
+                    # 2026-10-04 实际踩到——协调器崩着的时候 prepare 和 restore
+                    # 都报 Connection refused，两个错误恰好一样才没露馅；
+                    # 换个场景（比如主因是磁盘满）真实原因就完全看不见了。
+                    # 下面的 `error` 字段本来就正确拼了两者，这里让 message 与它一致。
+                    message=(
+                        f"{current_error}；任务结束后恢复大模型失败：{restore_error}"
+                        if current_error
+                        else f"任务结束后恢复大模型失败：{restore_error}"
+                    ),
                     error="; ".join(filter(None, (current_error, str(restore_error)))),
                 )
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -1174,7 +1185,18 @@ def _run_reset(job_id: str) -> None:
                     )
                 _update_job(
                     job_id,
-                    message=f"任务结束后恢复大模型失败：{restore_error}",
+                    # **主因必须在前。** 这里原先只写"恢复大模型失败"，会把任务
+                    # 真正的失败原因整个盖掉：明明任务在 prepare 阶段就没跑起来，
+                    # 界面却显示成"任务跑完了、只是收尾出错"，排查方向直接跑偏。
+                    # 2026-10-04 实际踩到——协调器崩着的时候 prepare 和 restore
+                    # 都报 Connection refused，两个错误恰好一样才没露馅；
+                    # 换个场景（比如主因是磁盘满）真实原因就完全看不见了。
+                    # 下面的 `error` 字段本来就正确拼了两者，这里让 message 与它一致。
+                    message=(
+                        f"{current_error}；任务结束后恢复大模型失败：{restore_error}"
+                        if current_error
+                        else f"任务结束后恢复大模型失败：{restore_error}"
+                    ),
                     error="; ".join(filter(None, (current_error, str(restore_error)))),
                 )
 
