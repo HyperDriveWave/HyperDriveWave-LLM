@@ -29,6 +29,29 @@ SOCKET_PATH = Path(
     )
 )
 LLAMA_UNIT = os.getenv("HDW_LLAMA_SYSTEMD_UNIT", "hyperdrivewave-llama.service")
+
+# ── 两种部署形态，协调器要区别对待 ───────────────────────────────
+#
+# 主站那套的前提是「**GPU 是稀缺资源**」：平时给 llama，知识库重建期间临时
+# 借给 RAG/MinerU，重建完再还回去。prepare/restore 就是干这个的。
+#
+# 但还有另一种部署：**RAG 常驻 GPU**（多卡机器上单独给 RAG/MinerU 一张卡，
+# `.env` 里 `HDW_RAG_DEVICE=cuda`）。这时根本不需要腾挪，照搬主站那套会出事：
+#
+#   · `restore` 里的 `_compose(gpu=False)` 会把 RAG 的 GPU **摘掉** ——
+#     等于每次入库结束都把 RAG 悄悄降级成 CPU，而界面上一切正常；
+#   · `_start_llama()` 会去 `systemctl --user enable --now` 宿主 llama 单元，
+#     而**容器化 llama 的部署里那个单元是 disabled 的**，且预编译二进制在
+#     麒麟这类老发行版上根本起不来、端口还被负载均衡器占着 ——
+#     于是入库明明已经干完，却报
+#         「任务结束后恢复大模型失败: [Errno 111] Connection refused」
+#     把一次成功的入库显示成失败。
+#
+# 判据用 `.env` 的 `HDW_RAG_DEVICE`：它是「RAG 跑在哪个设备上」的唯一事实源。
+# 主站是 `cpu`（需要腾挪），常驻 GPU 的部署是 `cuda`（不需要）。
+RAG_ON_PERMANENT_GPU = os.getenv("HDW_RAG_DEVICE", "cpu").strip().lower() == "cuda"
+# 宿主有没有 llama 单元可管。容器化 llama 的部署里没有（HDW_SKIP_LOCAL_LLM=true）。
+HOST_LLAMA_MANAGED = os.getenv("HDW_SKIP_LOCAL_LLM", "false").strip().lower() != "true"
 FRPC_UNIT = os.getenv("HDW_FRP_SYSTEMD_UNIT", "hyperdrivewave-frpc.service")
 
 # 端口由 HDW_LLAMA_PORT 推导，不写死 1919。
@@ -396,13 +419,25 @@ def _stop_llama() -> None:
 
 
 def _start_llama() -> None:
+    if not HOST_LLAMA_MANAGED:
+        # 容器化 llama 的部署：宿主没有这个单元。硬去 enable --now 会：
+        #   1) 拉起的二进制在老发行版上根本跑不起来；2) 就算起来了，
+        #   端口被负载均衡器占着。失败会把整个 restore 拖垮，
+        #   于是**一次成功的入库被显示成失败**。
+        # llama 要不要跑是容器的事（hdw-llama / hdw-llama-lb），不归协调器管。
+        return
     _run(["systemctl", "--user", "enable", "--now", LLAMA_UNIT])
     _wait_http(LLAMA_HEALTH_URL)
 
 
 def _restore_locked() -> dict[str, object]:
-    _compose(gpu=False)
-    rag = _wait_http(RAG_HEALTH_URL, expected_device="cpu")
+    # ⚠ 这里**不要**无条件 `_compose(gpu=False)`：在 RAG 常驻 GPU 的部署上，
+    # 那等于把 RAG 悄悄降级成 CPU，而且没有任何报错——下次提问才发现变慢。
+    if RAG_ON_PERMANENT_GPU:
+        rag = _wait_http(RAG_HEALTH_URL, expected_device="cuda")
+    else:
+        _compose(gpu=False)
+        rag = _wait_http(RAG_HEALTH_URL, expected_device="cpu")
     mineru = _wait_http(MINERU_HEALTH_URL)
     _start_llama()
     _set_state("restored")
@@ -416,7 +451,10 @@ def prepare() -> dict[str, object]:
         _set_state("preparing")
         try:
             _stop_llama()
-            _compose(gpu=True)
+            # 常驻 GPU 时不用重建容器——但**下面的 GPU 校验照做**：
+            # 那一步能在"RAG 不知何时掉了 GPU"时立刻抓住，而不是等用户发现变慢。
+            if not RAG_ON_PERMANENT_GPU:
+                _compose(gpu=True)
             rag = _wait_http(RAG_HEALTH_URL, expected_device="cuda")
             mineru = _wait_http(MINERU_HEALTH_URL)
             _verify_gpu_container(
@@ -457,6 +495,18 @@ def switch_llm() -> dict[str, object]:
         current_mode = str(_snapshot()["mode"])
         if current_mode in {"preparing", "prepared", "restoring", "switching_llm"}:
             raise RuntimeError(f"当前资源状态为 {current_mode}，暂不能切换本地模型")
+        if not HOST_LLAMA_MANAGED:
+            # **不要让它"成功"。** 容器化 llama 的部署里 _stop/_start_llama 都是
+            # 空操作，但下面 `_verify_llm_target` 探的是负载均衡器 —— 它一直
+            # 活着、一直返回 200，于是这里会**报成功而什么都没重启**：
+            # 界面显示「已切换」，模型 / MTP / mmproj 一个都没生效。
+            # 假成功比报错难查得多，所以直接拦下来。
+            raise RuntimeError(
+                "本地推理跑在容器里（hdw-llama），协调器管不到它——"
+                "systemctl 的宿主单元在本部署里是停用的。"
+                "改完模型 / MTP / mmproj 要重建容器才生效："
+                "bash Scripts/compose.sh up -d --force-recreate hdw-llama hdw-llama-2"
+            )
         target = _configured_llm_target()
         _set_state("switching_llm")
         try:
@@ -498,6 +548,15 @@ def unload_llm() -> dict[str, object]:
             "loading_llm",
         }:
             raise RuntimeError(f"当前资源状态为 {current_mode}，暂不能卸载本地模型")
+        if not HOST_LLAMA_MANAGED:
+            # 同上：_stop_llama 在这类部署里是空操作，不拦的话这里会返回
+            # `llm_unloaded`，而 llama 容器照跑、显存一点没还。界面显示"已卸载"，
+            # 用户以为卡腾出来了。直接说清楚该停什么。
+            raise RuntimeError(
+                "本地推理跑在容器里（hdw-llama），卸载要停容器而不是 systemctl：\n"
+                "  停：bash Scripts/compose.sh stop hdw-llama hdw-llama-2\n"
+                "  恢复：bash Scripts/compose.sh start hdw-llama hdw-llama-2"
+            )
         _set_state("unloading_llm")
         try:
             _stop_llama()
@@ -530,6 +589,37 @@ def frp_disable() -> dict[str, object]:
         return _frp_status()
 
 
+def _unlink_quiet(path: Path) -> None:
+    """删一个文件，不存在就算了。
+
+    **不要改回 `path.unlink(missing_ok=True)`。** 那个参数是 **Python 3.8**
+    才加的，而这个脚本跑在**宿主**的 python3 上——麒麟 V10 / RHEL8 这类系统
+    自带的是 3.7，会直接抛
+
+        TypeError: unlink() got an unexpected keyword argument 'missing_ok'
+
+    后果不只是这一个函数失败：它在 `server_bind()` 里，异常会让协调器**启动即崩**，
+    systemd 于是每 3 秒重启一次（`Active: activating (auto-restart)`）。
+    socket 文件还留在原地，看起来"服务装着"，但后面没有进程在听——
+    入库脚本连上去就是 `[Errno 111] Connection refused`，而报错信息把它
+    伪装成"网络问题"。
+
+    为什么会漏掉：这个脚本用了 `from __future__ import annotations`，
+    `str | None` / `dict[str, object]` 这类 **3.10+ 的标注**全都延迟求值、
+    在 3.7 上不报错，于是"语法检查通过、模块级执行也通过"。
+    但 `missing_ok` 不是标注，是**运行时 API**，只有真的把 server 建起来
+    才会碰到。**「能编译、能导入」不等于「能跑」**——验证这类脚本必须真的
+    启动一次、确认 `systemctl --user is-active` 返回 `active`，
+    而不是看到 socket 文件存在就当成功。
+    """
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # 权限之类：删不掉也别让协调器起不来
+        print(f"警告：无法删除 {path}（{exc}）", file=sys.stderr)
+
+
 class UnixHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     address_family = socket.AF_UNIX
     daemon_threads = True
@@ -537,13 +627,13 @@ class UnixHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
     def server_bind(self) -> None:
         SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SOCKET_PATH.unlink(missing_ok=True)
+        _unlink_quiet(SOCKET_PATH)
         super().server_bind()
         os.chmod(SOCKET_PATH, 0o660)
 
     def server_close(self) -> None:
         super().server_close()
-        SOCKET_PATH.unlink(missing_ok=True)
+        _unlink_quiet(SOCKET_PATH)
 
 
 class Handler(BaseHTTPRequestHandler):
