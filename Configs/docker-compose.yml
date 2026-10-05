@@ -271,6 +271,39 @@ services:
     ports:
       - "127.0.0.1:${HDW_RAG_PORT:-8001}:8001"
 
+  hdw-rag-gateway:
+    # 把 RAG 的 `/search` 开给局域网，外加一道密钥校验。
+    #
+    # 为什么不直接把上面 8001 的绑定从 127.0.0.1 改成 0.0.0.0：**那个端点没有
+    # 任何鉴权**（只有 /admin/* 要令牌），而它返回的是厂内文档原文——开出去等于
+    # 局域网里谁都能 `curl` 一下把整个知识库拖走。网关只放行 /search 与 /health
+    # 两个端点，其余一律 403。
+    #
+    # 默认**不启用**：只有需要外部系统调取知识库时才加 ip `rag-lan` profile。
+    restart: unless-stopped
+    image: nginx:1.27-alpine
+    profiles: ["rag-lan"]
+    # **刻意不用 host 网络。** 这台机器上 firewalld 是 active，而
+    # `network_mode: host` 的容器**不受 Docker 的 iptables 规则保护**，
+    # 会直接被 firewalld 的 public 区域拦掉（那里只放行了 cockpit/mdns/ssh，
+    # ports 是空的）。表现是：`ss` 里明明 LISTEN 在 0.0.0.0，别的机器却连不上。
+    # 走端口发布就落到 Docker 自己的规则里，与 webui / hdw-api 同一套，不必动防火墙。
+    # 上游也相应改成 compose 服务名 `hdw-rag`（同在容器网络内，由内嵌 DNS 解析）。
+    ports:
+      - "${HDW_RAG_LAN_BIND:-0.0.0.0}:${HDW_RAG_LAN_PORT:-8010}:8010"
+    environment:
+      HDW_RAG_LAN_PORT: ${HDW_RAG_LAN_PORT:-8010}
+      HDW_RAG_PORT: ${HDW_RAG_PORT:-8001}
+      # **`:?` 不是装饰**：不设或为空时让 compose 直接报错退出。
+      # 写成 `${HDW_RAG_LAN_KEY:-}` 的话密钥为空，模板里的
+      # `if ($http_x_hdw_api_key != "")` 会让**不带任何头部**的请求通过——
+      # 网关形同虚设，而且从配置上看不出来。宁可起不来。
+      HDW_RAG_LAN_KEY: ${HDW_RAG_LAN_KEY:?必须设置 HDW_RAG_LAN_KEY（网关的调用密钥）}
+      # 只替换这几个键，别动 $http_x_hdw_api_key / $host 这类 nginx 自己的变量。
+      NGINX_ENVSUBST_FILTER: "^HDW_RAG_"
+    volumes:
+      - ../HDW_Inference/RAG_Service/nginx-rag-gateway.conf.template:/etc/nginx/templates/default.conf.template:ro
+
   hdw-mineru:
     # 机器重启/Docker 重启后自动拉起。**远端 compose 一直有这条，本机漏了**——2026-09-26 内核升级重启后，本机 10 个容器一个都没回来。
     restart: unless-stopped

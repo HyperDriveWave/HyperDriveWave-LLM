@@ -1,0 +1,60 @@
+# RAG 检索的局域网网关 —— 给 `POST /search` 加一道密钥校验。
+#
+# 为什么需要它
+# ────────────
+# RAG 服务的 `/search` **没有任何鉴权**（只有 `/admin/*` 要令牌），而它返回的
+# 是厂内文档原文。把 8001 直接开到局域网 = 局域网里任何人 `curl` 一下就能把
+# 整个知识库拖走。所以中间加这一层，只放行两个端点、且必须带密钥。
+#
+# 为什么不改 RAG 服务本身加鉴权：那个服务同时被 qa-api / ingest 在容器网络里
+# 调用，改动影响面大；而且"内部调用免鉴权、对外调用要鉴权"本来就是两种信任级
+# 别，用网关区分比在业务代码里判断更清楚（这也是 hdw-api 存在的理由）。
+#
+# 密钥注入方式：envsubst，与 hdw-llama-lb 同一个套路。
+# **密钥不写在这个文件里**——写了就进仓库了。
+# compose 里用 NGINX_ENVSUBST_FILTER 限死只替换 HDW_RAG_ 开头的变量，
+# 否则 envsubst 会去动 $http_x_hdw_api_key 这类 nginx 自己的变量。
+
+server {
+    listen ${HDW_RAG_LAN_PORT};
+    server_tokens off;
+
+    # 只认这一个请求头。用 `if` + `return` 是 nginx 官方认可的安全用法——
+    # 那句 "if is evil" 针对的是在 if 里放 proxy_pass 一类的场景，`return` 不在其中。
+    if ($http_x_hdw_api_key != "${HDW_RAG_LAN_KEY}") {
+        return 401;
+    }
+
+    # **白名单，不是黑名单。** 默认全部 403，只开这两个：
+    #   /search —— IMON 那类系统要的纯检索
+    #   /health —— 让调用方能探活，不然出问题只能靠猜
+    # 其它端点（/embed、/rerank、/admin/*）一律不放出去：多开一个就多一份暴露面，
+    # 而对外调取知识只需要 /search。
+    location = /search {
+        # 上游走 compose 服务名：网关本身就在同一个容器网络里，
+        # 由 Docker 内嵌 DNS 解析，启动时一次解析、不依赖宿主回环。
+        proxy_pass http://hdw-rag:${HDW_RAG_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # 检索要跑 bge-m3 嵌入 + 重排，冷启动时首次请求可能十几秒；
+        # 批量检索更久。给足时间，别让它半路 504。
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location = /health {
+        proxy_pass http://hdw-rag:${HDW_RAG_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_read_timeout 30s;
+    }
+
+    location / {
+        return 403;
+    }
+}
